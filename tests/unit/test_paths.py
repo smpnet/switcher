@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from switcher.models import DirMapping, Tool
 from switcher.paths import IS_WINDOWS, PathResolver
 
 
@@ -98,3 +99,66 @@ def test_is_link_detects_posix_symlink(resolver: PathResolver, home: Path) -> No
     link.symlink_to(target)
     assert resolver.is_link(link)
     assert not resolver.is_link(target)
+
+
+def _two_dir_tool() -> Tool:
+    return Tool(
+        id="copilot",
+        name="GitHub Copilot CLI",
+        config_dirs=(
+            DirMapping(
+                posix_path="~/.config/github-copilot",
+                windows_path="%LOCALAPPDATA%\\github-copilot",
+                profile_subdir="copilot-auth",
+                env_override="GH_COPILOT_AUTH",
+            ),
+            DirMapping(
+                posix_path="~/.copilot",
+                windows_path="%USERPROFILE%\\.copilot",
+                profile_subdir="copilot-config",
+            ),
+        ),
+    )
+
+
+def test_tool_dir_no_env_override_returns_expanded_dir(
+    resolver: PathResolver, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GH_COPILOT_AUTH", raising=False)
+    tool = _two_dir_tool()
+    if IS_WINDOWS:
+        # On Windows, the test expands %LOCALAPPDATA% — set it to home for determinism.
+        monkeypatch.setenv("LOCALAPPDATA", str(home))
+        assert resolver.tool_dir(tool, 0) == home / "github-copilot"
+    else:
+        assert resolver.tool_dir(tool, 0) == home / ".config" / "github-copilot"
+
+
+def test_tool_dir_env_override_wins(
+    resolver: PathResolver, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GH_COPILOT_AUTH", str(tmp_path / "custom"))
+    tool = _two_dir_tool()
+    assert resolver.tool_dir(tool, 0) == tmp_path / "custom"
+
+
+def test_tool_dir_per_mapping_isolation(
+    resolver: PathResolver, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, home: Path
+) -> None:
+    """The env override only affects the dir whose mapping declares it.
+
+    Multi-dir tools must not collapse to a single env path — that was the
+    latent bug that motivated the per-DirMapping move.
+    """
+    monkeypatch.setenv("GH_COPILOT_AUTH", str(tmp_path / "custom"))
+    if IS_WINDOWS:
+        monkeypatch.setenv("USERPROFILE", str(home))
+    tool = _two_dir_tool()
+    dir0 = resolver.tool_dir(tool, 0)
+    dir1 = resolver.tool_dir(tool, 1)
+    assert dir0 == tmp_path / "custom"
+    assert dir0 != dir1
+    if IS_WINDOWS:
+        assert dir1 == home / ".copilot"
+    else:
+        assert dir1 == home / ".copilot"

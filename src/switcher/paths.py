@@ -16,6 +16,8 @@ from pathlib import Path
 
 import platformdirs
 
+from switcher.models import Tool
+
 IS_WINDOWS = sys.platform == "win32"
 
 
@@ -68,6 +70,25 @@ class PathResolver:
         if env:
             return self.expand(env)
         return Path(platformdirs.user_data_dir("switcher"))
+
+    def tool_dir(self, tool: Tool, dir_index: int) -> Path:
+        """Resolve where a tool's `dir_index`-th config dir lives.
+
+        Per-DirMapping env override semantics:
+          1. if config_dirs[dir_index].env_override is set AND the env var is
+             present in os.environ, use it (after expanduser).
+          2. else expand the OS-appropriate field (windows_path or posix_path).
+
+        Each DirMapping carries its own override (or none); multi-dir tools
+        never collapse to a single env path.
+        """
+        mapping = tool.config_dirs[dir_index]
+        if mapping.env_override:
+            override = os.environ.get(mapping.env_override)
+            if override:
+                return Path(override).expanduser()
+        raw = mapping.windows_path if IS_WINDOWS else mapping.posix_path
+        return self.expand(raw)
 
     def exists(self, p: Path) -> bool:
         return p.exists() or p.is_symlink()
