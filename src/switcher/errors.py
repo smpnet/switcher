@@ -25,6 +25,16 @@ class PathNotADirectoryError(SwitcherError):
     """Raised by init() when a live config path exists but is not a directory."""
 
 
+class ProfileTargetExistsError(SwitcherError):
+    """Raised by move_or_seed_dir() when the profile destination already exists.
+
+    This guards against silent data loss on init reruns after a partial
+    failure: rather than letting `live.replace(profile_target)` produce a
+    raw OSError (or worse, succeed-and-overwrite-empty-target on POSIX),
+    we surface a domain error the CLI can translate to clear advice.
+    """
+
+
 class UnknownProfileError(SwitcherError):
     """Raised when an operation references a profile that doesn't exist."""
 

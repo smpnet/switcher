@@ -16,7 +16,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from switcher.errors import AlreadyLinkedError, PathNotADirectoryError
+from switcher.errors import (
+    AlreadyLinkedError,
+    PathNotADirectoryError,
+    ProfileTargetExistsError,
+)
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -116,12 +120,23 @@ def move_or_seed_dir(live: Path, profile_target: Path) -> None:
       missing live           → create empty dir at profile_target
       symlink/junction live  → AlreadyLinkedError
       file (non-dir) live    → PathNotADirectoryError
-      real dir live          → os.replace (atomic move)
+      real dir live          → atomic move via Path.replace
+
+    `profile_target` must not already exist — init reruns after a partial
+    failure are realistic, and `live.replace(profile_target)` would either
+    silently overwrite an empty target on POSIX or surface as a raw
+    OSError on Windows. We pre-check and raise ProfileTargetExistsError
+    so the CLI can give actionable advice instead.
     """
     profile_target.parent.mkdir(parents=True, exist_ok=True)
     is_link = live.is_symlink() or (IS_WINDOWS and os.path.isjunction(live))
+    if profile_target.exists() or profile_target.is_symlink():
+        raise ProfileTargetExistsError(
+            f"profile destination already exists: {profile_target}; "
+            "this looks like a partial init — remove it manually before retrying"
+        )
     if not live.exists() and not is_link:
-        profile_target.mkdir(parents=True, exist_ok=False)
+        profile_target.mkdir(exist_ok=False)
         return
     if is_link:
         raise AlreadyLinkedError(f"{live} is already a link; refusing to move")

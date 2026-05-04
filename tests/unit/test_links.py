@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from switcher.errors import AlreadyLinkedError, PathNotADirectoryError
+from switcher.errors import (
+    AlreadyLinkedError,
+    PathNotADirectoryError,
+    ProfileTargetExistsError,
+)
 from switcher.links import link_dir, move_or_seed_dir, swap_link
 
 
@@ -159,3 +163,21 @@ def test_swap_link_refuses_to_replace_real_directory(tmp_path: Path) -> None:
         swap_link(target, occupied)
     # Side-effect check: the existing dir must still be intact.
     assert (occupied / "user_data").read_text() == "don't lose me"
+
+
+def test_move_or_seed_rejects_existing_profile_target(tmp_path: Path) -> None:
+    """Init reruns after a partial failure are realistic; the destination
+    profile dir might already contain files. Don't let `live.replace()`
+    silently overwrite (or fail with a raw OSError on Windows) — surface
+    a domain error so the CLI can give actionable advice."""
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "data.json").write_text("{}")
+    target = tmp_path / "profile" / "claude"
+    target.mkdir(parents=True)
+    (target / "preexisting").write_text("from a previous run")
+    with pytest.raises(ProfileTargetExistsError):
+        move_or_seed_dir(live, target)
+    # Side effects: live must remain untouched, target must remain intact.
+    assert (live / "data.json").read_text() == "{}"
+    assert (target / "preexisting").read_text() == "from a previous run"

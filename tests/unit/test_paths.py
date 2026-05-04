@@ -158,10 +158,9 @@ def test_tool_dir_per_mapping_isolation(
     dir1 = resolver.tool_dir(tool, 1)
     assert dir0 == tmp_path / "custom"
     assert dir0 != dir1
-    if IS_WINDOWS:
-        assert dir1 == home / ".copilot"
-    else:
-        assert dir1 == home / ".copilot"
+    # Both branches resolve to the same value: POSIX expands ~ against home;
+    # Windows expands %USERPROFILE% (also pinned to home) for parity.
+    assert dir1 == home / ".copilot"
 
 
 def test_tool_dir_env_override_expands_env_vars(
@@ -202,3 +201,17 @@ def test_tool_dir_env_override_rejects_other_user_tilde(
     tool = _two_dir_tool()
     with pytest.raises(ValueError, match="username"):
         resolver.tool_dir(tool, 0)
+
+
+def test_tool_dir_treats_empty_env_override_as_unset(
+    resolver: PathResolver, monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    """An explicitly-empty env var falls back to the default mapping path —
+    matches the docstring's "set to a non-empty value" contract and the
+    common shell convention that empty == unset."""
+    monkeypatch.setenv("GH_COPILOT_AUTH", "")
+    if IS_WINDOWS:
+        monkeypatch.setenv("LOCALAPPDATA", str(home))
+        assert resolver.tool_dir(_two_dir_tool(), 0) == home / "github-copilot"
+    else:
+        assert resolver.tool_dir(_two_dir_tool(), 0) == home / ".config" / "github-copilot"

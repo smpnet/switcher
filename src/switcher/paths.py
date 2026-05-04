@@ -75,10 +75,14 @@ class PathResolver:
         """Resolve where a tool's `dir_index`-th config dir lives.
 
         Per-DirMapping env override semantics:
-          1. if config_dirs[dir_index].env_override is set AND the env var is
-             present in os.environ, route it through `self.expand()` — same
-             contract as posix_path/windows_path entries (host-platform env
-             vars + `~` against the configured home; `~username` rejected).
+          1. if config_dirs[dir_index].env_override is set AND the env var
+             is present in os.environ AND its value is non-empty, route it
+             through `self.expand()` — same contract as posix_path/
+             windows_path entries (host-platform env vars + `~` against the
+             configured home; `~username` rejected). Empty values fall back
+             to the default mapping path; this matches the common shell
+             convention of treating empty as unset, and avoids a footgun
+             where `VAR=` would silently swallow the override.
           2. else expand the OS-appropriate field (windows_path or posix_path).
 
         Each DirMapping carries its own override (or none); multi-dir tools
