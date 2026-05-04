@@ -18,7 +18,10 @@ from pydantic import BaseModel, field_validator
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
 _RESERVED = frozenset(
     {
-        "CON", "PRN", "AUX", "NUL",
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
         *(f"COM{i}" for i in range(1, 10)),
         *(f"LPT{i}" for i in range(1, 10)),
     }
@@ -28,9 +31,7 @@ _RESERVED = frozenset(
 def validate_safe_name(value: str) -> str:
     """Reject names that aren't safe to use as filesystem path segments."""
     if not _NAME_RE.fullmatch(value):
-        raise ValueError(
-            f"invalid name {value!r}: must match {_NAME_RE.pattern}"
-        )
+        raise ValueError(f"invalid name {value!r}: must match {_NAME_RE.pattern}")
     if value.upper() in _RESERVED:
         raise ValueError(f"reserved name {value!r}")
     return value
@@ -43,6 +44,8 @@ def validate_credential_path(value: str) -> str:
     (C:\\...), UNC (\\\\server\\share), and home-relative (~/...) regardless
     of the host OS so the same registry data is portable.
     """
+    if not value or value == ".":
+        raise ValueError(f"credential path must name a file: {value!r}")
     if value.startswith("~"):
         raise ValueError(f"credential path must be relative: {value!r}")
     if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():

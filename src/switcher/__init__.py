@@ -1,4 +1,5 @@
 """switcher — swap AI-agent configuration profiles via atomic directory links."""
+
 from importlib.metadata import PackageNotFoundError, version
 
 try:

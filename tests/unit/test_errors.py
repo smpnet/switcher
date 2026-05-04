@@ -1,4 +1,5 @@
 """All error classes derive from SwitcherError and carry a message."""
+
 import pytest
 
 from switcher.errors import (
@@ -6,8 +7,8 @@ from switcher.errors import (
     PathNotADirectoryError,
     ProfileExistsError,
     ProfileIsActiveError,
-    StateAlreadyInitialized,
-    StateNotInitialized,
+    StateAlreadyInitializedError,
+    StateNotInitializedError,
     StorageError,
     SwitcherError,
     ToolHasNoActiveProfileError,
@@ -20,8 +21,8 @@ from switcher.errors import (
 @pytest.mark.parametrize(
     "cls",
     [
-        StateAlreadyInitialized,
-        StateNotInitialized,
+        StateAlreadyInitializedError,
+        StateNotInitializedError,
         AlreadyLinkedError,
         PathNotADirectoryError,
         UnknownProfileError,

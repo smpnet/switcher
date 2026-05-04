@@ -1,4 +1,5 @@
 """Pydantic models for switcher's domain types."""
+
 import pytest
 from pydantic import ValidationError
 
@@ -9,8 +10,8 @@ from switcher.models import (
     validate_safe_name,
 )
 
-
 # ---------------- validate_safe_name ----------------
+
 
 @pytest.mark.parametrize("name", ["work", "client-A", "2026-05-04-current", "v_1.2"])
 def test_safe_name_accepts_normal_names(name: str) -> None:
@@ -20,12 +21,12 @@ def test_safe_name_accepts_normal_names(name: str) -> None:
 @pytest.mark.parametrize(
     "name",
     [
-        "",            # empty
-        ".hidden",     # leading dot
+        "",  # empty
+        ".hidden",  # leading dot
         "with space",  # space
         "with/slash",  # slash
         "with\\back",  # backslash
-        "..",          # parent traversal
+        "..",  # parent traversal
         "with\nnewline",
     ],
 )
@@ -42,6 +43,7 @@ def test_safe_name_rejects_windows_reserved(name: str) -> None:
 
 # ---------------- validate_credential_path ----------------
 
+
 @pytest.mark.parametrize(
     "p",
     [".credentials.json", "data/secrets.json", "agent/auth.json", "apps.json"],
@@ -53,12 +55,14 @@ def test_credential_path_accepts_relative(p: str) -> None:
 @pytest.mark.parametrize(
     "p",
     [
-        "/etc/passwd",          # absolute POSIX
-        "C:\\Windows\\foo",     # absolute Windows
-        "~/foo",                # home-relative
-        "../escape",            # parent traversal
-        "a/../b",               # parent in middle
-        "\\\\server\\share",    # UNC
+        "/etc/passwd",  # absolute POSIX
+        "C:\\Windows\\foo",  # absolute Windows
+        "~/foo",  # home-relative
+        "../escape",  # parent traversal
+        "a/../b",  # parent in middle
+        "\\\\server\\share",  # UNC
+        "",  # empty
+        ".",  # current directory (no file)
     ],
 )
 def test_credential_path_rejects_unsafe(p: str) -> None:
@@ -67,6 +71,7 @@ def test_credential_path_rejects_unsafe(p: str) -> None:
 
 
 # ---------------- DirMapping ----------------
+
 
 def test_dir_mapping_basic() -> None:
     dm = DirMapping(
@@ -98,6 +103,7 @@ def test_dir_mapping_rejects_unsafe_subdir() -> None:
 
 
 # ---------------- CredentialFile ----------------
+
 
 def test_credential_file_basic() -> None:
     cf = CredentialFile(config_dir="copilot-auth", path="apps.json")

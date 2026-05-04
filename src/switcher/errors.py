@@ -9,11 +9,11 @@ class SwitcherError(Exception):
     """Base class for all user-facing switcher errors."""
 
 
-class StateAlreadyInitialized(SwitcherError):
+class StateAlreadyInitializedError(SwitcherError):
     """Raised by init() when the store already contains profiles."""
 
 
-class StateNotInitialized(SwitcherError):
+class StateNotInitializedError(SwitcherError):
     """Raised by mutating operations when the store has no profiles yet."""
 
 
