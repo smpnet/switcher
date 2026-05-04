@@ -7,6 +7,10 @@ Layout under <state_dir>:
 
 All writes go through `_atomic_write` (tmp + os.replace) so a crash mid-write
 can't tear config.json or metadata.json.
+
+The store is the persistence layer only. Cross-concern consistency — e.g.
+updating the active map when a profile is renamed or deleted — is the
+caller's responsibility (see `ProfileService` for the policy layer).
 """
 
 from __future__ import annotations
@@ -122,14 +126,20 @@ class FileProfileStore:
             raise UnknownProfileError(f"profile {old!r} not found")
         if new_dir.exists():
             raise ProfileExistsError(f"profile {new!r} already exists")
-        new_dir.parent.mkdir(parents=True, exist_ok=True)
-        old_dir.replace(new_dir)
-        existing = self.get(new)
+        # Order matters for crash-recovery: rewrite metadata in old_dir first,
+        # then move the dir. If the metadata write fails, old_dir is intact
+        # and a retry replays cleanly. If the dir move fails after the
+        # metadata rewrite, old_dir holds metadata that already says `new` —
+        # re-running rename(old, new) is idempotent. Reverse order leaves the
+        # caller stuck (dir at new with stale metadata, old_dir gone).
+        existing = self.get(old)
         renamed = Profile(name=new, created_at=existing.created_at, tools=existing.tools)
         self._atomic_write(
-            self._metadata_path(new),
+            self._metadata_path(old),
             renamed.model_dump_json(by_alias=True),
         )
+        new_dir.parent.mkdir(parents=True, exist_ok=True)
+        old_dir.replace(new_dir)
 
     # -- active map ---------------------------------------------------------
 

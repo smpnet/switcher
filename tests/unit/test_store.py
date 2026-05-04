@@ -126,6 +126,41 @@ def test_atomic_write_cleans_tmp_on_replace_failure(
     assert leftover == []
 
 
+def test_rename_is_recoverable_when_metadata_rewrite_fails(
+    store: FileProfileStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If rewriting metadata fails midway through rename, re-running
+    rename(old, new) must complete the operation. This guards the rename
+    ordering: rewrite metadata in old_dir first, then move the dir — so the
+    only intermediate state is one a retry can finish. Reverse order leaves
+    the user stuck (dir at new, metadata stale, old_dir gone)."""
+    store.create("old", {"claude": True})
+
+    original = Path.replace
+    state = {"calls": 0}
+
+    def fail_second_replace(self: Path, target: Path) -> Path:
+        state["calls"] += 1
+        if state["calls"] == 2:
+            raise OSError("simulated metadata write failure")
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_second_replace)
+
+    with pytest.raises(OSError, match="simulated"):
+        store.rename("old", "new")
+
+    # Restore real Path.replace before retry so the recovery exercises real
+    # filesystem behavior, not the patch's pass-through.
+    monkeypatch.setattr(Path, "replace", original)
+    store.rename("old", "new")
+    p = store.get("new")
+    assert p.name == "new"
+    assert p.tools == {"claude": True}
+    with pytest.raises(UnknownProfileError):
+        store.get("old")
+
+
 @pytest.mark.parametrize("bad_name", ["../etc", "../../escape", "a/b", ".hidden"])
 def test_profile_methods_reject_unsafe_names(store: FileProfileStore, bad_name: str) -> None:
     """profile_dir is a choke point — every method routing through it must
