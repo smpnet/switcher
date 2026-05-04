@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from switcher.models import (
     CredentialFile,
     DirMapping,
+    Tool,
     validate_credential_path,
     validate_safe_name,
 )
@@ -136,3 +137,109 @@ def test_credential_file_rejects_absolute_path() -> None:
 def test_credential_file_rejects_traversal() -> None:
     with pytest.raises(ValidationError):
         CredentialFile(config_dir="claude", path="../etc/passwd")
+
+
+# ---------------- Tool ----------------
+
+
+def _claude_tool() -> Tool:
+    return Tool(
+        id="claude",
+        name="Claude Code",
+        config_dirs=(
+            DirMapping(
+                posix_path="~/.claude",
+                windows_path="%USERPROFILE%\\.claude",
+                profile_subdir="claude",
+                env_override="CLAUDE_CONFIG_DIR",
+            ),
+        ),
+        credentials=(CredentialFile(config_dir="claude", path=".credentials.json"),),
+    )
+
+
+def test_tool_basic() -> None:
+    tool = _claude_tool()
+    assert tool.id == "claude"
+    assert len(tool.config_dirs) == 1
+    assert tool.config_dirs[0].env_override == "CLAUDE_CONFIG_DIR"
+    assert tool.credentials[0].path == ".credentials.json"
+
+
+def test_tool_id_is_validated() -> None:
+    with pytest.raises(ValidationError):
+        Tool(
+            id="../escape",
+            name="x",
+            config_dirs=(
+                DirMapping(
+                    posix_path="~/.x",
+                    windows_path="%USERPROFILE%\\.x",
+                    profile_subdir="x",
+                ),
+            ),
+        )
+
+
+def test_tool_credential_must_reference_known_config_dir() -> None:
+    with pytest.raises(ValidationError, match="unknown config_dir"):
+        Tool(
+            id="claude",
+            name="Claude Code",
+            config_dirs=(
+                DirMapping(
+                    posix_path="~/.claude",
+                    windows_path="%USERPROFILE%\\.claude",
+                    profile_subdir="claude",
+                ),
+            ),
+            credentials=(CredentialFile(config_dir="other", path="foo"),),
+        )
+
+
+def test_tool_shorthand_credential_files_expand() -> None:
+    """A flat credential_files list should expand to CredentialFile entries
+    pointing at the first config_dir."""
+    tool = Tool.model_validate(
+        {
+            "id": "claude",
+            "name": "Claude Code",
+            "credential_files": [".credentials.json"],
+            "config_dirs": [
+                {
+                    "posix_path": "~/.claude",
+                    "windows_path": "%USERPROFILE%\\.claude",
+                    "profile_subdir": "claude",
+                }
+            ],
+        }
+    )
+    assert len(tool.credentials) == 1
+    assert tool.credentials[0].config_dir == "claude"
+    assert tool.credentials[0].path == ".credentials.json"
+
+
+def test_tool_shorthand_and_explicit_credentials_coexist() -> None:
+    """Both forms can appear; shorthand entries are listed first."""
+    tool = Tool.model_validate(
+        {
+            "id": "copilot",
+            "name": "GitHub Copilot CLI",
+            "credential_files": ["x.json"],
+            "config_dirs": [
+                {
+                    "posix_path": "~/.config/github-copilot",
+                    "windows_path": "%LOCALAPPDATA%\\github-copilot",
+                    "profile_subdir": "copilot-auth",
+                },
+                {
+                    "posix_path": "~/.copilot",
+                    "windows_path": "%USERPROFILE%\\.copilot",
+                    "profile_subdir": "copilot-config",
+                },
+            ],
+            "credentials": [{"config_dir": "copilot-config", "path": "y.json"}],
+        }
+    )
+    assert [c.config_dir for c in tool.credentials] == ["copilot-auth", "copilot-config"]
+    assert [c.path for c in tool.credentials] == ["x.json", "y.json"]
