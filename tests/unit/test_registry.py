@@ -1,5 +1,6 @@
 """Registry: loads builtins from the wheel, user TOMLs from registry.d/."""
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,24 @@ def test_build_registry_user_overrides_builtin(
     assert "overrides builtin" in captured.err
 
 
+def test_build_registry_user_overrides_user_emits_distinct_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When two user TOMLs collide on `id`, the warning must NOT claim the
+    later one overrides a builtin — that misattributes the conflict and
+    confuses debugging when no builtin is involved."""
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    a = USER_TOOL.replace('id = "gemini"', 'id = "shared"')
+    b = USER_TOOL.replace('id = "gemini"', 'id = "shared"').replace('"Gemini CLI"', '"Second"')
+    (rd / "a.toml").write_text(a, encoding="utf-8")
+    (rd / "b.toml").write_text(b, encoding="utf-8")
+    build_registry(rd)
+    err = capsys.readouterr().err
+    assert "shared" in err
+    assert "overrides builtin" not in err
+
+
 def test_find_tool_returns_none_when_missing() -> None:
     tools = load_builtin_tools()
     assert find_tool(tools, "nonexistent") is None
@@ -98,8 +117,6 @@ def test_scaffold_writes_valid_toml(tmp_path: Path) -> None:
     content = out.read_text(encoding="utf-8")
     assert 'id = "myool"' in content
     # Verify the scaffold itself parses (after the user fills in `name`)
-    import tomllib
-
     parsed = tomllib.loads(content)
     assert parsed["id"] == "myool"
 

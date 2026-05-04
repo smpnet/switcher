@@ -126,14 +126,37 @@ def test_atomic_write_cleans_tmp_on_replace_failure(
     assert leftover == []
 
 
-def test_rename_is_recoverable_when_metadata_rewrite_fails(
+def test_create_cleans_up_dir_when_metadata_write_fails(
     store: FileProfileStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If rewriting metadata fails midway through rename, re-running
-    rename(old, new) must complete the operation. This guards the rename
-    ordering: rewrite metadata in old_dir first, then move the dir — so the
-    only intermediate state is one a retry can finish. Reverse order leaves
-    the user stuck (dir at new, metadata stale, old_dir gone)."""
+    """If the metadata write fails, create must not leave an empty profile
+    directory behind — otherwise a retry hits ProfileExistsError and list()
+    surfaces a phantom entry whose get() then errors."""
+
+    def _boom(self: Path, _target: Path) -> Path:
+        raise OSError("simulated metadata write failure")
+
+    monkeypatch.setattr(Path, "replace", _boom)
+    with pytest.raises(OSError, match="simulated"):
+        store.create("vanilla", {"claude": True})
+
+    assert not store.profile_dir("vanilla").exists()
+    monkeypatch.undo()
+    # Retry must succeed cleanly — no ProfileExistsError from a stale dir.
+    store.create("vanilla", {"claude": True})
+    assert store.get("vanilla").tools == {"claude": True}
+
+
+def test_rename_is_recoverable_when_directory_move_fails(
+    store: FileProfileStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the directory move fails *after* metadata has been rewritten in
+    place (call 1 = _atomic_write's tmp.replace; call 2 = old_dir.replace),
+    re-running rename(old, new) must complete the operation. This guards
+    the rename ordering: rewrite metadata in old_dir first, then move the
+    dir — so the only intermediate state is one a retry can finish.
+    Reverse order leaves the user stuck (dir at new, metadata stale,
+    old_dir gone)."""
     store.create("old", {"claude": True})
 
     original = Path.replace

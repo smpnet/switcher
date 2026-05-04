@@ -88,11 +88,19 @@ class FileProfileStore:
             created_at=datetime.now(UTC).replace(microsecond=0),
             tools=dict(tools),
         )
-        self.profile_dir(name).mkdir(parents=True, exist_ok=True)
-        self._atomic_write(
-            self._metadata_path(name),
-            profile.model_dump_json(by_alias=True),
-        )
+        d = self.profile_dir(name)
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            self._atomic_write(
+                self._metadata_path(name),
+                profile.model_dump_json(by_alias=True),
+            )
+        except Exception:
+            # No-debris discipline: a half-created profile would later
+            # surface as ProfileExistsError (blocking retries) and as a
+            # phantom in list() whose get() then errors. Roll back.
+            shutil.rmtree(d, ignore_errors=True)
+            raise
         return profile
 
     def get(self, name: str) -> Profile:

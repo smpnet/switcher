@@ -46,15 +46,22 @@ def load_user_tools(registry_dir: Path) -> tuple[Tool, ...]:
 
 def build_registry(registry_dir: Path) -> tuple[Tool, ...]:
     """Merge builtins and user tools. User entries override builtins, with a
-    stderr warning so the override is visible.
+    stderr warning so the override is visible. A second user TOML colliding
+    with an earlier user TOML is reported as a duplicate, not a builtin
+    override — distinguishing the two helps users find the actual conflict.
     """
-    by_id: dict[str, Tool] = {}
-    for t in load_builtin_tools():
-        by_id[t.id] = t
+    builtins = load_builtin_tools()
+    builtin_ids = frozenset(t.id for t in builtins)
+    by_id: dict[str, Tool] = {t.id: t for t in builtins}
     for t in load_user_tools(registry_dir):
-        if t.id in by_id:
+        if t.id in builtin_ids:
             print(
                 f"warning: user tool {t.id!r} overrides builtin",
+                file=sys.stderr,
+            )
+        elif t.id in by_id:
+            print(
+                f"warning: duplicate user tool {t.id!r} (later file wins)",
                 file=sys.stderr,
             )
         by_id[t.id] = t
