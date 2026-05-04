@@ -26,7 +26,13 @@ def link_dir(target: Path, link_path: Path) -> None:
 
     Junction on Windows; symlink on POSIX. Caller is responsible for ensuring
     `link_path` does not already exist.
+
+    `target` must be an existing directory. Without this check, POSIX would
+    happily create a dangling symlink while Windows would raise from junction
+    creation — same intent, divergent failures. We reject up front for parity.
     """
+    if not target.is_dir():
+        raise PathNotADirectoryError(f"link target must be an existing directory: {target}")
     if IS_WINDOWS:
         _create_junction(target, link_path)
     else:
@@ -54,23 +60,47 @@ def _create_junction(target: Path, link_path: Path) -> None:
 
 
 def _force_remove(path: Path) -> None:
-    """Remove a path regardless of what kind of entry it is."""
-    if path.is_symlink() or (IS_WINDOWS and os.path.isjunction(path)):
+    """Remove a path regardless of what kind of entry it is.
+
+    Junctions are reparse-pointed *directory* entries on Windows: the
+    DeleteFile syscall (which `Path.unlink` invokes) refuses them, while
+    RemoveDirectory (which `Path.rmdir` invokes) accepts them. Hence the
+    junction branch below — without it, stale-tmp cleanup in `swap_link`
+    would silently fail on Windows.
+    """
+    if IS_WINDOWS and os.path.isjunction(path):
+        path.rmdir()
+        return
+    if path.is_symlink():
         path.unlink(missing_ok=True)
         return
     if path.is_file():
         path.unlink(missing_ok=True)
         return
     if path.is_dir():
-        shutil.rmtree(path)
+        # `ignore_errors=True` mirrors `missing_ok=True` above — closes the
+        # TOCTOU window between is_dir() and rmtree().
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def swap_link(target: Path, link_path: Path) -> None:
-    """Atomically replace whatever is at `link_path` with a link to `target`.
+    """Atomically replace an existing link/file at `link_path` with a link to `target`.
 
-    Pattern: write to `link_path + ".tmp"`, then `os.replace` over `link_path`.
+    Pattern: write to `link_path + ".tmp"`, then `Path.replace` over `link_path`.
     Idempotent: pointing the link to where it already points is safe.
+
+    Refuses when `link_path` is a real (non-link) directory — replacing it
+    via rename would either fail noisily (POSIX EISDIR / Windows
+    ERROR_ACCESS_DENIED) or, worse, silently destroy whatever lives inside.
+    Callers that genuinely want to replace a real directory must run
+    `move_or_seed_dir` first, then call swap_link against the resulting link.
     """
+    is_link = link_path.is_symlink() or (IS_WINDOWS and os.path.isjunction(link_path))
+    if not is_link and link_path.is_dir():
+        raise IsADirectoryError(
+            f"refusing to replace real directory at {link_path}; "
+            "move_or_seed_dir it first, then swap_link the resulting link"
+        )
     tmp = link_path.with_name(link_path.name + ".tmp")
     if tmp.exists() or tmp.is_symlink() or (IS_WINDOWS and os.path.isjunction(tmp)):
         _force_remove(tmp)

@@ -1,0 +1,309 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit Configuration — switcher
+#
+# Adapted from the abbynormal day-1 generic core, then tuned for switcher's
+# shape: a small Python library (Pydantic v2 + Typer + platformdirs) with a
+# pixi-managed toolchain and a TDD-first test layout under tests/unit/.
+#
+# Sections deliberately *not* yet populated (added in the same PR that
+# introduces the matching code/invariant, per the CLAUDE.md global standard):
+#   • reviews.pre_merge_checks.custom_checks
+#   • reviews.finishing_touches.custom
+#   • most code_generation.unit_tests.path_instructions
+
+language: "en-US"
+early_access: false
+enable_free_tier: false
+
+reviews:
+  profile: "assertive"
+  # Per CLAUDE.md "serious projects" standard. No-op during scaffolding
+  # phase (commits go direct to feat/v0.1.0); active once we cut PRs.
+  request_changes_workflow: true
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+  high_level_summary_in_walkthrough: false
+
+  auto_title_placeholder: "@coderabbitai"
+  auto_title_instructions: >
+    Use conventional commit format: <type>: <description>.
+    Types: feat, fix, docs, chore, refactor, test, style, perf, ci.
+    Keep under 70 characters. Lowercase after the colon.
+
+  review_status: true
+  review_details: true
+  commit_status: true
+  fail_commit_status: false
+  collapse_walkthrough: false
+  changed_files_summary: true
+  sequence_diagrams: true
+  estimate_code_review_effort: true
+  poem: false
+  in_progress_fortune: true
+  enable_prompt_for_ai_agents: true
+  disable_cache: false
+
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+
+  suggested_labels: true
+  labeling_instructions:
+    - label: "docs"
+      instructions: >
+        Apply when the diff only touches docs/ or README.md
+        (no src/ or tests/).
+    - label: "infrastructure"
+      instructions: >
+        Apply when the diff touches CI (.github/), pyproject.toml, pixi.toml,
+        pixi.lock, .coderabbit.yaml, .gitignore, or other repo-level config
+        (not source code under src/ or tests/).
+    - label: "tests"
+      instructions: >
+        Apply when the diff only touches tests/ (no src/).
+  auto_apply_labels: false
+
+  suggested_reviewers: true
+  auto_assign_reviewers: false
+
+  abort_on_close: true
+
+  path_filters:
+    - "!.pixi/**"
+    - "!.worktrees/**"
+    - "!__pycache__/**"
+    - "!*.egg-info/**"
+    - "!.ruff_cache/**"
+    - "!.pytest_cache/**"
+    - "!.claude/settings.local.json"
+    - "!pixi.lock"
+
+  # Per-module review pointers. Each instruction is silently truncated past
+  # 250 characters by CodeRabbit, so keep them tight and actionable.
+  path_instructions:
+    - path: "src/switcher/models.py"
+      instructions: >
+        Pydantic v2 models. Cross-platform name validation must reject
+        Windows reserved stems (CON.txt) and trailing dots. credential_path
+        validation must reject POSIX/Windows absolute, drive-relative,
+        UNC, and ~-prefixed forms regardless of host OS.
+    - path: "src/switcher/paths.py"
+      instructions: >
+        PathResolver is the single source of truth for home, expand(),
+        tool_dir(), state_dir(), is_link(). expand() uses host-platform
+        env-var syntax; ~username is rejected. Per-DirMapping env override
+        wins only over its own mapping.
+    - path: "src/switcher/links.py"
+      instructions: >
+        POSIX symlinks / Windows junctions. swap_link must be atomic
+        (write tmp + rename) and idempotent. move_or_seed_dir's four
+        cases: missing→seed empty, link→AlreadyLinkedError, file→
+        PathNotADirectoryError, real dir→atomic move.
+    - path: "src/switcher/errors.py"
+      instructions: >
+        Exception class names must end with "Error" (ruff N818).
+        New exceptions inherit from SwitcherError.
+    - path: "tests/unit/**"
+      instructions: >
+        TDD style: behavior-named tests, one assertion per behavior.
+        Use tmp_path fixtures; no mocks unless unavoidable. Plan-driven
+        test bodies should be appended verbatim, then minimal deviations
+        noted in the commit message.
+    - path: "src/switcher/builtins/*.toml"
+      instructions: >
+        Builtin tool definitions. Each must round-trip through
+        Tool.model_validate() — keep credential_files shorthand or
+        explicit [[credentials]] consistent with the model contract.
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 10
+    drafts: false
+    ignore_title_keywords:
+      - "WIP"
+      - "do not review"
+      - "skip review"
+    description_keyword: ""
+    labels: []
+    base_branches: []
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "renovate[bot]"
+      - "github-actions[bot]"
+
+  tools:
+    # Relevant — Python library on pixi
+    ruff:
+      enabled: true
+    pylint:
+      # Disabled: ruff covers the same ground (and is wired into pixi run lint).
+      enabled: false
+    semgrep:
+      # Default rulesets only; no project-specific semgrep.yml yet.
+      enabled: true
+    gitleaks:
+      enabled: true
+    trufflehog:
+      enabled: true
+    markdownlint:
+      enabled: true
+    languagetool:
+      enabled: true
+    github-checks:
+      enabled: true
+    dotenvLint:
+      enabled: true
+    # No Semgrep Supply Chain on this repo, so OSV-Scanner does carry weight
+    # for proactive SCA on Pixi-managed dependencies. (abbynormal disables
+    # this; switcher leaves it on.)
+    osvScanner:
+      enabled: true
+    yamllint:
+      enabled: true
+    actionlint:
+      enabled: true
+
+    # Not relevant — switcher has no IaC, no containers
+    checkov:
+      enabled: false
+    trivy:
+      enabled: false
+
+    # Not relevant — non-Python ecosystems
+    eslint:
+      enabled: false
+    biome:
+      enabled: false
+    flake8:
+      enabled: false
+    shellcheck:
+      enabled: false
+    hadolint:
+      enabled: false
+    oxc:
+      enabled: false
+    phpstan:
+      enabled: false
+    phpmd:
+      enabled: false
+    phpcs:
+      enabled: false
+    swiftlint:
+      enabled: false
+    detekt:
+      enabled: false
+    rubocop:
+      enabled: false
+    clippy:
+      enabled: false
+    fortitudeLint:
+      enabled: false
+    buf:
+      enabled: false
+    regal:
+      enabled: false
+    pmd:
+      enabled: false
+    clang:
+      enabled: false
+    cppcheck:
+      enabled: false
+    opengrep:
+      enabled: false
+    shopifyThemeCheck:
+      enabled: false
+    luacheck:
+      enabled: false
+    brakeman:
+      enabled: false
+    psscriptanalyzer:
+      enabled: false
+    blinter:
+      enabled: false
+    checkmake:
+      enabled: false
+    htmlhint:
+      enabled: false
+    stylelint:
+      enabled: false
+    sqlfluff:
+      enabled: false
+    prismaLint:
+      enabled: false
+    tflint:
+      enabled: false
+    circleci:
+      enabled: false
+    smartyLint:
+      enabled: false
+    emberTemplateLint:
+      enabled: false
+    golangci-lint:
+      enabled: false
+
+chat:
+  art: false
+  auto_reply: true
+  integrations:
+    jira:
+      usage: "disabled"
+    linear:
+      usage: "disabled"
+
+knowledge_base:
+  opt_out: false
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/CLAUDE.md"
+      - "**/AGENTS.md"
+      - "docs/superpowers/specs/**"
+      - "docs/superpowers/plans/**"
+  learnings:
+    scope: "global"
+  issues:
+    scope: "auto"
+  pull_requests:
+    scope: "auto"
+  jira:
+    usage: "disabled"
+    project_keys: []
+  linear:
+    usage: "disabled"
+    team_keys: []
+  mcp:
+    usage: "auto"
+    disabled_servers: []
+  linked_repositories: []
+
+issue_enrichment:
+  auto_enrich:
+    enabled: false
+  planning:
+    enabled: false
+    auto_planning:
+      enabled: false
+      labels: []
+  labeling:
+    labeling_instructions: []
+    auto_apply_labels: false
+
+code_generation:
+  docstrings:
+    language: "en-US"
+    path_instructions:
+      - path: "src/switcher/**/*.py"
+        instructions: >
+          Lead with one short summary line. Document non-obvious WHY only
+          (constraints, cross-platform contracts, invariants) — not WHAT
+          the code does. Reference the spec section instead of restating it.
+  unit_tests:
+    path_instructions:
+      - path: "tests/unit/**/*.py"
+        instructions: >
+          Pytest with tmp_path. Test names describe behavior, not
+          implementation. Cross-platform branches use sys.platform == "win32".
+          Use pytest.MonkeyPatch for env mutation; never touch real $HOME.

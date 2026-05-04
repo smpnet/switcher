@@ -124,3 +124,38 @@ def test_move_or_seed_rejects_non_directory(tmp_path: Path) -> None:
     target = tmp_path / "profile" / "claude"
     with pytest.raises(PathNotADirectoryError):
         move_or_seed_dir(live, target)
+
+
+# --- Review-fix coverage (post-batch-3) ---------------------------------------
+
+
+def test_link_dir_rejects_missing_target(tmp_path: Path) -> None:
+    """A link with no real backing dir is dangling on POSIX and outright
+    fails on Windows (junction creation requires a real dir). Reject up
+    front so behavior matches across platforms."""
+    target = tmp_path / "missing"
+    link = tmp_path / "link"
+    with pytest.raises(PathNotADirectoryError):
+        link_dir(target, link)
+
+
+def test_link_dir_rejects_file_target(tmp_path: Path) -> None:
+    target = tmp_path / "not_a_dir"
+    target.write_text("plain file")
+    link = tmp_path / "link"
+    with pytest.raises(PathNotADirectoryError):
+        link_dir(target, link)
+
+
+def test_swap_link_refuses_to_replace_real_directory(tmp_path: Path) -> None:
+    """`swap_link` must not silently destroy a real (non-link) directory at
+    `link_path` — the contract is replace-an-existing-link, not replace-anything."""
+    target = tmp_path / "target"
+    target.mkdir()
+    occupied = tmp_path / "link"
+    occupied.mkdir()
+    (occupied / "user_data").write_text("don't lose me")
+    with pytest.raises(IsADirectoryError):
+        swap_link(target, occupied)
+    # Side-effect check: the existing dir must still be intact.
+    assert (occupied / "user_data").read_text() == "don't lose me"
