@@ -7,10 +7,18 @@ and serialized back the same way. Field aliases keep on-disk shapes clean.
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, cast
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 # ---------------------------------------------------------------------------
 # Validation helpers (also exported so callers can validate raw inputs).
@@ -166,3 +174,36 @@ class Tool(BaseModel):
                     f"expected one of {sorted(valid)}"
                 )
         return self
+
+
+# ---------------------------------------------------------------------------
+# Profile
+# ---------------------------------------------------------------------------
+
+
+class Profile(BaseModel):
+    """A named configuration snapshot that switcher can re-link to.
+
+    JSON is written with createdAt (camelCase). The serializer emits Z-suffixed
+    UTC ISO 8601 to match the spec example and stay readable. JSON read accepts
+    either createdAt or created_at so manually-edited metadata.json files don't
+    break.
+    """
+
+    name: str
+    created_at: datetime = Field(
+        validation_alias=AliasChoices("createdAt", "created_at"),
+        serialization_alias="createdAt",
+    )
+    tools: dict[str, bool]
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        return validate_safe_name(v)
+
+    @field_serializer("created_at")
+    def _serialize_created_at(self, v: datetime) -> str:
+        # Truncate to seconds, force UTC, emit Z (not +00:00)
+        utc = v.astimezone(UTC).replace(microsecond=0)
+        return utc.strftime("%Y-%m-%dT%H:%M:%SZ")

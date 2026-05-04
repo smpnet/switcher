@@ -1,11 +1,14 @@
 """Pydantic models for switcher's domain types."""
 
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import ValidationError
 
 from switcher.models import (
     CredentialFile,
     DirMapping,
+    Profile,
     Tool,
     validate_credential_path,
     validate_safe_name,
@@ -243,3 +246,47 @@ def test_tool_shorthand_and_explicit_credentials_coexist() -> None:
     )
     assert [c.config_dir for c in tool.credentials] == ["copilot-auth", "copilot-config"]
     assert [c.path for c in tool.credentials] == ["x.json", "y.json"]
+
+
+# ---------------- Profile ----------------
+
+
+def test_profile_basic() -> None:
+    p = Profile(
+        name="vanilla",
+        created_at=datetime(2026, 5, 4, 13, 42, 11, tzinfo=UTC),
+        tools={"claude": True, "copilot": True},
+    )
+    assert p.name == "vanilla"
+    assert p.tools["claude"] is True
+
+
+def test_profile_round_trips_json_with_camel_alias() -> None:
+    """Serializing uses createdAt (camel), deserializing accepts both."""
+    p = Profile(
+        name="vanilla",
+        created_at=datetime(2026, 5, 4, 13, 42, 11, tzinfo=UTC),
+        tools={"claude": True},
+    )
+    raw = p.model_dump_json(by_alias=True)
+    assert '"createdAt"' in raw
+    assert '"2026-05-04T13:42:11Z"' in raw
+    restored = Profile.model_validate_json(raw)
+    assert restored == p
+
+
+def test_profile_accepts_either_field_form() -> None:
+    """Reading metadata.json should work whether the file uses createdAt or
+    created_at (we always write the camel form, but be permissive on read)."""
+    raw = '{"name": "vanilla", "createdAt": "2026-05-04T13:42:11Z", "tools": {"claude": true}}'
+    p = Profile.model_validate_json(raw)
+    assert p.created_at == datetime(2026, 5, 4, 13, 42, 11, tzinfo=UTC)
+
+
+def test_profile_name_validated() -> None:
+    with pytest.raises(ValidationError):
+        Profile(
+            name="../escape",
+            created_at=datetime(2026, 5, 4, tzinfo=UTC),
+            tools={},
+        )
