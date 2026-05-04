@@ -1,0 +1,94 @@
+"""Two-layer registry: built-ins ship inside the wheel; users add TOMLs in
+`<state_dir>/registry.d/`. Same code path loads both. User entries override
+builtins (with a stderr warning)."""
+
+from __future__ import annotations
+
+import sys
+import tomllib
+from importlib.resources import files
+from importlib.resources.abc import Traversable
+from pathlib import Path
+
+from switcher.errors import StorageError
+from switcher.models import Tool
+
+
+def _load_toml_resource(resource: Traversable | Path) -> Tool:
+    """Parse one TOML file into a Tool. Wraps validation errors with file path."""
+    try:
+        with resource.open("rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"error parsing {resource}: {e}") from e
+    try:
+        return Tool.model_validate(data)
+    except Exception as e:
+        raise ValueError(f"error loading {resource}: {e}") from e
+
+
+def load_builtin_tools() -> tuple[Tool, ...]:
+    """Load every TOML inside the `switcher.builtins` package."""
+    pkg = files("switcher.builtins")
+    out: list[Tool] = []
+    for resource in sorted(pkg.iterdir(), key=lambda r: r.name):
+        if resource.name.endswith(".toml"):
+            out.append(_load_toml_resource(resource))
+    return tuple(out)
+
+
+def load_user_tools(registry_dir: Path) -> tuple[Tool, ...]:
+    """Load every *.toml in `registry_dir`, sorted by filename."""
+    if not registry_dir.is_dir():
+        return ()
+    return tuple(_load_toml_resource(p) for p in sorted(registry_dir.glob("*.toml")))
+
+
+def build_registry(registry_dir: Path) -> tuple[Tool, ...]:
+    """Merge builtins and user tools. User entries override builtins, with a
+    stderr warning so the override is visible.
+    """
+    by_id: dict[str, Tool] = {}
+    for t in load_builtin_tools():
+        by_id[t.id] = t
+    for t in load_user_tools(registry_dir):
+        if t.id in by_id:
+            print(
+                f"warning: user tool {t.id!r} overrides builtin",
+                file=sys.stderr,
+            )
+        by_id[t.id] = t
+    return tuple(by_id.values())
+
+
+def find_tool(registry: tuple[Tool, ...], tool_id: str) -> Tool | None:
+    for t in registry:
+        if t.id == tool_id:
+            return t
+    return None
+
+
+_SCAFFOLD_TEMPLATE = """\
+# Tool definition for {id}. Fill in `name` and adjust paths to match the tool's
+# actual on-disk layout, then drop this file into <state_dir>/registry.d/.
+id = "{id}"
+name = "<Display Name>"
+credential_files = []   # shorthand list, paths relative to first config_dir
+
+[[config_dirs]]
+posix_path = "~/.{id}"
+windows_path = "%USERPROFILE%\\\\.{id}"
+profile_subdir = "{id}"
+# env_override = "MYTOOL_HOME"   # optional; remove if no env override exists
+"""
+
+
+def scaffold_tool(tool_id: str, out_path: Path) -> None:
+    """Write a stub TOML for a new user tool to `out_path`.
+
+    Refuses to overwrite — raises StorageError if the file already exists.
+    """
+    if out_path.exists():
+        raise StorageError(f"refusing to overwrite {out_path}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(_SCAFFOLD_TEMPLATE.format(id=tool_id), encoding="utf-8")
