@@ -130,7 +130,14 @@ def move_or_seed_dir(live: Path, profile_target: Path) -> None:
     """
     profile_target.parent.mkdir(parents=True, exist_ok=True)
     is_link = live.is_symlink() or (IS_WINDOWS and os.path.isjunction(live))
-    if profile_target.exists() or profile_target.is_symlink():
+    # `is_symlink()` returns False for Windows junctions, and a *broken*
+    # junction also makes `exists()` return False — so we'd fall through
+    # to live.replace() and surface the raw OSError this guard exists to
+    # prevent. Mirror the junction handling we use elsewhere in this file.
+    target_is_link = profile_target.is_symlink() or (
+        IS_WINDOWS and os.path.isjunction(profile_target)
+    )
+    if profile_target.exists() or target_is_link:
         raise ProfileTargetExistsError(
             f"profile destination already exists: {profile_target}; "
             "this looks like a partial init — remove it manually before retrying"

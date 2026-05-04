@@ -181,3 +181,39 @@ def test_move_or_seed_rejects_existing_profile_target(tmp_path: Path) -> None:
     # Side effects: live must remain untouched, target must remain intact.
     assert (live / "data.json").read_text() == "{}"
     assert (target / "preexisting").read_text() == "from a previous run"
+
+
+def test_move_or_seed_rejects_existing_symlink_target(tmp_path: Path) -> None:
+    """A pre-existing symlink at profile_target must trip the precondition
+    too — `is_symlink()` covers POSIX symlinks (and Windows symbolic links,
+    on the rare systems with Developer Mode); junctions are covered in
+    the Windows-only test below."""
+    real = tmp_path / "real"
+    real.mkdir()
+    live = tmp_path / "live"
+    live.mkdir()
+    target = tmp_path / "profile" / "claude"
+    target.parent.mkdir(parents=True)
+    if sys.platform == "win32":
+        link_dir(real, target)
+    else:
+        target.symlink_to(real)
+    with pytest.raises(ProfileTargetExistsError):
+        move_or_seed_dir(live, target)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows junction-specific")
+def test_move_or_seed_rejects_existing_junction_target(tmp_path: Path) -> None:
+    """Windows junctions are not detected by `Path.is_symlink()`, and a
+    *broken* junction also fails `Path.exists()` — without an explicit
+    `os.path.isjunction()` arm the precondition would let the move fall
+    through to a raw OSError. Pin that hole shut."""
+    real = tmp_path / "real"
+    real.mkdir()
+    live = tmp_path / "live"
+    live.mkdir()
+    target = tmp_path / "profile" / "claude"
+    target.parent.mkdir(parents=True)
+    link_dir(real, target)
+    with pytest.raises(ProfileTargetExistsError):
+        move_or_seed_dir(live, target)
