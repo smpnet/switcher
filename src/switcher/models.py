@@ -218,13 +218,16 @@ class Profile(BaseModel):
 
     @field_validator("created_at")
     @classmethod
-    def _require_aware_datetime(cls, v: datetime) -> datetime:
+    def _normalize_created_at(cls, v: datetime) -> datetime:
         # Reject naive datetimes: astimezone(UTC) on a naive value silently
         # interprets it as local time and shifts the wall clock the user
         # typed. Forcing tz-awareness keeps round-trips stable.
         if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
             raise ValueError("created_at must include a timezone (got naive datetime)")
-        return v
+        # Truncate microseconds at validation time too — the wire format only
+        # carries whole seconds, so normalizing on input keeps in-memory state
+        # equal to what comes back through JSON round-trip.
+        return v.replace(microsecond=0)
 
     @field_serializer("created_at")
     def _serialize_created_at(self, v: datetime) -> str:

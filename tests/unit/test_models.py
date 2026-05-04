@@ -367,6 +367,20 @@ def test_profile_name_validated() -> None:
         )
 
 
+def test_profile_round_trip_stable_with_microseconds() -> None:
+    """Serialization truncates to whole seconds; validation must normalize the
+    same way so a Profile created with sub-second precision round-trips equal
+    via JSON. Otherwise the wire format silently disagrees with in-memory state."""
+    p = Profile(
+        name="vanilla",
+        created_at=datetime(2026, 5, 4, 13, 42, 11, 123456, tzinfo=UTC),
+        tools={"claude": True},
+    )
+    restored = Profile.model_validate_json(p.model_dump_json(by_alias=True))
+    assert restored == p
+    assert p.created_at.microsecond == 0
+
+
 def test_profile_rejects_naive_datetime() -> None:
     """Naive datetimes silently shift on astimezone(UTC) — reject them so the
     written timestamp can never disagree with the wall clock the user typed."""

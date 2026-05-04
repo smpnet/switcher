@@ -48,10 +48,17 @@ class PathResolver:
     def state_dir(self) -> Path:
         """Where switcher stores its profiles + config.json.
 
-        SWITCHER_STATE_DIR overrides the platformdirs default. Used for test
-        isolation and as a power-user override. Routed through `self.expand()`
-        so `~` and `$VAR`/`%VAR%` resolve against the configured home, keeping
-        the override consistent with every other path the resolver emits.
+        Two layers:
+          * `SWITCHER_STATE_DIR` (test isolation + power-user override) — routed
+            through `self.expand()` so `~` and `$VAR`/`%VAR%` resolve against
+            the configured home, consistent with every other path the resolver
+            emits.
+          * Otherwise, `platformdirs.user_data_dir("switcher")` — XDG / Library /
+            LOCALAPPDATA semantics. **Note:** this fallback intentionally
+            consults the OS environment (XDG_DATA_HOME, %LOCALAPPDATA%, etc.),
+            not the injected `home`. The injected-home contract governs `expand()`
+            and the env-override branch above; tests that need a private state
+            dir should set `SWITCHER_STATE_DIR`, not rely on `home=`.
         """
         env = os.environ.get("SWITCHER_STATE_DIR")
         if env:
