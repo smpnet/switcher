@@ -29,10 +29,19 @@ _RESERVED = frozenset(
 
 
 def validate_safe_name(value: str) -> str:
-    """Reject names that aren't safe to use as filesystem path segments."""
+    """Reject names that aren't safe to use as filesystem path segments.
+
+    Cross-platform: rejects POSIX traversal and unsafe characters via the
+    name regex; rejects Windows reserved device names by stem (e.g. CON.txt
+    is reserved, not just CON) and Windows-illegal trailing dots.
+    """
     if not _NAME_RE.fullmatch(value):
         raise ValueError(f"invalid name {value!r}: must match {_NAME_RE.pattern}")
-    if value.upper() in _RESERVED:
+    if value.endswith("."):
+        raise ValueError(f"invalid name {value!r}: must not end with a dot")
+    # Windows reserves device names by stem (CON.txt is also reserved)
+    stem = value.split(".", 1)[0].upper()
+    if stem in _RESERVED:
         raise ValueError(f"reserved name {value!r}")
     return value
 

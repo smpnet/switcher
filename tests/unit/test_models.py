@@ -41,6 +41,23 @@ def test_safe_name_rejects_windows_reserved(name: str) -> None:
         validate_safe_name(name)
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["CON.txt", "con.json", "PRN.log", "Aux.bat", "nul.cfg", "COM1.dat", "lpt9.tmp"],
+)
+def test_safe_name_rejects_windows_reserved_by_stem(name: str) -> None:
+    """Windows reserves device names by stem, not just exact match."""
+    with pytest.raises(ValueError, match="reserved"):
+        validate_safe_name(name)
+
+
+@pytest.mark.parametrize("name", ["profile.", "client.A.", "v_1.2."])
+def test_safe_name_rejects_trailing_dot(name: str) -> None:
+    """Windows disallows filenames with trailing dots."""
+    with pytest.raises(ValueError):
+        validate_safe_name(name)
+
+
 # ---------------- validate_credential_path ----------------
 
 
