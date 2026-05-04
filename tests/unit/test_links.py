@@ -34,7 +34,7 @@ def test_swap_link_creates_link_when_missing(tmp_path: Path) -> None:
     target.mkdir()
     link = tmp_path / "link"
     swap_link(target, link)
-    assert (link / "x" if (link / "x").exists() else link).exists()
+    assert link.exists()
     # Confirm it's a link of some kind
     if sys.platform == "win32":
         assert link.is_symlink() or os.path.isjunction(link)

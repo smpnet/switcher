@@ -76,17 +76,21 @@ class PathResolver:
 
         Per-DirMapping env override semantics:
           1. if config_dirs[dir_index].env_override is set AND the env var is
-             present in os.environ, use it (after expanduser).
+             present in os.environ, route it through `self.expand()` — same
+             contract as posix_path/windows_path entries (host-platform env
+             vars + `~` against the configured home; `~username` rejected).
           2. else expand the OS-appropriate field (windows_path or posix_path).
 
         Each DirMapping carries its own override (or none); multi-dir tools
-        never collapse to a single env path.
+        never collapse to a single env path. Routing overrides through
+        `expand()` keeps test/CLI sandboxing consistent — same precedent as
+        the `SWITCHER_STATE_DIR` handling in `state_dir()`.
         """
         mapping = tool.config_dirs[dir_index]
         if mapping.env_override:
             override = os.environ.get(mapping.env_override)
             if override:
-                return Path(override).expanduser()
+                return self.expand(override)
         raw = mapping.windows_path if IS_WINDOWS else mapping.posix_path
         return self.expand(raw)
 

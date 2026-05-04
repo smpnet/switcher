@@ -162,3 +162,43 @@ def test_tool_dir_per_mapping_isolation(
         assert dir1 == home / ".copilot"
     else:
         assert dir1 == home / ".copilot"
+
+
+def test_tool_dir_env_override_expands_env_vars(
+    resolver: PathResolver, monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    """An env-var override value must obey the same expansion rules as
+    posix_path/windows_path entries — host-platform env-var syntax against
+    the configured home. Otherwise overrides like
+    `GH_COPILOT_AUTH=$XDG_CONFIG_HOME/foo` (POSIX) or
+    `%LOCALAPPDATA%\\foo` (Windows) are treated as literal paths."""
+    if IS_WINDOWS:
+        monkeypatch.setenv("LOCALAPPDATA", str(home / "appdata"))
+        monkeypatch.setenv("GH_COPILOT_AUTH", "%LOCALAPPDATA%\\custom")
+    else:
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+        monkeypatch.setenv("GH_COPILOT_AUTH", "$XDG_CONFIG_HOME/custom")
+    tool = _two_dir_tool()
+    expected = (home / "appdata" / "custom") if IS_WINDOWS else (home / "xdg" / "custom")
+    assert resolver.tool_dir(tool, 0) == expected
+
+
+def test_tool_dir_env_override_expands_tilde(
+    resolver: PathResolver, monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    """`~` in an override must resolve against the injected home, not the
+    process user's real home — so test/CLI overrides stay sandboxed."""
+    monkeypatch.setenv("GH_COPILOT_AUTH", "~/custom")
+    tool = _two_dir_tool()
+    assert resolver.tool_dir(tool, 0) == home / "custom"
+
+
+def test_tool_dir_env_override_rejects_other_user_tilde(
+    resolver: PathResolver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`~username` is rejected by `expand()` — overrides must inherit that
+    rejection so a misconfigured env var fails loudly, not silently."""
+    monkeypatch.setenv("GH_COPILOT_AUTH", "~otheruser/foo")
+    tool = _two_dir_tool()
+    with pytest.raises(ValueError, match="username"):
+        resolver.tool_dir(tool, 0)
