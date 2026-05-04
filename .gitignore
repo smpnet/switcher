@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# Virtualenv / pixi
+.venv/
+.pixi/
+
+# Worktrees per CLAUDE.md
+.worktrees/
+
+# Local-only docs (specs and plans not in GitHub)
+docs/superpowers/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
