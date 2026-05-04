@@ -1,0 +1,9 @@
+id = "claude"
+name = "Claude Code"
+credential_files = [".credentials.json"]   # shorthand → first config_dir
+
+[[config_dirs]]
+posix_path = "~/.claude"
+windows_path = "%USERPROFILE%\\.claude"
+profile_subdir = "claude"
+env_override = "CLAUDE_CONFIG_DIR"
