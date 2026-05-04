@@ -1,0 +1,27 @@
+[workspace]
+name = "switcher"
+channels = ["conda-forge"]
+platforms = ["osx-64", "osx-arm64", "linux-64", "win-64"]
+
+[dependencies]
+python = ">=3.13,<3.14"
+pip = "*"
+
+[pypi-dependencies]
+switcher = { path = ".", editable = true }
+ruff = ">=0.6"
+basedpyright = "*"
+pytest = ">=8"
+pytest-cov = "*"
+freezegun = "*"
+build = "*"
+
+[tasks]
+test = "pytest tests/unit"
+test-integration = "pytest tests/integration -m integration"
+test-e2e = "pytest tests/e2e -m e2e"
+lint = { cmd = "ruff check src tests && ruff format --check src tests" }
+format = "ruff format src tests"
+typecheck = "basedpyright src tests"
+build = "python -m build"
+ci = { depends-on = ["lint", "typecheck", "test", "test-integration", "test-e2e"] }

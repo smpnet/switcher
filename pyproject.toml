@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "switcher"
+version = "0.1.0"
+description = "Switch between AI-agent configuration profiles in one command"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Switcher Authors" }]
+dependencies = [
+  "typer>=0.12",
+  "pydantic>=2.7",
+  "rich>=13.0",
+  "platformdirs>=4.0",
+]
+
+[project.scripts]
+switcher = "switcher.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/switcher"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/switcher/builtins" = "switcher/builtins"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "PTH", "RUF", "SIM"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B011"]  # allow `assert False` in tests
+
+[tool.basedpyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"
+pythonVersion = "3.13"
+reportMissingTypeStubs = false
+reportUnknownParameterType = "none"  # too noisy for typer/pydantic
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: integration tests (real filesystem)",
+  "e2e: end-to-end tests (subprocess)",
+]
+testpaths = ["tests"]
+addopts = "-ra"
