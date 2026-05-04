@@ -202,6 +202,38 @@ def test_move_or_seed_rejects_existing_symlink_target(tmp_path: Path) -> None:
         move_or_seed_dir(live, target)
 
 
+def test_move_or_seed_failed_precondition_leaves_no_debris(tmp_path: Path) -> None:
+    """A failed `move_or_seed_dir` must not have already created
+    profile_target's parent — init retries should encounter the same
+    filesystem state as a fresh attempt, not a half-built dir tree."""
+    live = tmp_path / "live"
+    live.write_text("not a directory")  # triggers PathNotADirectoryError
+    target = tmp_path / "profile" / "claude"
+    assert not target.parent.exists()
+    with pytest.raises(PathNotADirectoryError):
+        move_or_seed_dir(live, target)
+    # The error path must not have left target.parent behind.
+    assert not target.parent.exists()
+
+
+def test_move_or_seed_existing_target_leaves_no_debris(tmp_path: Path) -> None:
+    """ProfileTargetExistsError must also not leak parent-mkdir side effects.
+    The parent already exists in this test (we mkdir'd it to host the
+    target), but we still confirm the function didn't add any debris
+    underneath it beyond what we set up."""
+    live = tmp_path / "live"
+    live.mkdir()
+    target = tmp_path / "profile" / "claude"
+    target.mkdir(parents=True)
+    sibling = target.parent / "sibling-must-not-appear"
+    with pytest.raises(ProfileTargetExistsError):
+        move_or_seed_dir(live, target)
+    assert not sibling.exists()
+    # And the original directories are still intact.
+    assert live.is_dir()
+    assert target.is_dir()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows junction-specific")
 def test_move_or_seed_rejects_existing_junction_target(tmp_path: Path) -> None:
     """Windows junctions are not detected by `Path.is_symlink()`, and a

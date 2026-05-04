@@ -127,8 +127,11 @@ def move_or_seed_dir(live: Path, profile_target: Path) -> None:
     silently overwrite an empty target on POSIX or surface as a raw
     OSError on Windows. We pre-check and raise ProfileTargetExistsError
     so the CLI can give actionable advice instead.
+
+    All preconditions are validated *before* any filesystem mutation, so a
+    failed call leaves no debris (no half-created `profile_target.parent`
+    behind). Init retries see the same FS state as a fresh attempt.
     """
-    profile_target.parent.mkdir(parents=True, exist_ok=True)
     is_link = live.is_symlink() or (IS_WINDOWS and os.path.isjunction(live))
     # `is_symlink()` returns False for Windows junctions, and a *broken*
     # junction also makes `exists()` return False — so we'd fall through
@@ -142,11 +145,14 @@ def move_or_seed_dir(live: Path, profile_target: Path) -> None:
             f"profile destination already exists: {profile_target}; "
             "this looks like a partial init — remove it manually before retrying"
         )
-    if not live.exists() and not is_link:
-        profile_target.mkdir(exist_ok=False)
-        return
     if is_link:
         raise AlreadyLinkedError(f"{live} is already a link; refusing to move")
-    if not live.is_dir():
+    if live.exists() and not live.is_dir():
         raise PathNotADirectoryError(f"{live} exists but is not a directory")
+
+    # Preconditions all passed — only now mutate the filesystem.
+    profile_target.parent.mkdir(parents=True, exist_ok=True)
+    if not live.exists():
+        profile_target.mkdir(exist_ok=False)
+        return
     live.replace(profile_target)
