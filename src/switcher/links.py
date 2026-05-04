@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from switcher.errors import AlreadyLinkedError, PathNotADirectoryError
+
 IS_WINDOWS = sys.platform == "win32"
 
 
@@ -75,3 +77,24 @@ def swap_link(target: Path, link_path: Path) -> None:
     link_path.parent.mkdir(parents=True, exist_ok=True)
     link_dir(target, tmp)
     tmp.replace(link_path)
+
+
+def move_or_seed_dir(live: Path, profile_target: Path) -> None:
+    """Move a live config dir into a profile, or seed an empty one if missing.
+
+    Used by `init` to migrate live config dirs. The four cases:
+      missing live           → create empty dir at profile_target
+      symlink/junction live  → AlreadyLinkedError
+      file (non-dir) live    → PathNotADirectoryError
+      real dir live          → os.replace (atomic move)
+    """
+    profile_target.parent.mkdir(parents=True, exist_ok=True)
+    is_link = live.is_symlink() or (IS_WINDOWS and os.path.isjunction(live))
+    if not live.exists() and not is_link:
+        profile_target.mkdir(parents=True, exist_ok=False)
+        return
+    if is_link:
+        raise AlreadyLinkedError(f"{live} is already a link; refusing to move")
+    if not live.is_dir():
+        raise PathNotADirectoryError(f"{live} exists but is not a directory")
+    live.replace(profile_target)
