@@ -162,14 +162,36 @@ class Tool(BaseModel):
         src = cast(dict[str, Any], data)
         out: dict[str, Any] = dict(src)
         shorthand = out.pop("credential_files")
+        # mode="before" runs before child fields are coerced, so malformed
+        # shapes have to be rejected here with a clean message — otherwise a
+        # bare string expands to one credential per character, and a `[{}]`
+        # config_dirs raises KeyError instead of ValidationError.
+        if isinstance(shorthand, str) or not isinstance(shorthand, (list, tuple)):
+            raise ValueError(
+                "credential_files must be a list of relative file paths "
+                f"(got {type(shorthand).__name__})"
+            )
+        if not all(isinstance(p, str) for p in shorthand):
+            raise ValueError("credential_files entries must be strings")
         config_dirs = out.get("config_dirs") or []
         if not config_dirs:
             raise ValueError("credential_files shorthand requires at least one config_dir")
-        first = config_dirs[0]
+        first: Any = cast(Any, config_dirs[0])
         # `mode="before"` runs before child models are coerced, but Python
         # callers can still pass already-built DirMapping instances. Handle
         # both shapes so the shorthand works from TOML and from Python.
-        first_subdir = first["profile_subdir"] if isinstance(first, dict) else first.profile_subdir
+        if isinstance(first, dict):
+            if "profile_subdir" not in first:
+                raise ValueError(
+                    "credential_files shorthand requires config_dirs[0].profile_subdir"
+                )
+            first_subdir = first["profile_subdir"]
+        else:
+            first_subdir = getattr(first, "profile_subdir", None)
+            if first_subdir is None:
+                raise ValueError(
+                    "credential_files shorthand requires config_dirs[0].profile_subdir"
+                )
         expanded: list[Any] = [{"config_dir": first_subdir, "path": p} for p in shorthand]
         # `credentials` may arrive as a tuple (Python idiom) or list (TOML);
         # normalize via list() so concatenation never raises.

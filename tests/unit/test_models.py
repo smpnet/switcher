@@ -245,6 +245,40 @@ def test_tool_shorthand_works_with_dirmapping_instances() -> None:
     assert tool.credentials[0].path == ".credentials.json"
 
 
+def test_tool_shorthand_rejects_string_credential_files() -> None:
+    """A bare string would otherwise expand to one credential per character —
+    the user almost certainly meant `[".credentials.json"]`."""
+    with pytest.raises(ValidationError, match="credential_files"):
+        Tool.model_validate(
+            {
+                "id": "claude",
+                "name": "Claude Code",
+                "credential_files": ".credentials.json",
+                "config_dirs": [
+                    {
+                        "posix_path": "~/.claude",
+                        "windows_path": "%USERPROFILE%\\.claude",
+                        "profile_subdir": "claude",
+                    }
+                ],
+            }
+        )
+
+
+def test_tool_shorthand_rejects_missing_profile_subdir_on_first_dir() -> None:
+    """An empty dict in config_dirs[0] would raise KeyError pre-validation —
+    surface a clean ValidationError instead."""
+    with pytest.raises(ValidationError, match="profile_subdir"):
+        Tool.model_validate(
+            {
+                "id": "claude",
+                "name": "Claude Code",
+                "credential_files": [".credentials.json"],
+                "config_dirs": [{}],
+            }
+        )
+
+
 def test_tool_shorthand_does_not_mutate_caller_input() -> None:
     """The mode='before' validator must not pop keys from the caller's dict.
     Re-using the same payload twice should still expand both times."""
