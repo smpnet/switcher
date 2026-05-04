@@ -49,11 +49,13 @@ class PathResolver:
         """Where switcher stores its profiles + config.json.
 
         SWITCHER_STATE_DIR overrides the platformdirs default. Used for test
-        isolation and as a power-user override.
+        isolation and as a power-user override. Routed through `self.expand()`
+        so `~` and `$VAR`/`%VAR%` resolve against the configured home, keeping
+        the override consistent with every other path the resolver emits.
         """
         env = os.environ.get("SWITCHER_STATE_DIR")
         if env:
-            return Path(env).expanduser()
+            return self.expand(env)
         return Path(platformdirs.user_data_dir("switcher"))
 
     def exists(self, p: Path) -> bool:

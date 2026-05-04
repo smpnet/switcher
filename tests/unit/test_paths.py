@@ -70,6 +70,16 @@ def test_state_dir_uses_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert r.state_dir() == tmp_path / "state"
 
 
+def test_state_dir_env_override_expands_against_injected_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SWITCHER_STATE_DIR must expand `~` against the injected home, not the
+    process user's real home — otherwise the test/override contract leaks."""
+    monkeypatch.setenv("SWITCHER_STATE_DIR", "~/state")
+    r = PathResolver(home=tmp_path)
+    assert r.state_dir() == tmp_path / "state"
+
+
 def test_state_dir_falls_back_to_platformdirs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
