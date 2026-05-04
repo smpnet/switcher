@@ -1,6 +1,6 @@
 """Pydantic models for switcher's domain types."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -413,6 +413,23 @@ def test_profile_round_trip_stable_with_microseconds() -> None:
     restored = Profile.model_validate_json(p.model_dump_json(by_alias=True))
     assert restored == p
     assert p.created_at.microsecond == 0
+
+
+def test_profile_round_trip_stable_with_non_utc_offset() -> None:
+    """Serialization converts to UTC; validation must convert too, otherwise
+    a +02:00 datetime survives in memory but reads back as UTC after JSON,
+    which breaks Profile equality across the round-trip."""
+    plus_two = timezone(timedelta(hours=2))
+    p = Profile(
+        name="vanilla",
+        created_at=datetime(2026, 5, 4, 15, 42, 11, tzinfo=plus_two),
+        tools={"claude": True},
+    )
+    # Same instant, normalized form
+    assert p.created_at == datetime(2026, 5, 4, 13, 42, 11, tzinfo=UTC)
+    assert p.created_at.utcoffset() == timedelta(0)
+    restored = Profile.model_validate_json(p.model_dump_json(by_alias=True))
+    assert restored == p
 
 
 def test_profile_rejects_naive_datetime() -> None:

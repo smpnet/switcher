@@ -29,12 +29,16 @@ class PathResolver:
     def expand(self, path: str) -> Path:
         """Expand env vars and tildes against the configured home.
 
-        Order: env-var expansion first, then tilde, so values like `$HOME/foo`
-        and `%USERPROFILE%\\foo` work without depending on Path.home().
+        Uses **the host platform's** env-var syntax: `$VAR` on POSIX, `%VAR%`
+        on Windows (this is `os.path.expandvars`'s contract). Cross-syntax
+        expansion is intentionally *not* supported — the registry already
+        carries `posix_path`/`windows_path` per DirMapping and the caller
+        picks the platform-correct one before passing it here, so `expand()`
+        never sees foreign syntax in practice.
 
-        Only `~` and `~/...` are accepted; the POSIX `~username` form (resolve
-        another user's home) would otherwise be silently misread as a path
-        segment under the configured home, so it is rejected explicitly.
+        Only `~` and `~/...` are accepted; the POSIX `~username` form
+        (resolve another user's home) would otherwise be silently misread as
+        a path segment under the configured home, so it is rejected.
         """
         expanded = os.path.expandvars(path)
         if expanded == "~":

@@ -246,10 +246,10 @@ class Profile(BaseModel):
         # typed. Forcing tz-awareness keeps round-trips stable.
         if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
             raise ValueError("created_at must include a timezone (got naive datetime)")
-        # Truncate microseconds at validation time too — the wire format only
-        # carries whole seconds, so normalizing on input keeps in-memory state
-        # equal to what comes back through JSON round-trip.
-        return v.replace(microsecond=0)
+        # Normalize to the wire form on input too: convert to UTC and drop
+        # microseconds. Otherwise a +02:00 datetime would survive in memory
+        # but read back as UTC after JSON round-trip, breaking Profile equality.
+        return v.astimezone(UTC).replace(microsecond=0)
 
     @field_serializer("created_at")
     def _serialize_created_at(self, v: datetime) -> str:
