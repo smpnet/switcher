@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from switcher.errors import ProfileExistsError, StorageError, UnknownProfileError
-from switcher.models import Profile
+from switcher.models import Profile, validate_safe_name
 
 
 class ProfileStore(Protocol):
@@ -46,7 +46,10 @@ class FileProfileStore:
         return self._state_dir
 
     def profile_dir(self, name: str) -> Path:
-        return self._state_dir / "profiles" / name
+        # Validate at the choke point: every CRUD method routes through here,
+        # so any caller (incl. the Protocol's external implementers) is forced
+        # through validate_safe_name before a name can become a real path.
+        return self._state_dir / "profiles" / validate_safe_name(name)
 
     def _profiles_dir(self) -> Path:
         return self._state_dir / "profiles"
@@ -62,8 +65,14 @@ class FileProfileStore:
     def _atomic_write(self, path: Path, data: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(data, encoding="utf-8")
-        tmp.replace(path)
+        try:
+            tmp.write_text(data, encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            # Don't leave a half-written sibling on disk; missing_ok handles
+            # the case where write_text never created the file.
+            tmp.unlink(missing_ok=True)
+            raise
 
     # -- profile CRUD -------------------------------------------------------
 
@@ -104,12 +113,17 @@ class FileProfileStore:
         shutil.rmtree(d)
 
     def rename(self, old: str, new: str) -> None:
-        if not self.profile_dir(old).exists():
+        # Validate both names up front so an invalid `new` is rejected even
+        # when `old` doesn't exist (otherwise UnknownProfileError shadows the
+        # safer-failure ValueError from validate_safe_name).
+        old_dir = self.profile_dir(old)
+        new_dir = self.profile_dir(new)
+        if not old_dir.exists():
             raise UnknownProfileError(f"profile {old!r} not found")
-        if self.profile_dir(new).exists():
+        if new_dir.exists():
             raise ProfileExistsError(f"profile {new!r} already exists")
-        self.profile_dir(new).parent.mkdir(parents=True, exist_ok=True)
-        self.profile_dir(old).replace(self.profile_dir(new))
+        new_dir.parent.mkdir(parents=True, exist_ok=True)
+        old_dir.replace(new_dir)
         existing = self.get(new)
         renamed = Profile(name=new, created_at=existing.created_at, tools=existing.tools)
         self._atomic_write(

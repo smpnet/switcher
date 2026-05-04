@@ -108,3 +108,35 @@ def test_atomic_write_no_partial_file(store: FileProfileStore, tmp_path: Path) -
     names = [f.name for f in files]
     assert "config.json" in names
     assert all(not n.endswith(".tmp") for n in names)
+
+
+def test_atomic_write_cleans_tmp_on_replace_failure(
+    store: FileProfileStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If replace() fails mid-write, the .tmp sibling must not survive."""
+
+    def _boom(self: Path, _target: Path) -> Path:
+        raise OSError("boom")
+
+    monkeypatch.setattr(Path, "replace", _boom)
+    with pytest.raises(OSError, match="boom"):
+        store.set_active({"claude": "vanilla"})
+    state = tmp_path / "state"
+    leftover = [p.name for p in state.iterdir() if p.name.endswith(".tmp")]
+    assert leftover == []
+
+
+@pytest.mark.parametrize("bad_name", ["../etc", "../../escape", "a/b", ".hidden"])
+def test_profile_methods_reject_unsafe_names(store: FileProfileStore, bad_name: str) -> None:
+    """profile_dir is a choke point — every method routing through it must
+    refuse path-traversal-style names so callers cannot escape the state dir."""
+    with pytest.raises(ValueError):
+        store.get(bad_name)
+    with pytest.raises(ValueError):
+        store.delete(bad_name)
+    with pytest.raises(ValueError):
+        store.create(bad_name, {})
+    with pytest.raises(ValueError):
+        store.rename(bad_name, "new")
+    with pytest.raises(ValueError):
+        store.rename("old", bad_name)
