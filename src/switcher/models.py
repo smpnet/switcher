@@ -158,7 +158,11 @@ class Tool(BaseModel):
         config_dirs = data.get("config_dirs") or []
         if not config_dirs:
             raise ValueError("credential_files shorthand requires at least one config_dir")
-        first_subdir = config_dirs[0]["profile_subdir"]
+        first = config_dirs[0]
+        # `mode="before"` runs before child models are coerced, but Python
+        # callers can still pass already-built DirMapping instances. Handle
+        # both shapes so the shorthand works from TOML and from Python.
+        first_subdir = first["profile_subdir"] if isinstance(first, dict) else first.profile_subdir
         expanded: list[Any] = [{"config_dir": first_subdir, "path": p} for p in shorthand]
         existing = cast(list[Any], data.get("credentials") or [])
         data["credentials"] = expanded + existing
@@ -201,6 +205,16 @@ class Profile(BaseModel):
     @classmethod
     def _validate_name(cls, v: str) -> str:
         return validate_safe_name(v)
+
+    @field_validator("created_at")
+    @classmethod
+    def _require_aware_datetime(cls, v: datetime) -> datetime:
+        # Reject naive datetimes: astimezone(UTC) on a naive value silently
+        # interprets it as local time and shifts the wall clock the user
+        # typed. Forcing tz-awareness keeps round-trips stable.
+        if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+            raise ValueError("created_at must include a timezone (got naive datetime)")
+        return v
 
     @field_serializer("created_at")
     def _serialize_created_at(self, v: datetime) -> str:

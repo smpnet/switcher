@@ -222,6 +222,27 @@ def test_tool_shorthand_credential_files_expand() -> None:
     assert tool.credentials[0].path == ".credentials.json"
 
 
+def test_tool_shorthand_works_with_dirmapping_instances() -> None:
+    """Python callers can pass DirMapping instances directly; shorthand
+    expansion must handle both raw dicts (TOML path) and instances."""
+    tool = Tool.model_validate(
+        {
+            "id": "claude",
+            "name": "Claude Code",
+            "credential_files": [".credentials.json"],
+            "config_dirs": [
+                DirMapping(
+                    posix_path="~/.claude",
+                    windows_path="%USERPROFILE%\\.claude",
+                    profile_subdir="claude",
+                )
+            ],
+        }
+    )
+    assert tool.credentials[0].config_dir == "claude"
+    assert tool.credentials[0].path == ".credentials.json"
+
+
 def test_tool_shorthand_and_explicit_credentials_coexist() -> None:
     """Both forms can appear; shorthand entries are listed first."""
     tool = Tool.model_validate(
@@ -288,5 +309,16 @@ def test_profile_name_validated() -> None:
         Profile(
             name="../escape",
             created_at=datetime(2026, 5, 4, tzinfo=UTC),
+            tools={},
+        )
+
+
+def test_profile_rejects_naive_datetime() -> None:
+    """Naive datetimes silently shift on astimezone(UTC) — reject them so the
+    written timestamp can never disagree with the wall clock the user typed."""
+    with pytest.raises(ValidationError, match="timezone"):
+        Profile(
+            name="vanilla",
+            created_at=datetime(2026, 5, 4, 13, 42, 11),
             tools={},
         )
