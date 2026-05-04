@@ -78,6 +78,8 @@ def test_credential_path_accepts_relative(p: str) -> None:
     [
         "/etc/passwd",  # absolute POSIX
         "C:\\Windows\\foo",  # absolute Windows
+        "C:foo",  # Windows drive-relative — not is_absolute(), but unsafe
+        "\\Windows\\foo",  # Windows root-of-current-drive — not is_absolute()
         "~/foo",  # home-relative
         "../escape",  # parent traversal
         "a/../b",  # parent in middle
@@ -243,6 +245,51 @@ def test_tool_shorthand_works_with_dirmapping_instances() -> None:
     assert tool.credentials[0].path == ".credentials.json"
 
 
+def test_tool_shorthand_does_not_mutate_caller_input() -> None:
+    """The mode='before' validator must not pop keys from the caller's dict.
+    Re-using the same payload twice should still expand both times."""
+    payload = {
+        "id": "claude",
+        "name": "Claude Code",
+        "credential_files": [".credentials.json"],
+        "config_dirs": [
+            {
+                "posix_path": "~/.claude",
+                "windows_path": "%USERPROFILE%\\.claude",
+                "profile_subdir": "claude",
+            }
+        ],
+    }
+    Tool.model_validate(payload)
+    # Caller dict still carries the shorthand key, untouched.
+    assert payload.get("credential_files") == [".credentials.json"]
+    # Validating again from the same dict still produces credentials.
+    again = Tool.model_validate(payload)
+    assert again.credentials[0].path == ".credentials.json"
+
+
+def test_tool_shorthand_with_tuple_explicit_credentials() -> None:
+    """Python callers idiomatically pass tuple values for tuple-typed fields.
+    Shorthand expansion must produce a list-compatible result so concatenating
+    onto a tuple input does not raise TypeError."""
+    tool = Tool.model_validate(
+        {
+            "id": "claude",
+            "name": "Claude Code",
+            "credential_files": [".credentials.json"],
+            "config_dirs": (
+                DirMapping(
+                    posix_path="~/.claude",
+                    windows_path="%USERPROFILE%\\.claude",
+                    profile_subdir="claude",
+                ),
+            ),
+            "credentials": (CredentialFile(config_dir="claude", path="other.json"),),
+        }
+    )
+    assert [c.path for c in tool.credentials] == [".credentials.json", "other.json"]
+
+
 def test_tool_shorthand_and_explicit_credentials_coexist() -> None:
     """Both forms can appear; shorthand entries are listed first."""
     tool = Tool.model_validate(
@@ -300,6 +347,13 @@ def test_profile_accepts_either_field_form() -> None:
     """Reading metadata.json should work whether the file uses createdAt or
     created_at (we always write the camel form, but be permissive on read)."""
     raw = '{"name": "vanilla", "createdAt": "2026-05-04T13:42:11Z", "tools": {"claude": true}}'
+    p = Profile.model_validate_json(raw)
+    assert p.created_at == datetime(2026, 5, 4, 13, 42, 11, tzinfo=UTC)
+
+
+def test_profile_accepts_snake_case_on_read() -> None:
+    """The docstring promises snake_case is also accepted on read."""
+    raw = '{"name": "vanilla", "created_at": "2026-05-04T13:42:11Z", "tools": {"claude": true}}'
     p = Profile.model_validate_json(raw)
     assert p.created_at == datetime(2026, 5, 4, 13, 42, 11, tzinfo=UTC)
 

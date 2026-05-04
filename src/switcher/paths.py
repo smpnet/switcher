@@ -31,11 +31,18 @@ class PathResolver:
 
         Order: env-var expansion first, then tilde, so values like `$HOME/foo`
         and `%USERPROFILE%\\foo` work without depending on Path.home().
+
+        Only `~` and `~/...` are accepted; the POSIX `~username` form (resolve
+        another user's home) would otherwise be silently misread as a path
+        segment under the configured home, so it is rejected explicitly.
         """
         expanded = os.path.expandvars(path)
+        if expanded == "~":
+            return self._home
+        if expanded.startswith(("~/", "~\\")):
+            return self._home / expanded[2:]
         if expanded.startswith("~"):
-            tail = expanded[1:].lstrip("/\\")
-            return (self._home / tail) if tail else self._home
+            raise ValueError(f"~username expansion is not supported: {expanded!r}")
         return Path(expanded)
 
     def state_dir(self) -> Path:

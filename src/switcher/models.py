@@ -59,18 +59,21 @@ def validate_credential_path(value: str) -> str:
     """Credential paths must be relative and not contain `..`.
 
     Cross-platform: rejects POSIX-absolute (/etc/...), Windows-absolute
-    (C:\\...), UNC (\\\\server\\share), and home-relative (~/...) regardless
-    of the host OS so the same registry data is portable.
+    (C:\\...), UNC (\\\\server\\share), home-relative (~/...), Windows
+    drive-relative (C:foo) and root-of-current-drive (\\Windows\\foo)
+    regardless of the host OS, so the same registry data is portable.
     """
     if not value or value == ".":
         raise ValueError(f"credential path must name a file: {value!r}")
     if value.startswith("~"):
         raise ValueError(f"credential path must be relative: {value!r}")
-    if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():
+    pp = PurePosixPath(value)
+    pw = PureWindowsPath(value)
+    # is_absolute() misses Windows drive-relative ("C:foo") and root-only
+    # ("\\Windows\\foo") forms; reject anything with a drive or root too.
+    if pp.is_absolute() or pw.is_absolute() or pw.drive or pw.root:
         raise ValueError(f"credential path must be relative: {value!r}")
-    posix_parts = PurePosixPath(value).parts
-    windows_parts = PureWindowsPath(value).parts
-    if ".." in posix_parts or ".." in windows_parts:
+    if ".." in pp.parts or ".." in pw.parts:
         raise ValueError(f"credential path must not contain '..': {value!r}")
     return value
 
@@ -152,10 +155,14 @@ class Tool(BaseModel):
     def _expand_credential_files(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
-        shorthand = data.pop("credential_files", None)
-        if shorthand is None:
+        if "credential_files" not in data:
             return data
-        config_dirs = data.get("config_dirs") or []
+        # Copy so we don't mutate the caller's dict — re-validating the same
+        # payload twice must produce the same result.
+        src = cast(dict[str, Any], data)
+        out: dict[str, Any] = dict(src)
+        shorthand = out.pop("credential_files")
+        config_dirs = out.get("config_dirs") or []
         if not config_dirs:
             raise ValueError("credential_files shorthand requires at least one config_dir")
         first = config_dirs[0]
@@ -164,9 +171,11 @@ class Tool(BaseModel):
         # both shapes so the shorthand works from TOML and from Python.
         first_subdir = first["profile_subdir"] if isinstance(first, dict) else first.profile_subdir
         expanded: list[Any] = [{"config_dir": first_subdir, "path": p} for p in shorthand]
-        existing = cast(list[Any], data.get("credentials") or [])
-        data["credentials"] = expanded + existing
-        return data
+        # `credentials` may arrive as a tuple (Python idiom) or list (TOML);
+        # normalize via list() so concatenation never raises.
+        existing = list(cast(Any, out.get("credentials") or ()))
+        out["credentials"] = expanded + existing
+        return out
 
     @model_validator(mode="after")
     def _validate_credential_dirs(self) -> Tool:
@@ -189,9 +198,10 @@ class Profile(BaseModel):
     """A named configuration snapshot that switcher can re-link to.
 
     JSON is written with createdAt (camelCase). The serializer emits Z-suffixed
-    UTC ISO 8601 to match the spec example and stay readable. JSON read accepts
-    either createdAt or created_at so manually-edited metadata.json files don't
-    break.
+    UTC ISO 8601 truncated to whole seconds (matches the spec example), so any
+    sub-second precision on `created_at` is intentionally dropped on write.
+    JSON read accepts either createdAt or created_at so manually-edited
+    metadata.json files don't break.
     """
 
     name: str

@@ -30,6 +30,13 @@ def test_expand_handles_bare_tilde(resolver: PathResolver, home: Path) -> None:
     assert resolver.expand("~") == home
 
 
+def test_expand_rejects_other_user_tilde(resolver: PathResolver) -> None:
+    """POSIX ~username expands to another user's home; we do not support that
+    and would otherwise treat 'otheruser/foo' as a path under self._home."""
+    with pytest.raises(ValueError, match="username"):
+        resolver.expand("~otheruser/foo")
+
+
 def test_expand_passes_absolute_through(resolver: PathResolver) -> None:
     if IS_WINDOWS:
         assert resolver.expand("C:\\Windows") == Path("C:\\Windows")
