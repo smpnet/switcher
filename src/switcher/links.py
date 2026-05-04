@@ -98,13 +98,19 @@ def swap_link(target: Path, link_path: Path) -> None:
     ERROR_ACCESS_DENIED) or, worse, silently destroy whatever lives inside.
     Callers that genuinely want to replace a real directory must run
     `move_or_seed_dir` first, then call swap_link against the resulting link.
+
+    All preconditions are validated *before* any filesystem mutation
+    (parent-mkdir or stale-.tmp cleanup), so a failed call leaves no debris.
     """
+    if not target.is_dir():
+        raise PathNotADirectoryError(f"link target must be an existing directory: {target}")
     is_link = link_path.is_symlink() or (IS_WINDOWS and os.path.isjunction(link_path))
     if not is_link and link_path.is_dir():
         raise IsADirectoryError(
             f"refusing to replace real directory at {link_path}; "
             "move_or_seed_dir it first, then swap_link the resulting link"
         )
+    # Preconditions all passed — only now mutate.
     tmp = link_path.with_name(link_path.name + ".tmp")
     if tmp.exists() or tmp.is_symlink() or (IS_WINDOWS and os.path.isjunction(tmp)):
         _force_remove(tmp)

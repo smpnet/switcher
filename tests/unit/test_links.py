@@ -151,6 +151,35 @@ def test_link_dir_rejects_file_target(tmp_path: Path) -> None:
         link_dir(target, link)
 
 
+def test_swap_link_failed_target_validation_leaves_no_debris(tmp_path: Path) -> None:
+    """`swap_link` must validate `target` *before* it mutates anything —
+    otherwise a missing/file target leaves behind a freshly-mkdir'd
+    link_path.parent (or worse, a removed .tmp from a prior crashed run).
+    Same debris discipline as `move_or_seed_dir`."""
+    missing_target = tmp_path / "missing"
+    link_path = tmp_path / "deep" / "nested" / "link"
+    assert not link_path.parent.exists()
+    with pytest.raises(PathNotADirectoryError):
+        swap_link(missing_target, link_path)
+    # The error path must not have created link_path.parent.
+    assert not link_path.parent.exists()
+
+
+def test_swap_link_failed_target_validation_preserves_stale_tmp(tmp_path: Path) -> None:
+    """A leftover `.tmp` from a prior crash must not be cleaned up if the
+    new swap is going to fail anyway — a future retry of the same call,
+    once the target is valid, would lose the chance to surface the stale
+    .tmp's existence."""
+    missing_target = tmp_path / "missing"
+    link_path = tmp_path / "link"
+    stale_tmp = tmp_path / "link.tmp"
+    stale_tmp.mkdir()
+    (stale_tmp / "garbage").write_text("from a prior crashed swap")
+    with pytest.raises(PathNotADirectoryError):
+        swap_link(missing_target, link_path)
+    assert (stale_tmp / "garbage").read_text() == "from a prior crashed swap"
+
+
 def test_swap_link_refuses_to_replace_real_directory(tmp_path: Path) -> None:
     """`swap_link` must not silently destroy a real (non-link) directory at
     `link_path` — the contract is replace-an-existing-link, not replace-anything."""
