@@ -63,17 +63,20 @@ jobs:
   # for the tools we ship builtins for'.
   #
   # Gated two ways:
-  #   1. github.repository check restricts the job to the canonical repo so
-  #      a fork push (when the repo is public) doesn't queue a job onto a
+  #   1. !github.event.repository.fork restricts the job to the canonical
+  #      (non-fork) repo so a fork push doesn't queue a job onto a
   #      [self-hosted, Windows, X64] runner that exists only in the
-  #      upstream repo. Without this gate, contributor forks would get a
-  #      permanently-queued job for reasons unrelated to their code.
+  #      upstream repo. Deriving from metadata (rather than hardcoding a
+  #      repo slug like 'owner/name') keeps the job alive across repo
+  #      renames and transfers -- a host-provisioning monitor that
+  #      silently stops running after a rename would be the worst failure
+  #      mode for this kind of check.
   #   2. The fork-PR check protects self-hosted infrastructure from
   #      executing untrusted PR code (privilege escalation / secret
   #      exfiltration via workflow injection). Same-repo PRs and pushes
   #      still run normally.
   test-windows:
-    if: github.repository == 'smpnet74/switcher' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: ${{ !github.event.repository.fork && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     timeout-minutes: 15
     runs-on: [self-hosted, Windows, X64]
     steps:
