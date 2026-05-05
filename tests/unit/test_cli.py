@@ -142,6 +142,16 @@ def test_delete_with_force(runner: CliRunner, tmp_home: Path, tmp_state: Path) -
     assert result.exit_code == 0
 
 
+def test_delete_declined_at_prompt(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
+    """Answering 'n' to the confirmation exits cleanly and leaves the profile in place."""
+    _setup(runner, "init")
+    _setup(runner, "use", "vanilla")  # switch off the dated profile
+    dated = _dated_profile_name(tmp_state)
+    result = runner.invoke(app, ["delete", dated], input="n\n")
+    assert result.exit_code == 0
+    assert dated in [p.name for p in FileProfileStore(tmp_state).list()]
+
+
 def test_delete_active_refused(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
     _setup(runner, "init")
     dated = _dated_profile_name(tmp_state)
