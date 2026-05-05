@@ -19,10 +19,6 @@ import threading
 import time
 from pathlib import Path
 
-if sys.platform != "win32":
-    print("SKIP: Windows only")
-    sys.exit(0)
-
 
 def test_create_junction(workdir: Path) -> bool:
     target = workdir / "target"
@@ -75,26 +71,47 @@ def test_atomic_replace(workdir: Path) -> bool:
                 misses += 1
             time.sleep(0.0001)
 
+    writer_errors: list[str] = []
     t = threading.Thread(target=reader)
     t.start()
-    for i in range(200):
-        new = workdir / f"link.{i}.tmp"
-        _winapi.CreateJunction(str(target_b if i % 2 else target_a), str(new))
-        os.replace(new, link)
-    stop.set()
-    t.join()
-    if misses > 0:
+    try:
+        for i in range(200):
+            new = workdir / f"link.{i}.tmp"
+            try:
+                _winapi.CreateJunction(
+                    str(target_b if i % 2 else target_a), str(new)
+                )
+                os.replace(new, link)
+            except OSError as e:
+                # Transient writer-side errors during the swap window
+                # (e.g., PermissionError from anti-virus / Defender file
+                # locks) would otherwise crash the script unhandled and
+                # show up as a CI flake instead of a real signal.
+                writer_errors.append(f"iter {i}: {type(e).__name__}: {e}")
+    finally:
+        stop.set()
+        t.join()
+    if writer_errors or misses > 0:
         print(
-            f"FAIL atomic replace; misses={misses}, seen={seen} -- "
-            "atomicity hedge confirmed needed: "
-            "switch to delete-then-create fallback"
+            f"FAIL atomic replace; misses={misses}, "
+            f"writer_errors={len(writer_errors)}, seen={seen}"
         )
+        for err in writer_errors[:10]:
+            print(f"  writer: {err}")
+        if misses > 0:
+            print(
+                "  reader: atomicity hedge confirmed needed -- "
+                "switch to delete-then-create fallback"
+            )
         return False
     print(f"PASS atomic replace; misses=0, seen={seen}")
     return True
 
 
 def main() -> int:
+    if sys.platform != "win32":
+        print("SKIP: Windows only")
+        return 0
     # tempfile.mkdtemp instead of a relative path so the spike works regardless
     # of which CWD pixi run / the CI runner happens to invoke us from.
     workdir = Path(tempfile.mkdtemp(prefix="junction-spike-"))

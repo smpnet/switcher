@@ -21,9 +21,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every `os` is a list (single-element for hosted runners, multi-label
+        # for self-hosted) so the field's shape is uniform; threading a value
+        # that's sometimes a scalar and sometimes a sequence through
+        # `runs-on` is a known footgun.
         include:
-          - { os: ubuntu-latest }
-          - { os: macos-latest }
+          - { os: [ubuntu-latest] }
+          - { os: [macos-latest] }
           - { os: [self-hosted, Windows, X64] }
 
     runs-on: ${{ matrix.os }}
