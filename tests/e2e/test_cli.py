@@ -2,6 +2,14 @@
 
 These boot a fresh Python process with `python -m switcher`, isolating env
 through the same tmp_home + tmp_state fixtures.
+
+The subprocess pins ``cwd`` to the per-test temp home (see ``_run`` below),
+which means ``switcher`` must be importable via ``sys.executable``'s site-
+packages -- i.e. installed in the active environment, not just present in
+the repo source tree. The pixi workspace handles this via
+``[pypi-dependencies] switcher = { path = ".", editable = true }``; running
+these tests under bare Python without an editable install will fail with
+``ModuleNotFoundError: No module named 'switcher'`` and that's by design.
 """
 
 from __future__ import annotations

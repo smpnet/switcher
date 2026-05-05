@@ -15,6 +15,19 @@ runs:
         pixi-version: v0.66.0
         cache: true
 
-    - name: Run CI task list
+    # Per-platform shell selection: `shell: bash` would assume Git for
+    # Windows is installed on every Windows runner, which holds for
+    # github-hosted windows-latest but is NOT a contract on self-hosted
+    # runners (those may be provisioned without Git). PowerShell ships
+    # with Windows itself, so it's the most portable Windows shell.
+    # On POSIX, plain bash is universal.
+
+    - name: Run CI task list (POSIX)
+      if: runner.os != 'Windows'
       shell: bash
+      run: pixi run ci
+
+    - name: Run CI task list (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
       run: pixi run ci
