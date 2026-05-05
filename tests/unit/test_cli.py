@@ -149,9 +149,10 @@ def test_delete_active_refused(runner: CliRunner, tmp_home: Path, tmp_state: Pat
 
 def test_which_command(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
     _setup(runner, "init")
+    expected = _dated_profile_name(tmp_state)
     result = runner.invoke(app, ["which", "claude"])
     assert result.exit_code == 0
-    assert "current" in result.stdout
+    assert expected in result.stdout
 
 
 def test_tools_scaffold_writes_default_path(runner: CliRunner, tmp_state: Path) -> None:
