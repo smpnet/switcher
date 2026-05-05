@@ -1,9 +1,14 @@
 """Verify the Windows config paths in our builtin TOMLs are well-formed.
 
+Loads `windows_path` entries directly from src/switcher/builtins/*.toml so
+the script can never drift from what's actually shipped: there's only one
+source of truth for the expected Windows paths, the same one production
+code reads.
+
 The hermetic check (always run by CI): expand each path's env vars and
-confirm none of them are left unexpanded. A leftover %VAR% token means
-the builtin TOML references an env var that the runner doesn't define,
-which is something the repo can fix.
+confirm none of them are left unexpanded. A leftover %VAR% token means a
+shipped TOML references an env var the runner doesn't define -- something
+the repo can fix.
 
 The host-dependent check (informational only): each fully-expanded path
 is also checked for existence and dir-vs-file status, but those statuses
@@ -21,18 +26,22 @@ from __future__ import annotations
 
 import os
 import sys
+import tomllib
 from pathlib import Path
 
-# IMPORTANT: keep these in sync with the `windows_path` entries in
-#   src/switcher/builtins/claude.toml
-#   src/switcher/builtins/copilot.toml
-# The duplication is intentional: the script is a cross-check, not a
-# tautology -- if the TOMLs change without this list updating, the next
-# Windows run on a provisioned host will surface a MISSING result.
-EXPECTATIONS = {
-    "claude": [r"%USERPROFILE%\.claude"],
-    "copilot": [r"%LOCALAPPDATA%\github-copilot", r"%USERPROFILE%\.copilot"],
-}
+BUILTINS_DIR = Path(__file__).resolve().parent.parent / "src" / "switcher" / "builtins"
+
+
+def load_expectations() -> dict[str, list[str]]:
+    """Read every *.toml in the builtins dir, return {tool_id: [windows_path, ...]}."""
+    expectations: dict[str, list[str]] = {}
+    for toml_path in sorted(BUILTINS_DIR.glob("*.toml")):
+        with toml_path.open("rb") as f:
+            data = tomllib.load(f)
+        tool_id = str(data["id"])
+        windows_paths = [str(d["windows_path"]) for d in data.get("config_dirs", [])]
+        expectations[tool_id] = windows_paths
+    return expectations
 
 
 def main() -> int:
@@ -42,8 +51,12 @@ def main() -> int:
     print(f"USERPROFILE = {os.environ.get('USERPROFILE')}")
     print(f"LOCALAPPDATA = {os.environ.get('LOCALAPPDATA')}")
     print()
+    expectations = load_expectations()
+    if not expectations:
+        print(f"FAIL no builtin TOMLs found at {BUILTINS_DIR}")
+        return 1
     unexpanded_failures: list[str] = []
-    for tool, paths in EXPECTATIONS.items():
+    for tool, paths in expectations.items():
         print(f"--- {tool} ---")
         for raw in paths:
             expanded_str = os.path.expandvars(raw)
