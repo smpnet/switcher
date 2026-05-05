@@ -81,6 +81,16 @@ def load_expectations() -> dict[str, list[str]]:
                 f"{toml_path.name}: 'config_dirs' is empty "
                 f"(every builtin requires at least one config dir)"
             )
+        for i, entry in enumerate(config_dirs):
+            # Each config_dirs entry must be a [[config_dirs]] table. A
+            # malformed value like `config_dirs = ["foo"]` (list of strings)
+            # would otherwise fall into the comprehension below and raise a
+            # generic TypeError that doesn't name the file or the index.
+            if not isinstance(entry, dict):
+                raise TypeError(
+                    f"{toml_path.name}: config_dirs[{i}] must be a table, "
+                    f"got {type(entry).__name__}"
+                )
         # Filter to entries that declare a windows_path. POSIX-only builtins
         # leave the list empty; a partially-Windows-aware builtin with some
         # but not all config_dirs declaring windows_path still gets its
