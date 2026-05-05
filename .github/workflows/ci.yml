@@ -12,21 +12,19 @@ permissions:
   contents: read
 
 jobs:
-  # ============================================================================
-  # KEEP IN LOCKSTEP: the step lists in `test` and `test-windows` mirror the
-  # `ci` task in pixi.toml (lint, typecheck, test, test-integration, test-e2e,
-  # verify-windows, build). When you change one, change all three. A composite
-  # action collapse is tracked as a v0.2.0 follow-up; until then the per-step
-  # GitHub UI visibility is the reason we keep them spelled out here.
-  # ============================================================================
+  # The actual step list (setup-pixi, lint, typecheck, test, test-integration,
+  # test-e2e, verify-windows, build) lives in .github/actions/run-pixi-ci/
+  # action.yml -- a composite action both jobs invoke. There is exactly one
+  # source of truth for what CI runs, with per-step GitHub UI visibility
+  # preserved through the composite's nested steps.
 
   # GitHub-hosted runners: always run, including for fork PRs. These are
   # ephemeral and isolated, so untrusted PR code is safe here. windows-latest
-  # is included in the hosted matrix so the verify-windows scripts get
-  # exercised on every push/PR (including fork PRs), closing the gap where
-  # the self-hosted Windows job is gated away from forks. The test-windows
-  # job below stays for the host-state diagnostics that need a provisioned
-  # runner with Claude Code / Copilot CLI actually installed.
+  # is in the hosted matrix so the verify-windows scripts get exercised on
+  # every push/PR (including fork PRs), closing the gap where the self-hosted
+  # Windows job is gated away from forks. The test-windows job below stays
+  # for the host-state diagnostics that need a provisioned runner with
+  # Claude Code / Copilot CLI actually installed.
   test:
     timeout-minutes: 30
     strategy:
@@ -37,75 +35,19 @@ jobs:
     # Python version is pinned via pixi.toml ([dependencies] python = ">=3.13,<3.14")
     # and resolved by setup-pixi -- no system Python is consulted, so a matrix
     # `python` dimension here would be dead noise.
-
     steps:
       - uses: actions/checkout@v4
-
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: v0.66.0
-          cache: true
-
-      - name: Lint
-        run: pixi run lint
-
-      - name: Type check
-        run: pixi run typecheck
-
-      - name: Unit tests
-        run: pixi run test
-
-      - name: Integration tests
-        run: pixi run test-integration
-
-      - name: E2E tests
-        run: pixi run test-e2e
-
-      - name: Windows verification spikes
-        # Self-skips with `SKIP: Windows only` on POSIX runners; we still run
-        # it here so the workflow's step list mirrors `pixi run ci` exactly.
-        # Lets pixi.toml stay the single source of truth for what's tested.
-        run: pixi run verify-windows
-
-      - name: Build wheel
-        run: pixi run build
+      - uses: ./.github/actions/run-pixi-ci
 
   # Self-hosted Windows runner: gated against fork PRs because self-hosted
   # infrastructure must not execute untrusted PR code (privilege escalation
   # / secret exfiltration via workflow injection). Same-repo PRs and pushes
   # still run normally; this is a no-op while the repo is private but is
-  # forward-compatible with going public later. Hosted runners above stay
-  # unconditional so fork PRs still get CI signal on the safe matrix.
+  # forward-compatible with going public later.
   test-windows:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
     runs-on: [self-hosted, Windows, X64]
-
     steps:
       - uses: actions/checkout@v4
-
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: v0.66.0
-          cache: true
-
-      - name: Lint
-        run: pixi run lint
-
-      - name: Type check
-        run: pixi run typecheck
-
-      - name: Unit tests
-        run: pixi run test
-
-      - name: Integration tests
-        run: pixi run test-integration
-
-      - name: E2E tests
-        run: pixi run test-e2e
-
-      - name: Windows verification spikes
-        run: pixi run verify-windows
-
-      - name: Build wheel
-        run: pixi run build
+      - uses: ./.github/actions/run-pixi-ci

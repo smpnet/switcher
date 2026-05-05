@@ -1,0 +1,44 @@
+name: Run pixi CI
+description: >
+  Set up pixi and run the full `pixi run ci` task list as discrete steps,
+  so the GitHub UI shows per-step pass/fail. This is the single source of
+  truth for what CI runs -- both the hosted matrix job and the self-hosted
+  Windows job invoke this action so the step lists cannot drift.
+
+runs:
+  using: composite
+  steps:
+    - uses: prefix-dev/setup-pixi@v0.8.1
+      with:
+        pixi-version: v0.66.0
+        cache: true
+
+    - name: Lint
+      shell: bash
+      run: pixi run lint
+
+    - name: Type check
+      shell: bash
+      run: pixi run typecheck
+
+    - name: Unit tests
+      shell: bash
+      run: pixi run test
+
+    - name: Integration tests
+      shell: bash
+      run: pixi run test-integration
+
+    - name: E2E tests
+      shell: bash
+      run: pixi run test-e2e
+
+    - name: Windows verification spikes
+      # Self-skips with `SKIP: Windows only` on POSIX runners; runs the
+      # actual probes on windows-latest (hosted) and self-hosted Windows.
+      shell: bash
+      run: pixi run verify-windows
+
+    - name: Build wheel
+      shell: bash
+      run: pixi run build

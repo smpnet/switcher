@@ -54,9 +54,24 @@ def load_expectations() -> dict[str, list[str]]:
             data = tomllib.load(f)
         try:
             tool_id = str(data["id"])
-            windows_paths = [str(d["windows_path"]) for d in data.get("config_dirs", [])]
+            config_dirs = data["config_dirs"]
         except KeyError as e:
             raise KeyError(f"{toml_path.name}: missing required key {e.args[0]!r}") from e
+        if not config_dirs:
+            # An empty `config_dirs` list (or one that defaulted to []) would
+            # otherwise turn this script into a tautology for that builtin --
+            # zero windows_paths means zero checks, which always reports green.
+            # Every shipped builtin requires at least one config_dirs entry.
+            raise KeyError(
+                f"{toml_path.name}: 'config_dirs' is empty "
+                f"(every builtin requires at least one config dir)"
+            )
+        try:
+            windows_paths = [str(d["windows_path"]) for d in config_dirs]
+        except KeyError as e:
+            raise KeyError(
+                f"{toml_path.name}: config_dirs entry missing {e.args[0]!r}"
+            ) from e
         if tool_id in expectations:
             # Two builtin TOMLs claiming the same id would otherwise silently
             # overwrite, masking one of them and letting CI report a false pass.
