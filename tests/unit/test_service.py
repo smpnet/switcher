@@ -12,6 +12,7 @@ from switcher.errors import (
     AlreadyLinkedError,
     PathNotADirectoryError,
     ProfileExistsError,
+    ProfileIsActiveError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
     ToolHasNoActiveProfileError,
@@ -393,3 +394,63 @@ def test_which_unknown_tool_raises(service: ProfileService) -> None:
 def test_which_before_init_raises(service: ProfileService) -> None:
     with pytest.raises(StateNotInitializedError):
         service.which("claude")
+
+
+# ---------------- rename ----------------
+
+
+def test_rename_active_profile_relinks(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    name = service.init()
+    service.rename(name, "client-A")
+    store = FileProfileStore(tmp_state)
+    active = store.get_active()
+    assert active["claude"] == "client-A"
+    # Live link points at the renamed dir
+    claude_link = tmp_home / ".claude"
+    expected = (store.profile_dir("client-A") / "claude").resolve()
+    assert claude_link.resolve() == expected
+
+
+def test_rename_unknown_raises(service: ProfileService) -> None:
+    service.init()
+    with pytest.raises(UnknownProfileError):
+        service.rename("missing", "new")
+
+
+def test_rename_to_existing_raises(service: ProfileService) -> None:
+    service.init()
+    with pytest.raises(ProfileExistsError):
+        service.rename("vanilla", "vanilla")  # already exists
+
+
+def test_rename_before_init_raises(service: ProfileService) -> None:
+    with pytest.raises(StateNotInitializedError):
+        service.rename("a", "b")
+
+
+# ---------------- delete ----------------
+
+
+def test_delete_inactive_profile_succeeds(service: ProfileService) -> None:
+    name = service.init()
+    service.use("vanilla")  # switch off `name`, freeing it for delete
+    service.delete(name)
+
+
+def test_delete_active_profile_refuses(service: ProfileService) -> None:
+    name = service.init()  # name is active for everything
+    with pytest.raises(ProfileIsActiveError):
+        service.delete(name)
+
+
+def test_delete_unknown_raises(service: ProfileService) -> None:
+    service.init()
+    with pytest.raises(UnknownProfileError):
+        service.delete("missing")
+
+
+def test_delete_before_init_raises(service: ProfileService) -> None:
+    with pytest.raises(StateNotInitializedError):
+        service.delete("anything")

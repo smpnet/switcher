@@ -15,10 +15,12 @@ from switcher.errors import (
     AlreadyLinkedError,
     PathNotADirectoryError,
     ProfileExistsError,
+    ProfileIsActiveError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
     ToolHasNoActiveProfileError,
     ToolNotInProfileError,
+    UnknownProfileError,
     UnknownToolError,
 )
 from switcher.links import move_or_seed_dir, swap_link
@@ -248,3 +250,36 @@ class ProfileService:
         if tool_id not in active:
             raise ToolHasNoActiveProfileError(f"tool {tool_id!r} has no active profile")
         return active[tool_id]
+
+    def rename(self, old: str, new: str) -> None:
+        self._require_initialized()
+        if not self._store.profile_dir(old).exists():
+            raise UnknownProfileError(f"profile {old!r} not found")
+        if self._store.profile_dir(new).exists():
+            raise ProfileExistsError(f"profile {new!r} already exists")
+        self._store.rename(old, new)
+        active = self._store.get_active()
+        affected_ids = [tid for tid, p in active.items() if p == old]
+        for tid in affected_ids:
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                continue
+            for i, dm in enumerate(tool.config_dirs):
+                target = self._store.profile_dir(new) / dm.profile_subdir
+                live = self._resolver.tool_dir(tool, i)
+                swap_link(target, live)
+            active[tid] = new
+        self._store.set_active(active)
+
+    def delete(self, name: str) -> None:
+        self._require_initialized()
+        if not self._store.profile_dir(name).exists():
+            raise UnknownProfileError(f"profile {name!r} not found")
+        active = self._store.get_active()
+        active_for = sorted(tid for tid, p in active.items() if p == name)
+        if active_for:
+            raise ProfileIsActiveError(
+                f"profile {name!r} is active for: {', '.join(active_for)}. "
+                f"Switch them to a different profile before deleting."
+            )
+        self._store.delete(name)
