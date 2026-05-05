@@ -61,11 +61,20 @@ def test_full_lifecycle(tmp_home: Path, tmp_state: Path) -> None:
     assert_active_profile("vanilla")
 
     # --- save snapshot -------------------------------------------------------
-    # Writes through the live link land in the active profile's subdir
-    (tmp_home / ".claude" / "marker.txt").write_text("snap-data")
+    # Writes through every tool's every live link must land in the matching
+    # subdir of the snapshot profile. A regression that mishandled copilot's
+    # secondary config_dir (different profile_subdir, different copy logic)
+    # would otherwise hide behind the .claude-only assertion.
+    markers: dict[tuple[str, str], str] = {}
+    for tool in registry:
+        for i, dm in enumerate(tool.config_dirs):
+            live = resolver.tool_dir(tool, i)
+            marker = f"snap-{tool.id}-{dm.profile_subdir}"
+            (live / "marker.txt").write_text(marker)
+            markers[(tool.id, dm.profile_subdir)] = marker
     service.save("snap")
-    snap_marker = store.profile_dir("snap") / "claude" / "marker.txt"
-    assert snap_marker.read_text() == "snap-data"
+    for (_tool_id, subdir), marker in markers.items():
+        assert (store.profile_dir("snap") / subdir / "marker.txt").read_text() == marker
 
     # --- create experiment + use it -----------------------------------------
     service.create("experiment")
