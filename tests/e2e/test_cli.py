@@ -37,24 +37,34 @@ _BUILTINS_DIR = Path(__file__).resolve().parent.parent.parent / "src" / "switche
 
 
 def _shipped_tool_ids() -> list[str]:
+    """Discover shipped builtin tool IDs.
+
+    Mirrors the validation rules in verify_windows_paths.load_expectations
+    (file-qualified errors for missing `id`, type-check that `id` is a
+    string, reject duplicate IDs). Keeping the two helpers in lockstep --
+    even with light duplication -- means an ambiguous repo state (two
+    builtin TOMLs claiming the same id) fails BOTH the verifier and the
+    e2e suite, so neither layer can mask a divergence.
+    """
     ids: list[str] = []
+    seen: set[str] = set()
     for toml_path in sorted(_BUILTINS_DIR.glob("*.toml")):
         with toml_path.open("rb") as f:
             data = tomllib.load(f)
         try:
             tool_id = data["id"]
         except KeyError as e:
-            # File-qualified error mirrors verify_windows_paths.load_expectations
-            # so a malformed builtin TOML doesn't fail at module import with a
-            # bare `KeyError: 'id'` traceback that doesn't name the file.
             raise KeyError(f"{toml_path.name}: missing required key {e.args[0]!r}") from e
-        # Reject non-string `id` rather than silently coercing via str().
-        # A malformed `id = []` or `id = 42` would otherwise produce
-        # nonsense tool keys that pass through to test assertions.
         if not isinstance(tool_id, str):
             raise TypeError(
                 f"{toml_path.name}: 'id' must be a string, got {type(tool_id).__name__}"
             )
+        if tool_id in seen:
+            raise KeyError(
+                f"{toml_path.name}: duplicate tool id {tool_id!r} "
+                f"(already provided by an earlier file)"
+            )
+        seen.add(tool_id)
         ids.append(tool_id)
     return ids
 
