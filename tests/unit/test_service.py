@@ -272,9 +272,15 @@ def test_save_rejects_non_dir_live_path(
     user tries to use it. Pre-flight matches move_or_seed_dir's stance.
     """
     service.init()
-    # Replace the live ~/.claude link with a regular file
+    # Replace the live ~/.claude link with a regular file. After init the link
+    # is a symlink on POSIX (unlinkable) and a junction on Windows (Path.rmdir
+    # accepts junctions; Path.unlink/DeleteFile rejects them — same split as
+    # _force_remove in links.py).
     claude = tmp_home / ".claude"
-    claude.unlink()
+    if IS_WINDOWS:
+        claude.rmdir()
+    else:
+        claude.unlink()
     claude.write_text("not a directory")
     with pytest.raises(PathNotADirectoryError):
         service.save("snap")
@@ -307,6 +313,11 @@ def test_save_rolls_back_on_copytree_failure(
     assert not FileProfileStore(tmp_state).profile_dir("snap").exists()
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS,
+    reason="POSIX dangling-symlink semantics: Path.symlink_to needs Developer Mode "
+    "on Windows, and broken junctions don't surface as is_symlink() in detect_installed",
+)
 def test_save_rejects_dangling_symlink_live_path(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
