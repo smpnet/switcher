@@ -51,13 +51,18 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: ./.github/actions/run-pixi-ci
 
-  # Self-hosted Windows runner: gated against fork PRs because self-hosted
-  # infrastructure must not execute untrusted PR code (privilege escalation
-  # / secret exfiltration via workflow injection). Same-repo PRs and pushes
-  # still run normally; this is a no-op while the repo is private but is
-  # forward-compatible with going public later.
+  # Self-hosted Windows runner: gated two ways.
+  #   1. github.repository check restricts the job to the canonical repo so
+  #      a fork push (when the repo is public) doesn't queue a job onto a
+  #      [self-hosted, Windows, X64] runner that exists only in the
+  #      upstream repo. Without this gate, contributor forks would get a
+  #      permanently-queued job for reasons unrelated to their code.
+  #   2. The fork-PR check protects self-hosted infrastructure from
+  #      executing untrusted PR code (privilege escalation / secret
+  #      exfiltration via workflow injection). Same-repo PRs and pushes
+  #      still run normally.
   test-windows:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.repository == 'smpnet74/switcher' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     timeout-minutes: 30
     runs-on: [self-hosted, Windows, X64]
     steps:
