@@ -5,25 +5,26 @@ the script can never drift from what's actually shipped: there's only one
 source of truth for the expected Windows paths, the same one production
 code reads.
 
-The hermetic check (always run by CI): expand each path's env vars and
-confirm none of them are left unexpanded. A leftover %VAR% token means a
-shipped TOML references an env var the runner doesn't define -- something
-the repo can fix.
+Two modes, selected by the --strict flag:
 
-The host-dependent check (informational only): each fully-expanded path
-is also checked for existence and dir-vs-file status, but those statuses
-do not affect the exit code. They depend on whether the AI tools are
-actually installed on the runner under the expected user account, which
-is host state -- not repo correctness -- and would otherwise make CI
-fail on every fresh Windows runner.
+Default (hermetic only): expand each path's env vars and confirm none are
+left unexpanded. A leftover %VAR% token means a shipped TOML references an
+env var the runner doesn't define -- something the repo can fix. MISSING /
+FILE statuses on the expanded paths are reported but informational; the
+exit code only reflects unexpanded vars. This is what hosted CI runs --
+no provisioned-tool assumption.
 
-Exits 1 only when an env var fails to expand. Run on a fully-provisioned
-Windows machine (Claude Code + Copilot CLI installed) to also surface
-the host-side mismatches, which are diagnostic.
+Strict (--strict): same hermetic check PLUS the host-state check is
+gating. Missing-directory and file-not-dir statuses also fail the run.
+This is the mode the self-hosted Windows runner uses to assert it's been
+provisioned with Claude Code / Copilot CLI under the expected accounts;
+without --strict the self-hosted job would just rerun what hosted CI
+already covers.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import sys
@@ -97,17 +98,30 @@ def load_expectations() -> dict[str, list[str]]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Also fail on MISSING / FILE host-state results (use on a "
+            "self-hosted runner provisioned with the expected tool installs)."
+        ),
+    )
+    args = parser.parse_args()
+
     if sys.platform != "win32":
         print("SKIP: Windows only")
         return 0
     print(f"USERPROFILE = {os.environ.get('USERPROFILE')}")
     print(f"LOCALAPPDATA = {os.environ.get('LOCALAPPDATA')}")
+    print(f"strict mode = {args.strict}")
     print()
     expectations = load_expectations()
     if not expectations:
         print(f"FAIL no builtin TOMLs found at {BUILTINS_DIR}")
         return 1
     unexpanded_failures: list[str] = []
+    host_state_failures: list[str] = []
     for tool, paths in expectations.items():
         print(f"--- {tool} ---")
         if not paths:
@@ -123,26 +137,43 @@ def main() -> int:
                 # expandvars leaves unknown %VAR% tokens untouched, so a path
                 # like '%LOCALAPPDATA%\foo' would otherwise be reported as
                 # MISSING with no hint that the env var was the actual problem.
-                # This is the only failure mode the repo owns; everything below
-                # depends on host install state.
+                # Always a failure regardless of --strict -- this is repo-owned.
                 print(f"    -> FAIL: env var not expanded: {expanded_str}")
                 unexpanded_failures.append(f"{tool}: unexpanded {raw}")
                 continue
             expanded = Path(expanded_str)
             if not expanded.exists():
                 status = "MISSING (host: tool may not be installed)"
+                host_state_failures.append(f"{tool}: missing {expanded}")
             elif expanded.is_dir():
                 status = "DIR"
             else:
                 status = "FILE (expected directory; host state)"
+                host_state_failures.append(f"{tool}: file-not-dir {expanded}")
             print(f"    -> {expanded} [{status}]")
+    rc = 0
     if unexpanded_failures:
         print()
         print(f"FAIL {len(unexpanded_failures)} env var(s) failed to expand:")
         for f in unexpanded_failures:
             print(f"  - {f}")
-        return 1
-    return 0
+        rc = 1
+    if host_state_failures:
+        print()
+        if args.strict:
+            print(
+                f"FAIL {len(host_state_failures)} host-state issue(s) "
+                f"(--strict): runner is not provisioned as expected:"
+            )
+            rc = 1
+        else:
+            print(
+                f"NOTE {len(host_state_failures)} host-state issue(s) "
+                f"(informational; pass --strict to fail on these):"
+            )
+        for f in host_state_failures:
+            print(f"  - {f}")
+    return rc
 
 
 if __name__ == "__main__":

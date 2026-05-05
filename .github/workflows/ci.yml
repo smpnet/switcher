@@ -51,7 +51,18 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: ./.github/actions/run-pixi-ci
 
-  # Self-hosted Windows runner: gated two ways.
+  # Self-hosted Windows runner: provisioned-tool sanity check ONLY.
+  #
+  # The hosted matrix above already runs the full CI aggregate on
+  # windows-latest, so duplicating it here would be expensive duplication.
+  # What the self-hosted runner uniquely contributes is a real, stable
+  # Windows account where Claude Code + Copilot CLI are actually installed
+  # under USERPROFILE / LOCALAPPDATA. This job invokes verify-windows-strict,
+  # which fails on MISSING / FILE host-state results -- so the job has a
+  # specific, narrow contract: 'this runner is still correctly provisioned
+  # for the tools we ship builtins for'.
+  #
+  # Gated two ways:
   #   1. github.repository check restricts the job to the canonical repo so
   #      a fork push (when the repo is public) doesn't queue a job onto a
   #      [self-hosted, Windows, X64] runner that exists only in the
@@ -63,11 +74,17 @@ jobs:
   #      still run normally.
   test-windows:
     if: github.repository == 'smpnet74/switcher' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    timeout-minutes: 30
+    timeout-minutes: 15
     runs-on: [self-hosted, Windows, X64]
     steps:
       # Pinned to immutable commit SHA (= tag v4) for the same supply-chain
       # hardening reason setup-pixi is pinned in run-pixi-ci/action.yml;
       # bump on the v0.2.0 security review.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-      - uses: ./.github/actions/run-pixi-ci
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659  # v0.8.1
+        with:
+          pixi-version: v0.66.0
+          cache: true
+      - name: Verify provisioned tool state (host-strict)
+        shell: powershell
+        run: pixi run verify-windows-strict

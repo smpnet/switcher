@@ -30,6 +30,13 @@ build = "python -m build"
 # timing or scheduling sensitivity.
 verify-windows = "python scripts/verify_windows_paths.py"
 
+# Strict variant for the self-hosted Windows runner: also fails on MISSING /
+# FILE host-state results, so the job actually validates that the runner is
+# provisioned with Claude Code / Copilot CLI under the expected accounts.
+# Without --strict, the self-hosted job would just rerun what the hosted
+# windows-latest matrix already covers.
+verify-windows-strict = "python scripts/verify_windows_paths.py --strict"
+
 # Junction atomicity probe -- *not* in `ci` aggregate. The script is
 # explicitly probabilistic ("not a proof") and gating CI on a race-probe
 # would invite scheduler-induced flakes on shared runners. Run manually
