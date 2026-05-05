@@ -54,6 +54,17 @@ def _shipped_tool_ids() -> list[str]:
 _TOOL_IDS = _shipped_tool_ids()
 assert _TOOL_IDS, f"no builtin TOMLs discovered under {_BUILTINS_DIR}"
 
+# Split on whitespace AND Rich table border glyphs so a tool ID can be
+# checked as a discrete token rather than a substring. Without this, an
+# assertion like `"claude" in r.stdout` would match a hypothetical future
+# "claude-code" tool ID's row, manufacturing a false-positive coverage.
+_TABLE_TOKEN_SPLIT = re.compile(r"[\s│┃┏┓┗┛━┳┻┃╇╋│]+")
+
+
+def _tokens(text: str) -> list[str]:
+    return [t for t in _TABLE_TOKEN_SPLIT.split(text) if t]
+
+
 pytestmark = pytest.mark.e2e
 
 
@@ -109,8 +120,11 @@ def test_version(tmp_home: Path, tmp_state: Path) -> None:
 def test_tools(tmp_home: Path, tmp_state: Path) -> None:
     r = _run(["tools"], tmp_home, tmp_state)
     assert r.returncode == 0, r.stderr
+    tokens = _tokens(r.stdout)
     for tid in _TOOL_IDS:
-        assert tid in r.stdout, f"missing builtin {tid!r} in tools output: {r.stdout!r}"
+        assert tid in tokens, (
+            f"missing builtin {tid!r} as a discrete token in tools output: {r.stdout!r}"
+        )
 
 
 def test_init_then_status(tmp_home: Path, tmp_state: Path) -> None:
@@ -128,9 +142,9 @@ def test_init_then_status(tmp_home: Path, tmp_state: Path) -> None:
     # search. Per-line enforcement is what the comment actually claims.
     status_lines = r.stdout.splitlines()
     for tool in _TOOL_IDS:
-        assert any(tool in line and _DATED_PROFILE.search(line) for line in status_lines), (
-            f"no dated active profile on the {tool!r} line of status: {r.stdout!r}"
-        )
+        assert any(
+            tool in _tokens(line) and _DATED_PROFILE.search(line) for line in status_lines
+        ), f"no dated active profile on the {tool!r} line of status: {r.stdout!r}"
 
 
 def test_init_twice_errors(tmp_home: Path, tmp_state: Path) -> None:
