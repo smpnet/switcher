@@ -483,6 +483,23 @@ def test_rename_before_init_raises(service: ProfileService) -> None:
         service.rename("a", "b")
 
 
+def test_rename_repoints_orphan_active_entries(service: ProfileService, tmp_state: Path) -> None:
+    """An active entry for a tool no longer in the registry must still be
+    re-pointed to the new profile name. Otherwise the active map keeps a
+    reference to the renamed-away ``old``, which no longer exists in the
+    store — a silent inconsistency that surfaces on the next use()/which().
+    """
+    name = service.init()
+    store = FileProfileStore(tmp_state)
+    active = store.get_active()
+    active["ghost"] = name  # orphan: not in the registry
+    store.set_active(active)
+    service.rename(name, "client-A")
+    after = store.get_active()
+    assert after["ghost"] == "client-A"
+    assert after["claude"] == "client-A"
+
+
 def test_rename_pre_validates_live_paths_are_links(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

@@ -277,15 +277,21 @@ class ProfileService:
         """Rename a profile, re-pointing affected live links to the new name.
 
         Pre-flight catches the deterministic failure modes (real directory
-        at a live path, missing tool, target name in use). After pre-flight,
-        the remaining failure surface is transient I/O during swap_link.
-        Such a mid-loop failure leaves the rename half-applied: the profile
-        directory has been renamed, but some tools' live links still point
-        at the now-missing old path. Recovery is non-destructive — re-run
-        ``rename`` (idempotent on store side) or ``use(<new-name>)`` to
-        complete the relinking. True transactional rollback requires a
-        tracked-ops design and is deferred to v0.2.0; the same constraint
-        applies to init() multi-step failures.
+        at a live path, target name in use). Orphan tool IDs in the active
+        map (registry drift since init) are tolerated: their active entry
+        gets re-pointed to ``new`` so the map stays consistent with the
+        store, but no relinking is attempted since the tool's config_dirs
+        aren't known.
+
+        After pre-flight, the remaining failure surface is transient I/O
+        during swap_link. Such a mid-loop failure leaves the rename
+        half-applied: the profile directory has been renamed, but some
+        tools' live links still point at the now-missing old path.
+        Recovery is non-destructive — re-run ``rename`` (idempotent on
+        store side) or ``use(<new-name>)`` to complete the relinking.
+        True transactional rollback requires a tracked-ops design and is
+        deferred to v0.2.0; the same constraint applies to init() multi-
+        step failures.
         """
         self._require_initialized()
         if not self._store.profile_dir(old).exists():
@@ -319,12 +325,16 @@ class ProfileService:
         self._store.rename(old, new)
         for tid in affected_ids:
             tool = find_tool(self._registry, tid)
-            if tool is None:
-                continue
-            for i, dm in enumerate(tool.config_dirs):
-                target = self._store.profile_dir(new) / dm.profile_subdir
-                live = self._resolver.tool_dir(tool, i)
-                swap_link(target, live)
+            # Always re-point the active entry to the new name — otherwise
+            # an orphan tool (registered at init time, removed from the
+            # registry since) keeps a reference to `old`, which no longer
+            # exists in the store. The relinking step is registry-dependent
+            # and skips gracefully; the active-map update isn't.
+            if tool is not None:
+                for i, dm in enumerate(tool.config_dirs):
+                    target = self._store.profile_dir(new) / dm.profile_subdir
+                    live = self._resolver.tool_dir(tool, i)
+                    swap_link(target, live)
             active[tid] = new
         self._store.set_active(active)
 
