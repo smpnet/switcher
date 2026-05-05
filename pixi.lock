@@ -1177,7 +1177,7 @@ packages:
 - pypi: ./
   name: switcher
   version: 0.1.0
-  sha256: 3fa4deb6f27247eca4c5763387557bfaad23838aaf97cdabf4cc94c4721c7560
+  sha256: cd9966a62830573b7d161666c8ced610e5116a2f2550f94c5e49cb5bc0077794
   requires_dist:
   - typer>=0.12
   - pydantic>=2.7

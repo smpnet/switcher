@@ -1,15 +1,22 @@
 """Verify junction creation + atomic os.replace on Windows.
 
 The atomicity test runs a concurrent reader against a junction being replaced
-and asserts the reader never observes a missing or unreadable target -- only
-old or new.
+and reports whether the reader ever observes a missing or unreadable target.
 
-Exits non-zero (1) if any verification fails or if the atomicity reader
-observes any OSError during the swap window (FileNotFoundError,
-PermissionError, etc.). A non-zero miss count means swap_link's Windows
-path needs the delete-then-create fallback documented in spec section 4;
-writer-side OSErrors during the loop also trip the same failure mode and
-are reported with their iteration index for diagnosis.
+This is a *probe*, not a proof. A non-zero miss count is real evidence that
+the swap is unsafe under contention -- pessimistic, deterministic, and
+actionable: swap_link's Windows path needs the delete-then-create fallback
+documented in spec section 4. A zero miss count is *probabilistic
+confidence* over 200 swap iterations and one reader, not a guarantee that
+no race window exists. Maintainers reading a green run should treat it as
+'no gross atomicity failure observed,' not 'atomicity proven.' If atomic
+replacement turns out to be load-bearing for production safety, prefer the
+fallback unconditionally rather than relying on this probe's silence.
+
+Exits non-zero (1) if any verification fails, the reader observes any
+OSError during the swap window (FileNotFoundError, PermissionError, etc.),
+or the writer hits an OSError mid-loop (reported with the iteration index
+for diagnosis).
 """
 
 from __future__ import annotations

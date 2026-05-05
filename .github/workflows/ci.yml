@@ -10,6 +10,14 @@ permissions:
   contents: read
 
 jobs:
+  # ============================================================================
+  # KEEP IN LOCKSTEP: the step lists in `test` and `test-windows` mirror the
+  # `ci` task in pixi.toml (lint, typecheck, test, test-integration, test-e2e,
+  # verify-windows, build). When you change one, change all three. A composite
+  # action collapse is tracked as a v0.2.0 follow-up; until then the per-step
+  # GitHub UI visibility is the reason we keep them spelled out here.
+  # ============================================================================
+
   # GitHub-hosted runners: always run, including for fork PRs. These are
   # ephemeral and isolated, so untrusted PR code is safe here.
   test:
