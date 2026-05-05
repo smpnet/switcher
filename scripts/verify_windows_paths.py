@@ -122,8 +122,13 @@ def main() -> int:
     if sys.platform != "win32":
         print("SKIP: Windows only")
         return 0
+    # Echo every Windows config root we know about, including APPDATA --
+    # the e2e helper normalizes that one too, so a future builtin that
+    # references %APPDATA% would otherwise hit a FAIL with no nearby
+    # context for why the var resolved (or didn't) the way it did.
     print(f"USERPROFILE = {os.environ.get('USERPROFILE')}")
     print(f"LOCALAPPDATA = {os.environ.get('LOCALAPPDATA')}")
+    print(f"APPDATA = {os.environ.get('APPDATA')}")
     print(f"strict mode = {args.strict}")
     print()
     expectations = load_expectations()
