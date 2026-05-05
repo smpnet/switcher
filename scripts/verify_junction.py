@@ -1,12 +1,15 @@
 """Verify junction creation + atomic os.replace on Windows.
 
 The atomicity test runs a concurrent reader against a junction being replaced
-and asserts the reader never observes a missing target -- only old or new.
+and asserts the reader never observes a missing or unreadable target -- only
+old or new.
 
 Exits non-zero (1) if any verification fails or if the atomicity reader
-observes any FileNotFoundError, since a non-zero miss count means
-swap_link's Windows path needs the delete-then-create fallback documented
-in spec section 4.
+observes any OSError during the swap window (FileNotFoundError,
+PermissionError, etc.). A non-zero miss count means swap_link's Windows
+path needs the delete-then-create fallback documented in spec section 4;
+writer-side OSErrors during the loop also trip the same failure mode and
+are reported with their iteration index for diagnosis.
 """
 
 from __future__ import annotations

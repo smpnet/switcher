@@ -57,6 +57,13 @@ def load_expectations() -> dict[str, list[str]]:
             windows_paths = [str(d["windows_path"]) for d in data.get("config_dirs", [])]
         except KeyError as e:
             raise KeyError(f"{toml_path.name}: missing required key {e.args[0]!r}") from e
+        if tool_id in expectations:
+            # Two builtin TOMLs claiming the same id would otherwise silently
+            # overwrite, masking one of them and letting CI report a false pass.
+            raise KeyError(
+                f"{toml_path.name}: duplicate tool id {tool_id!r} "
+                f"(already provided by an earlier file)"
+            )
         expectations[tool_id] = windows_paths
     return expectations
 
