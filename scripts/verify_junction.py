@@ -64,21 +64,33 @@ def test_atomic_replace(workdir: Path) -> bool:
 
     _winapi.CreateJunction(str(target_a), str(link))
 
+    # Synchronization primitives: a script that exists to reason about race
+    # safety mustn't introduce its own unsynchronized cross-thread state.
+    # `state_lock` guards every read/write of `misses` and `seen` from main
+    # vs. reader. `saw_initial_a` is the explicit signal main waits on
+    # before starting swaps, instead of polling `seen`.
     misses = 0
     seen: set[str] = set()
+    state_lock = threading.Lock()
     stop = threading.Event()
+    saw_initial_a = threading.Event()
 
     def reader() -> None:
         nonlocal misses
         while not stop.is_set():
             try:
-                seen.add((link / "v").read_text())
+                value = (link / "v").read_text()
+                with state_lock:
+                    seen.add(value)
+                if value == "A":
+                    saw_initial_a.set()
             except OSError:
                 # Catch any read-window failure, not only FileNotFoundError --
                 # PermissionError or other transient OSErrors during the swap
                 # also indicate the path isn't safely readable through the
                 # replacement, which is what we're trying to detect.
-                misses += 1
+                with state_lock:
+                    misses += 1
             time.sleep(0.0001)
 
     writer_errors: list[str] = []
@@ -91,10 +103,7 @@ def test_atomic_replace(workdir: Path) -> bool:
     # within a generous deadline, something is structurally broken and the
     # whole atomicity claim is moot -- fail loudly rather than continue into
     # a 200-iter loop that would just confirm the same thing.
-    deadline = time.monotonic() + 2.0
-    while "A" not in seen and time.monotonic() < deadline:
-        time.sleep(0.001)
-    if "A" not in seen:
+    if not saw_initial_a.wait(timeout=2.0):
         stop.set()
         t.join()
         print("FAIL atomic replace; reader never observed the initial 'A'")
@@ -121,6 +130,16 @@ def test_atomic_replace(workdir: Path) -> bool:
     finally:
         stop.set()
         t.join()
+
+    # Snapshot the shared state under the lock. After t.join() the reader
+    # has terminated and Python's join() provides a happens-before edge,
+    # but going through the same lock the reader used keeps the
+    # synchronization story consistent and makes the contract obvious to
+    # anyone editing the script later.
+    with state_lock:
+        final_misses = misses
+        final_seen = set(seen)
+
     # Both target values must be observed for the run to mean anything: a
     # green miss count alongside `seen={"A"}` would prove only that no read
     # error happened while one value was visible, NOT that the reader
@@ -128,29 +147,29 @@ def test_atomic_replace(workdir: Path) -> bool:
     # a false-positive surface; require {"A", "B"} so a one-sided run fails
     # loudly instead of masquerading as evidence of atomic behavior.
     expected_seen = {"A", "B"}
-    incomplete_observation = seen != expected_seen
-    if writer_errors or misses > 0 or incomplete_observation:
+    incomplete_observation = final_seen != expected_seen
+    if writer_errors or final_misses > 0 or incomplete_observation:
         print(
-            f"FAIL atomic replace; misses={misses}, "
-            f"writer_errors={len(writer_errors)}, seen={seen}"
+            f"FAIL atomic replace; misses={final_misses}, "
+            f"writer_errors={len(writer_errors)}, seen={final_seen}"
         )
         for err in writer_errors[:10]:
             print(f"  writer: {err}")
-        if misses > 0:
+        if final_misses > 0:
             print(
                 "  reader: atomicity hedge confirmed needed -- "
                 "switch to delete-then-create fallback"
             )
         if incomplete_observation:
-            missing = expected_seen - seen
+            missing = expected_seen - final_seen
             print(
-                f"  reader: only observed {sorted(seen)!r}; expected to see "
+                f"  reader: only observed {sorted(final_seen)!r}; expected to see "
                 f"both 'A' and 'B' across the swap window (missing: "
                 f"{sorted(missing)!r}). Run did not actually exercise the "
                 f"swap -- treat the result as inconclusive."
             )
         return False
-    print(f"PASS atomic replace; misses=0, seen={seen}")
+    print(f"PASS atomic replace; misses=0, seen={final_seen}")
     return True
 
 

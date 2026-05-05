@@ -43,6 +43,7 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
     if sys.platform == "win32":
         env["USERPROFILE"] = str(home)
         env["LOCALAPPDATA"] = str(home / "AppData" / "Local")
+        env["APPDATA"] = str(home / "AppData" / "Roaming")
         # Clear every other root expanduser / Path.home() consults. Python's
         # os.path.expanduser('~') on Windows tries HOME, then USERPROFILE,
         # then HOMEDRIVE+HOMEPATH; any of those still pointing at the real

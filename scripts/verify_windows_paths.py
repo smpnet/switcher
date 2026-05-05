@@ -57,6 +57,14 @@ def load_expectations() -> dict[str, list[str]]:
             config_dirs = data["config_dirs"]
         except KeyError as e:
             raise KeyError(f"{toml_path.name}: missing required key {e.args[0]!r}") from e
+        if not isinstance(config_dirs, list):
+            # E.g. someone wrote `config_dirs = "claude"` instead of
+            # `[[config_dirs]]`. Without this check the for-loop below would
+            # raise an unrelated TypeError that doesn't name the file.
+            raise TypeError(
+                f"{toml_path.name}: 'config_dirs' must be a list of tables, "
+                f"got {type(config_dirs).__name__}"
+            )
         if not config_dirs:
             # An empty `config_dirs` list (or one that defaulted to []) would
             # otherwise turn this script into a tautology for that builtin --
