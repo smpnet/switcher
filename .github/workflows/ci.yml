@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,                  python: "3.13" }
+          - { os: macos-latest,                   python: "3.13" }
+          - { os: [self-hosted, Windows, X64],    python: "3.13" }
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: true
+
+      - name: Lint
+        run: pixi run lint
+
+      - name: Type check
+        run: pixi run typecheck
+
+      - name: Unit tests
+        run: pixi run test
+
+      - name: Integration tests
+        run: pixi run test-integration
+
+      - name: E2E tests
+        run: pixi run test-e2e
+
+      - name: Build wheel
+        run: pixi run build
