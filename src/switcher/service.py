@@ -14,10 +14,14 @@ from datetime import UTC, datetime
 from switcher.errors import (
     AlreadyLinkedError,
     StateAlreadyInitializedError,
+    StateNotInitializedError,
+    ToolNotInProfileError,
+    UnknownToolError,
 )
 from switcher.links import move_or_seed_dir, swap_link
 from switcher.models import Profile, Tool
 from switcher.paths import PathResolver
+from switcher.registry import find_tool
 from switcher.store import ProfileStore
 
 
@@ -52,6 +56,10 @@ class ProfileService:
     def list_profiles(self) -> list[Profile]:
         """Convenience pass-through used by some tests; CLI uses store directly."""
         return self._store.list()
+
+    def _require_initialized(self) -> None:
+        if not self._store.list():
+            raise StateNotInitializedError("switcher has not been initialized; run 'switcher init'")
 
     def _seed_credentials(self, src_profile: str, dst_profile: str, tool: Tool) -> None:
         """Copy a tool's credential files from src_profile into dst_profile.
@@ -99,3 +107,27 @@ class ProfileService:
             self._seed_credentials(current_name, "vanilla", tool)
         self._store.set_active({t.id: current_name for t in installed})
         return current_name
+
+    def use(self, profile_name: str, only: list[str] | None = None) -> None:
+        self._require_initialized()
+        profile = self._store.get(profile_name)
+        active = self._store.get_active()
+        if only is not None:
+            for tid in only:
+                if tid not in profile.tools:
+                    raise ToolNotInProfileError(
+                        f"profile {profile_name!r} does not include {tid!r}"
+                    )
+            target_ids = list(only)
+        else:
+            target_ids = sorted(profile.tools.keys())
+        for tid in target_ids:
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                raise UnknownToolError(f"unknown tool {tid!r}")
+            for i, dm in enumerate(tool.config_dirs):
+                target = self._store.profile_dir(profile_name) / dm.profile_subdir
+                live = self._resolver.tool_dir(tool, i)
+                swap_link(target, live)
+            active[tid] = profile_name
+        self._store.set_active(active)

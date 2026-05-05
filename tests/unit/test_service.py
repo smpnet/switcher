@@ -11,6 +11,9 @@ import pytest
 from switcher.errors import (
     AlreadyLinkedError,
     StateAlreadyInitializedError,
+    StateNotInitializedError,
+    ToolNotInProfileError,
+    UnknownProfileError,
 )
 from switcher.models import Tool
 from switcher.paths import IS_WINDOWS, PathResolver
@@ -112,3 +115,50 @@ def test_init_refuses_when_live_dir_already_linked(
     service = ProfileService(store, resolver, registry)
     with pytest.raises(AlreadyLinkedError):
         service.init()
+
+
+# ---------------- use ----------------
+
+
+def test_use_switches_active_to_target(service: ProfileService, tmp_state: Path) -> None:
+    service.init()
+    service.use("vanilla")
+    active = FileProfileStore(tmp_state).get_active()
+    for v in active.values():
+        assert v == "vanilla"
+
+
+def test_use_with_only_targets_subset(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    name = service.init()
+    service.use("vanilla", only=["claude"])
+    active = FileProfileStore(tmp_state).get_active()
+    assert active["claude"] == "vanilla"
+    assert active["copilot"] == name  # copilot stays on the original profile
+
+
+def test_use_unknown_profile_raises(service: ProfileService) -> None:
+    service.init()
+    with pytest.raises(UnknownProfileError):
+        service.use("nonexistent")
+
+
+def test_use_only_with_tool_not_in_profile_raises(service: ProfileService) -> None:
+    service.init()
+    with pytest.raises(ToolNotInProfileError):
+        service.use("vanilla", only=["nonexistent_tool"])
+
+
+def test_use_before_init_raises(service: ProfileService) -> None:
+    with pytest.raises(StateNotInitializedError):
+        service.use("vanilla")
+
+
+def test_use_is_idempotent(service: ProfileService, tmp_state: Path) -> None:
+    service.init()
+    service.use("vanilla")
+    service.use("vanilla")  # again
+    active = FileProfileStore(tmp_state).get_active()
+    for v in active.values():
+        assert v == "vanilla"
