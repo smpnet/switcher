@@ -45,7 +45,10 @@ jobs:
     # and resolved by setup-pixi -- no system Python is consulted, so a matrix
     # `python` dimension here would be dead noise.
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to immutable commit SHA (= tag v4) for the same supply-chain
+      # hardening reason setup-pixi is pinned in run-pixi-ci/action.yml;
+      # bump on the v0.2.0 security review.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: ./.github/actions/run-pixi-ci
 
   # Self-hosted Windows runner: gated against fork PRs because self-hosted
@@ -58,5 +61,8 @@ jobs:
     timeout-minutes: 30
     runs-on: [self-hosted, Windows, X64]
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to immutable commit SHA (= tag v4) for the same supply-chain
+      # hardening reason setup-pixi is pinned in run-pixi-ci/action.yml;
+      # bump on the v0.2.0 security review.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: ./.github/actions/run-pixi-ci

@@ -40,7 +40,14 @@ def _shipped_tool_ids() -> list[str]:
     ids: list[str] = []
     for toml_path in sorted(_BUILTINS_DIR.glob("*.toml")):
         with toml_path.open("rb") as f:
-            ids.append(str(tomllib.load(f)["id"]))
+            data = tomllib.load(f)
+        try:
+            ids.append(str(data["id"]))
+        except KeyError as e:
+            # File-qualified error mirrors verify_windows_paths.load_expectations
+            # so a malformed builtin TOML doesn't fail at module import with a
+            # bare `KeyError: 'id'` traceback that doesn't name the file.
+            raise KeyError(f"{toml_path.name}: missing required key {e.args[0]!r}") from e
     return ids
 
 
