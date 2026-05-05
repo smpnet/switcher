@@ -101,9 +101,11 @@ def main() -> int:
         create_dir.mkdir()
         atomic_dir = workdir / "atomic"
         atomic_dir.mkdir()
-        ok = test_create_junction(create_dir)
-        ok = test_atomic_replace(atomic_dir) and ok
-        return 0 if ok else 1
+        results = [
+            test_create_junction(create_dir),
+            test_atomic_replace(atomic_dir),
+        ]
+        return 0 if all(results) else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

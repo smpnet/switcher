@@ -8,6 +8,12 @@ import os
 import sys
 from pathlib import Path
 
+# IMPORTANT: keep these in sync with the `windows_path` entries in
+#   src/switcher/builtins/claude.toml
+#   src/switcher/builtins/copilot.toml
+# The duplication is intentional: the script is a cross-check, not a
+# tautology — if the TOMLs change without this list updating, the next
+# Windows CI run will surface a MISSING result and force a reconciliation.
 EXPECTATIONS = {
     "claude": [r"%USERPROFILE%\.claude"],
     "copilot": [r"%LOCALAPPDATA%\github-copilot", r"%USERPROFILE%\.copilot"],
@@ -33,8 +39,13 @@ def main() -> None:
                 print(f"    -> WARN: env var not expanded: {expanded_str}")
                 continue
             expanded = Path(expanded_str)
-            exists = "EXISTS" if expanded.exists() else "MISSING"
-            print(f"    -> {expanded} [{exists}]")
+            if not expanded.exists():
+                status = "MISSING"
+            elif expanded.is_dir():
+                status = "DIR"
+            else:
+                status = "FILE (expected directory!)"
+            print(f"    -> {expanded} [{status}]")
 
 
 if __name__ == "__main__":

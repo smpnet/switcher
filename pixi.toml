@@ -24,4 +24,8 @@ lint = { cmd = "ruff check src tests && ruff format --check src tests" }
 format = "ruff format src tests"
 typecheck = "basedpyright src tests"
 build = "python -m build"
+# Run the §11 verification spikes. Both scripts SKIP on non-Windows, so
+# this task is safe to invoke on any host but is only meaningful on the
+# Windows CI runner.
+verify-windows = { cmd = "python scripts/verify_windows_paths.py && python scripts/verify_junction.py" }
 ci = { depends-on = ["lint", "typecheck", "test", "test-integration", "test-e2e"] }
