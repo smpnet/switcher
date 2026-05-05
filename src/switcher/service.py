@@ -134,26 +134,21 @@ class ProfileService:
         self._store.set_active(active)
 
     def save(self, name: str) -> None:
+        """Snapshot live config into a new profile.
+
+        Only currently-installed tools are snapshotted. A tool that's in the
+        active map but no longer installed live is intentionally skipped:
+        save's contract is "snapshot live state", and a uninstalled-but-
+        persisted-in-store flow doesn't fit that contract cleanly. If the
+        user wants that data preserved, the active profile already holds it
+        and `use(other_profile)` won't disturb it.
+        """
         self._require_initialized()
         if self._store.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
         installed = self.detect_installed()
-        installed_by_id = {t.id: t for t in installed}
-        active = self._store.get_active()
-        # Save tools that are either currently installed OR have an active
-        # profile entry — covers the case where a tool was uninstalled live but
-        # still has historical state worth snapshotting.
-        tools_to_save: list[Tool] = []
-        seen_ids: set[str] = set()
-        for tid in list(installed_by_id) + list(active):
-            if tid in seen_ids:
-                continue
-            tool = installed_by_id.get(tid) or find_tool(self._registry, tid)
-            if tool is not None:
-                tools_to_save.append(tool)
-                seen_ids.add(tid)
-        self._store.create(name, {t.id: True for t in tools_to_save})
-        for tool in tools_to_save:
+        self._store.create(name, {t.id: True for t in installed})
+        for tool in installed:
             for i, dm in enumerate(tool.config_dirs):
                 live = self._resolver.tool_dir(tool, i)
                 target = self._store.profile_dir(name) / dm.profile_subdir
