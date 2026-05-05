@@ -114,6 +114,29 @@ def test_which_command(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> No
     assert "current" in result.stdout
 
 
+def test_tools_scaffold_writes_default_path(runner: CliRunner, tmp_state: Path) -> None:
+    result = runner.invoke(app, ["tools", "scaffold", "gemini"])
+    assert result.exit_code == 0
+    expected = tmp_state / "registry.d" / "gemini.toml"
+    assert expected.exists()
+    content = expected.read_text()
+    assert 'id = "gemini"' in content
+
+
+def test_tools_scaffold_with_out(runner: CliRunner, tmp_state: Path, tmp_path: Path) -> None:
+    out = tmp_path / "custom.toml"
+    result = runner.invoke(app, ["tools", "scaffold", "x", "--out", str(out)])
+    assert result.exit_code == 0
+    assert out.exists()
+
+
+def test_tools_scaffold_refuses_overwrite(runner: CliRunner, tmp_state: Path) -> None:
+    runner.invoke(app, ["tools", "scaffold", "gemini"])
+    result = runner.invoke(app, ["tools", "scaffold", "gemini"])
+    assert result.exit_code == 1
+    assert "overwrite" in result.stderr
+
+
 def test_handle_errors_renders_switcher_error_to_stderr(runner: CliRunner) -> None:
     """SwitcherError must surface as exit-code 1 + a rendered message on stderr.
 

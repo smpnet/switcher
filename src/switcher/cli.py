@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -14,7 +15,7 @@ from rich.table import Table
 from switcher.errors import SwitcherError
 from switcher.models import Tool
 from switcher.paths import IS_WINDOWS, PathResolver
-from switcher.registry import build_registry
+from switcher.registry import build_registry, scaffold_tool
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore, ProfileStore
 
@@ -184,6 +185,23 @@ def which(tool: str) -> None:
     """Show which profile a specific tool is currently using."""
     name = get_deps().service.which(tool)
     console.print(name)
+
+
+@tools_app.command(name="scaffold")
+@handle_errors
+def tools_scaffold(
+    tool_id: str,
+    out: str | None = typer.Option(
+        None,
+        "--out",
+        help="Output path; defaults to <state_dir>/registry.d/<id>.toml",
+    ),
+) -> None:
+    """Write a stub TOML for a new user tool."""
+    deps = get_deps()
+    target = Path(out) if out else deps.store.state_dir() / "registry.d" / f"{tool_id}.toml"
+    scaffold_tool(tool_id, target)
+    console.print(f"Wrote scaffold to {target}")
 
 
 @tools_app.callback(invoke_without_command=True)
