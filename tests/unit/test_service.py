@@ -527,6 +527,48 @@ def test_rename_repoints_orphan_active_entries(service: ProfileService, tmp_stat
     assert after["claude"] == "client-A"
 
 
+def test_rename_remains_recoverable_when_swap_link_fails(
+    service: ProfileService,
+    tmp_home: Path,
+    tmp_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If swap_link fails mid-rename, the active map MUST already say `new`
+    so that ``use(<new>)`` is a clean idempotent recovery path.
+
+    Without ordering set_active before the swap loop, a mid-loop swap_link
+    failure leaves active still pointing at ``old`` — which no longer
+    exists in the store, since store.rename already moved it. Re-running
+    ``rename(old, new)`` would raise UnknownProfileError, leaving the user
+    with no programmatic recovery.
+    """
+    name = service.init()
+
+    call_count = {"n": 0}
+
+    def boom(target: Path, live: Path) -> None:
+        call_count["n"] += 1
+        raise OSError("simulated swap failure")
+
+    monkeypatch.setattr("switcher.service.swap_link", boom)
+    with pytest.raises(OSError, match="simulated"):
+        service.rename(name, "client-A")
+
+    # After the failure: store dir was renamed, active says new
+    store = FileProfileStore(tmp_state)
+    assert store.profile_dir("client-A").exists()
+    assert not store.profile_dir(name).exists()
+    after_active = store.get_active()
+    assert all(v == "client-A" for v in after_active.values())
+
+    # And `use(<new>)` must be a clean recovery path
+    monkeypatch.undo()  # restore real swap_link
+    service.use("client-A")
+    claude_link = tmp_home / ".claude"
+    expected = (store.profile_dir("client-A") / "claude").resolve()
+    assert claude_link.resolve() == expected
+
+
 def test_rename_pre_validates_live_paths_are_links(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

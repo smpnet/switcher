@@ -290,15 +290,24 @@ class ProfileService:
         store, but no relinking is attempted since the tool's config_dirs
         aren't known.
 
-        After pre-flight, the remaining failure surface is transient I/O
-        during swap_link. Such a mid-loop failure leaves the rename
-        half-applied: the profile directory has been renamed, but some
-        tools' live links still point at the now-missing old path.
-        Recovery is non-destructive — re-run ``rename`` (idempotent on
-        store side) or ``use(<new-name>)`` to complete the relinking.
-        True transactional rollback requires a tracked-ops design and is
-        deferred to v0.2.0; the same constraint applies to init() multi-
-        step failures.
+        Commit ordering matters for failure recovery:
+
+        1. ``store.rename(old, new)`` — atomic directory move.
+        2. ``set_active(updated)`` — atomic tmp+rename of state.json. Once
+           this succeeds, the rename is *logically committed*: store and
+           active map both reference ``new``, and the work that remains is
+           pure link-fixup.
+        3. Swap each affected tool's live link to the new target. Any
+           failure here leaves *some* live links pointing at a now-missing
+           ``old`` path, but the canonical state is consistent. Recovery
+           is ``use(<new>)``, which runs swap_link for every tool in the
+           profile; it's idempotent on already-relinked tools.
+
+        The narrow failure window between steps 1 and 2 (rename succeeds,
+        set_active fails) leaves the active map pointing at ``old`` while
+        the profile lives at ``new``. That requires a manual state.json
+        edit until tracked-ops land in v0.2.0 — same constraint as
+        init() multi-step failures.
         """
         self._require_initialized()
         if not self._store.profile_dir(old).exists():
@@ -330,20 +339,26 @@ class ProfileService:
                         f"{live} exists but is not a directory; cannot relink"
                     )
         self._store.rename(old, new)
+        # Persist the active-map update IMMEDIATELY after the dir rename:
+        # once both succeed, the rename is logically committed and any
+        # subsequent swap_link failure is recoverable via `use(<new>)`.
+        # Running set_active LAST (after the swap loop) would leave the
+        # active map pointing at a name that no longer exists in the store
+        # whenever swap_link fails mid-loop — an unrecoverable state.
+        # Orphan tool IDs (in active but not in the registry) get
+        # re-pointed too, since their active entry must stay consistent
+        # with the store regardless of relink-ability.
         for tid in affected_ids:
-            tool = find_tool(self._registry, tid)
-            # Always re-point the active entry to the new name — otherwise
-            # an orphan tool (registered at init time, removed from the
-            # registry since) keeps a reference to `old`, which no longer
-            # exists in the store. The relinking step is registry-dependent
-            # and skips gracefully; the active-map update isn't.
-            if tool is not None:
-                for i, dm in enumerate(tool.config_dirs):
-                    target = self._store.profile_dir(new) / dm.profile_subdir
-                    live = self._resolver.tool_dir(tool, i)
-                    swap_link(target, live)
             active[tid] = new
         self._store.set_active(active)
+        for tid in affected_ids:
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                continue
+            for i, dm in enumerate(tool.config_dirs):
+                target = self._store.profile_dir(new) / dm.profile_subdir
+                live = self._resolver.tool_dir(tool, i)
+                swap_link(target, live)
 
     def delete(self, name: str) -> None:
         self._require_initialized()
