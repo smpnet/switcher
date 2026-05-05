@@ -25,9 +25,15 @@ the host-side mismatches, which are diagnostic.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tomllib
 from pathlib import Path
+
+# Match an unresolved Windows env-var placeholder (e.g. `%LOCALAPPDATA%`).
+# Bare `"%" in expanded_str` would also flag legitimate filenames containing
+# a literal percent sign; this regex matches the placeholder shape only.
+_UNEXPANDED_VAR = re.compile(r"%[^%]+%")
 
 BUILTINS_DIR = Path(__file__).resolve().parent.parent / "src" / "switcher" / "builtins"
 
@@ -72,7 +78,7 @@ def main() -> int:
         for raw in paths:
             expanded_str = os.path.expandvars(raw)
             print(f"  {raw}")
-            if "%" in expanded_str:
+            if _UNEXPANDED_VAR.search(expanded_str):
                 # expandvars leaves unknown %VAR% tokens untouched, so a path
                 # like '%LOCALAPPDATA%\foo' would otherwise be reported as
                 # MISSING with no hint that the env var was the actual problem.

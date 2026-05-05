@@ -83,10 +83,14 @@ def test_atomic_replace(workdir: Path) -> bool:
                 )
                 os.replace(new, link)
             except OSError as e:
-                # Transient writer-side errors during the swap window
-                # (e.g., PermissionError from anti-virus / Defender file
-                # locks) would otherwise crash the script unhandled and
-                # show up as a CI flake instead of a real signal.
+                # Surface writer-side errors as a deterministic FAIL instead
+                # of an untrapped exception. We don't tolerate or retry them
+                # -- if CreateJunction or os.replace can't run cleanly under
+                # contention, that's a real signal that swap_link's Windows
+                # path needs the delete-then-create fallback (spec §4), same
+                # category as a non-zero reader miss count. The catch just
+                # ensures a useful summary line gets printed instead of a
+                # mid-loop traceback drowning the actual failure mode.
                 writer_errors.append(f"iter {i}: {type(e).__name__}: {e}")
     finally:
         stop.set()
