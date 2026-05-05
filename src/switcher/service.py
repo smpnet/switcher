@@ -168,15 +168,20 @@ class ProfileService:
         if self._store.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
         installed = self.detect_installed()
-        # Pre-flight: every existing live path must be a directory. Without
-        # this, a regular file at a live config path slips through — copytree
-        # is skipped and the snapshot records an empty dir, hiding corruption
-        # behind a profile that looks valid. Matches move_or_seed_dir's stance
-        # in init(): fail loudly rather than silently produce bogus state.
+        # Pre-flight: every live path that detect_installed surfaced must be
+        # a real directory. Two pathological shapes slip through if we use
+        # plain `live.exists()` here: a regular file (exists True, is_dir
+        # False) and a dangling symlink (exists False, is_symlink True — so
+        # detect_installed via resolver.exists() includes it, but a naive
+        # exists() check would skip it). Routing through resolver.exists()
+        # mirrors the detect step exactly: anything detected as installed
+        # must validate as a directory or fail loud. Matches move_or_seed_dir's
+        # stance in init(): fail loudly rather than silently snapshot an empty
+        # subdir behind a profile that looks valid until the user uses it.
         for tool in installed:
             for i in range(len(tool.config_dirs)):
                 live = self._resolver.tool_dir(tool, i)
-                if not live.exists():
+                if not self._resolver.exists(live):
                     continue
                 src = live.resolve() if live.is_symlink() else live
                 if not src.is_dir():

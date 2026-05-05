@@ -257,3 +257,23 @@ def test_save_rejects_non_dir_live_path(
         service.save("snap")
     # Pre-flight runs before _store.create(), so the profile must not exist
     assert not FileProfileStore(tmp_state).profile_dir("snap").exists()
+
+
+def test_save_rejects_dangling_symlink_live_path(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A dangling symlink at a live path must fail loud, not snapshot empty.
+
+    detect_installed routes through resolver.exists() (`exists() or is_symlink()`),
+    so a broken link is reported as installed — but plain `live.exists()` in
+    the pre-flight would skip it, leaving a snapshot with the tool listed in
+    its tools dict but no data. The pre-flight must use the same surface as
+    detect_installed so the two stay in lockstep.
+    """
+    service.init()
+    claude = tmp_home / ".claude"
+    claude.unlink()
+    claude.symlink_to(tmp_home / "missing_target", target_is_directory=True)
+    with pytest.raises(PathNotADirectoryError):
+        service.save("snap")
+    assert not FileProfileStore(tmp_state).profile_dir("snap").exists()
