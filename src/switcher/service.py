@@ -122,10 +122,18 @@ class ProfileService:
             target_ids = list(only)
         else:
             target_ids = sorted(profile.tools.keys())
+        # Pre-flight: resolve every tool BEFORE mutating any link. Without
+        # this, a stale tool id in profile.tools (registry drift, plugin
+        # removed, hand-edited state) would only surface partway through the
+        # swap loop and leave the filesystem half-switched. Same "validate
+        # preconditions, then mutate" discipline as move_or_seed_dir / swap_link.
+        resolved: list[tuple[str, Tool]] = []
         for tid in target_ids:
             tool = find_tool(self._registry, tid)
             if tool is None:
                 raise UnknownToolError(f"unknown tool {tid!r}")
+            resolved.append((tid, tool))
+        for tid, tool in resolved:
             for i, dm in enumerate(tool.config_dirs):
                 target = self._store.profile_dir(profile_name) / dm.profile_subdir
                 live = self._resolver.tool_dir(tool, i)

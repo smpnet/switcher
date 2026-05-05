@@ -15,6 +15,7 @@ from switcher.errors import (
     StateNotInitializedError,
     ToolNotInProfileError,
     UnknownProfileError,
+    UnknownToolError,
 )
 from switcher.models import Tool
 from switcher.paths import IS_WINDOWS, PathResolver
@@ -163,6 +164,28 @@ def test_use_is_idempotent(service: ProfileService, tmp_state: Path) -> None:
     active = FileProfileStore(tmp_state).get_active()
     for v in active.values():
         assert v == "vanilla"
+
+
+def test_use_pre_validates_tools_before_mutating(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A profile with a stale tool id must fail before any live link changes.
+
+    Without pre-flight validation, the swap loop would process tools in
+    sorted order: 'claude' would switch successfully, then 'ghost' would
+    raise UnknownToolError, leaving the filesystem half-switched. Pre-flight
+    must reject the call without touching any live link.
+    """
+    service.init()
+    store = FileProfileStore(tmp_state)
+    # Hand-craft a profile dir that references a tool not in the registry.
+    store.create("stale", {"claude": True, "ghost": True})
+    (store.profile_dir("stale") / "claude").mkdir()
+    claude_link = tmp_home / ".claude"
+    original_target = claude_link.resolve()
+    with pytest.raises(UnknownToolError):
+        service.use("stale")
+    assert claude_link.resolve() == original_target
 
 
 # ---------------- save ----------------
