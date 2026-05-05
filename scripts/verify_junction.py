@@ -127,6 +127,10 @@ def test_atomic_replace(workdir: Path) -> bool:
                 # ensures a useful summary line gets printed instead of a
                 # mid-loop traceback drowning the actual failure mode.
                 writer_errors.append(f"iter {i}: {type(e).__name__}: {e}")
+                # First writer error guarantees a FAIL verdict; bail out
+                # rather than burn through the remaining iterations
+                # accumulating duplicate noise.
+                break
     finally:
         stop.set()
         t.join()

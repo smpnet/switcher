@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,25 @@ import pytest
 # layer asserts the canonical shape rather than the literal date so tests
 # don't drift across midnight or across machines with different locales.
 _DATED_PROFILE = re.compile(r"\d{4}-\d{2}-\d{2}-current")
+
+# Discover the shipped builtin tool IDs at module load. Hardcoding "claude"
+# and "copilot" would have made these tests assert repo inventory instead
+# of CLI semantics: any future builtin rename / add / remove would surface
+# as a CLI regression even when CLI behavior was unchanged. Reading from
+# the same TOMLs production code consults keeps the test honest.
+_BUILTINS_DIR = Path(__file__).resolve().parent.parent.parent / "src" / "switcher" / "builtins"
+
+
+def _shipped_tool_ids() -> list[str]:
+    ids: list[str] = []
+    for toml_path in sorted(_BUILTINS_DIR.glob("*.toml")):
+        with toml_path.open("rb") as f:
+            ids.append(str(tomllib.load(f)["id"]))
+    return ids
+
+
+_TOOL_IDS = _shipped_tool_ids()
+assert _TOOL_IDS, f"no builtin TOMLs discovered under {_BUILTINS_DIR}"
 
 pytestmark = pytest.mark.e2e
 
@@ -82,8 +102,8 @@ def test_version(tmp_home: Path, tmp_state: Path) -> None:
 def test_tools(tmp_home: Path, tmp_state: Path) -> None:
     r = _run(["tools"], tmp_home, tmp_state)
     assert r.returncode == 0, r.stderr
-    assert "claude" in r.stdout
-    assert "copilot" in r.stdout
+    for tid in _TOOL_IDS:
+        assert tid in r.stdout, f"missing builtin {tid!r} in tools output: {r.stdout!r}"
 
 
 def test_init_then_status(tmp_home: Path, tmp_state: Path) -> None:
@@ -100,7 +120,7 @@ def test_init_then_status(tmp_home: Path, tmp_state: Path) -> None:
     # the same dated string from the other row would satisfy a global
     # search. Per-line enforcement is what the comment actually claims.
     status_lines = r.stdout.splitlines()
-    for tool in ("claude", "copilot"):
+    for tool in _TOOL_IDS:
         assert any(tool in line and _DATED_PROFILE.search(line) for line in status_lines), (
             f"no dated active profile on the {tool!r} line of status: {r.stdout!r}"
         )
@@ -115,7 +135,7 @@ def test_init_twice_errors(tmp_home: Path, tmp_state: Path) -> None:
 
 
 def test_which_before_init_errors(tmp_home: Path, tmp_state: Path) -> None:
-    r = _run(["which", "claude"], tmp_home, tmp_state)
+    r = _run(["which", _TOOL_IDS[0]], tmp_home, tmp_state)
     assert r.returncode == 1
     assert "not been initialized" in r.stderr
 
