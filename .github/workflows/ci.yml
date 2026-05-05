@@ -10,26 +10,14 @@ permissions:
   contents: read
 
 jobs:
+  # GitHub-hosted runners: always run, including for fork PRs. These are
+  # ephemeral and isolated, so untrusted PR code is safe here.
   test:
-    # Skip fork-PR runs: the matrix includes a self-hosted Windows runner,
-    # and self-hosted infrastructure must not execute untrusted PR code
-    # (privilege escalation / secret exfiltration via workflow injection).
-    # Same-repo PRs and pushes still run normally; this is a no-op while the
-    # repo is private but is forward-compatible with going public later.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        # Every `os` is a list (single-element for hosted runners, multi-label
-        # for self-hosted) so the field's shape is uniform; threading a value
-        # that's sometimes a scalar and sometimes a sequence through
-        # `runs-on` is a known footgun.
-        include:
-          - { os: [ubuntu-latest] }
-          - { os: [macos-latest] }
-          - { os: [self-hosted, Windows, X64] }
-
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     # Python version is pinned via pixi.toml ([dependencies] python = ">=3.13,<3.14")
     # and resolved by setup-pixi -- no system Python is consulted, so a matrix
@@ -58,8 +46,44 @@ jobs:
       - name: E2E tests
         run: pixi run test-e2e
 
+      - name: Build wheel
+        run: pixi run build
+
+  # Self-hosted Windows runner: gated against fork PRs because self-hosted
+  # infrastructure must not execute untrusted PR code (privilege escalation
+  # / secret exfiltration via workflow injection). Same-repo PRs and pushes
+  # still run normally; this is a no-op while the repo is private but is
+  # forward-compatible with going public later. Hosted runners above stay
+  # unconditional so fork PRs still get CI signal on the safe matrix.
+  test-windows:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 30
+    runs-on: [self-hosted, Windows, X64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.66.0
+          cache: true
+
+      - name: Lint
+        run: pixi run lint
+
+      - name: Type check
+        run: pixi run typecheck
+
+      - name: Unit tests
+        run: pixi run test
+
+      - name: Integration tests
+        run: pixi run test-integration
+
+      - name: E2E tests
+        run: pixi run test-e2e
+
       - name: Windows verification spikes
-        if: runner.os == 'Windows'
         run: pixi run verify-windows
 
       - name: Build wheel

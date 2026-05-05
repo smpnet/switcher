@@ -33,13 +33,24 @@ BUILTINS_DIR = Path(__file__).resolve().parent.parent / "src" / "switcher" / "bu
 
 
 def load_expectations() -> dict[str, list[str]]:
-    """Read every *.toml in the builtins dir, return {tool_id: [windows_path, ...]}."""
+    """Read every *.toml in the builtins dir, return {tool_id: [windows_path, ...]}.
+
+    Raises KeyError with a file-qualified message if a TOML is missing
+    `id` or a `config_dirs` entry is missing `windows_path`. We keep this
+    loud (rather than skip-with-warning) since the builtin TOMLs are
+    repo-shipped -- a missing key is a repo bug to surface, not host
+    state to tolerate -- but the file-qualified message saves the reader
+    from chasing a bare `KeyError: 'id'` traceback.
+    """
     expectations: dict[str, list[str]] = {}
     for toml_path in sorted(BUILTINS_DIR.glob("*.toml")):
         with toml_path.open("rb") as f:
             data = tomllib.load(f)
-        tool_id = str(data["id"])
-        windows_paths = [str(d["windows_path"]) for d in data.get("config_dirs", [])]
+        try:
+            tool_id = str(data["id"])
+            windows_paths = [str(d["windows_path"]) for d in data.get("config_dirs", [])]
+        except KeyError as e:
+            raise KeyError(f"{toml_path.name}: missing required key {e.args[0]!r}") from e
         expectations[tool_id] = windows_paths
     return expectations
 

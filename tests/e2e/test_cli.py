@@ -29,6 +29,11 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
     if sys.platform == "win32":
         env["USERPROFILE"] = str(home)
         env["LOCALAPPDATA"] = str(home / "AppData" / "Local")
+        # Clear the POSIX-side roots too: Path.home() on Windows reads HOME
+        # before USERPROFILE, and any code consulting XDG_CONFIG_HOME would
+        # otherwise resolve into the runner's real user dir.
+        env.pop("HOME", None)
+        env.pop("XDG_CONFIG_HOME", None)
     else:
         env["HOME"] = str(home)
         env.pop("XDG_CONFIG_HOME", None)
