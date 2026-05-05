@@ -28,4 +28,4 @@ build = "python -m build"
 # this task is safe to invoke on any host but is only meaningful on the
 # Windows CI runner.
 verify-windows = { cmd = "python scripts/verify_windows_paths.py && python scripts/verify_junction.py" }
-ci = { depends-on = ["lint", "typecheck", "test", "test-integration", "test-e2e", "verify-windows"] }
+ci = { depends-on = ["lint", "typecheck", "test", "test-integration", "test-e2e", "verify-windows", "build"] }
