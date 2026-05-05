@@ -41,9 +41,15 @@ BUILTINS_DIR = Path(__file__).resolve().parent.parent / "src" / "switcher" / "bu
 def load_expectations() -> dict[str, list[str]]:
     """Read every *.toml in the builtins dir, return {tool_id: [windows_path, ...]}.
 
+    `config_dirs[*].windows_path` is treated as OPTIONAL: a builtin
+    intentionally targeting POSIX-only tools can omit it. Such tools land
+    in the result with an empty list and main() reports them as
+    `(POSIX-only)` rather than failing CI for a non-bug.
+
     Raises KeyError with a file-qualified message if a TOML is missing
-    `id` or a `config_dirs` entry is missing `windows_path`. We keep this
-    loud (rather than skip-with-warning) since the builtin TOMLs are
+    `id` or `config_dirs`, or if `config_dirs` is empty (every builtin
+    needs at least one config dir to be useful). We keep this loud
+    (rather than skip-with-warning) since the builtin TOMLs are
     repo-shipped -- a missing key is a repo bug to surface, not host
     state to tolerate -- but the file-qualified message saves the reader
     from chasing a bare `KeyError: 'id'` traceback.
@@ -74,12 +80,11 @@ def load_expectations() -> dict[str, list[str]]:
                 f"{toml_path.name}: 'config_dirs' is empty "
                 f"(every builtin requires at least one config dir)"
             )
-        try:
-            windows_paths = [str(d["windows_path"]) for d in config_dirs]
-        except KeyError as e:
-            raise KeyError(
-                f"{toml_path.name}: config_dirs entry missing {e.args[0]!r}"
-            ) from e
+        # Filter to entries that declare a windows_path. POSIX-only builtins
+        # leave the list empty; a partially-Windows-aware builtin with some
+        # but not all config_dirs declaring windows_path still gets its
+        # declared paths verified.
+        windows_paths = [str(d["windows_path"]) for d in config_dirs if "windows_path" in d]
         if tool_id in expectations:
             # Two builtin TOMLs claiming the same id would otherwise silently
             # overwrite, masking one of them and letting CI report a false pass.
@@ -105,6 +110,12 @@ def main() -> int:
     unexpanded_failures: list[str] = []
     for tool, paths in expectations.items():
         print(f"--- {tool} ---")
+        if not paths:
+            # Builtin declares no windows_path entries -- POSIX-only tool.
+            # Print a marker so the report shows we considered it; nothing
+            # to verify on the Windows side.
+            print("  (POSIX-only -- no windows_path declared)")
+            continue
         for raw in paths:
             expanded_str = os.path.expandvars(raw)
             print(f"  {raw}")
