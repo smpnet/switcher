@@ -99,6 +99,32 @@ reviews:
         (write tmp + rename) and idempotent. move_or_seed_dir's four
         cases: missing→seed empty, link→AlreadyLinkedError, file→
         PathNotADirectoryError, real dir→atomic move.
+    - path: "src/switcher/store.py"
+      instructions: >
+        Persistence layer only. profile_dir() is the single path
+        constructor; routes every name through validate_safe_name.
+        Atomic writes via tmp+rename. Caller owns active-map updates
+        on rename/delete. get/list reconcile metadata.name to dir.
+    - path: "src/switcher/registry.py"
+      instructions: >
+        Two-layer override: package builtins + user TOMLs from
+        <state>/registry.d/. user_seen check runs BEFORE builtin
+        check, so two user TOMLs colliding on a builtin id report
+        first as override-builtin, then as duplicate-user.
+    - path: "src/switcher/service.py"
+      instructions: >
+        Policy layer. delete() refuses if profile is active. create()
+        derives tools from the active map (not detect_installed).
+        rename() persists active map BEFORE relinking. save() rolls
+        back on copytree failure. Module-level now() is the
+        monkeypatch seam.
+    - path: "src/switcher/cli.py"
+      instructions: >
+        Typer app. handle_errors decorator catches SwitcherError ->
+        stderr + exit 1. get_deps() is the test override seam.
+        pretty_exceptions_enable=False is intentional. Mutating
+        commands flow through ProfileService; list/status hit the
+        store directly.
     - path: "src/switcher/errors.py"
       instructions: >
         Exception class names must end with "Error" (ruff N818).
@@ -109,6 +135,13 @@ reviews:
         Use tmp_path fixtures; no mocks unless unavoidable. Plan-driven
         test bodies should be appended verbatim, then minimal deviations
         noted in the commit message.
+    - path: "tests/integration/**"
+      instructions: >
+        Marked pytestmark = pytest.mark.integration. Real filesystem
+        via tmp_home/tmp_state (never real $HOME). May shell out via
+        subprocess. Assert disk state across full lifecycles, not
+        just return values. Extend per-tool invariants when adding
+        tools.
     - path: "src/switcher/builtins/*.toml"
       instructions: >
         Builtin tool definitions. Each must round-trip through
@@ -307,3 +340,9 @@ code_generation:
           Pytest with tmp_path. Test names describe behavior, not
           implementation. Cross-platform branches use sys.platform == "win32".
           Use pytest.MonkeyPatch for env mutation; never touch real $HOME.
+      - path: "tests/integration/**/*.py"
+        instructions: >
+          Real filesystem (tmp_home/tmp_state). Mark with
+          pytest.mark.integration. Lifecycle tests walk the registry and
+          assert per-tool link/active-map invariants; packaging tests
+          inspect built wheel/sdist.
