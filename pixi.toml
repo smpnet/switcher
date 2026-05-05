@@ -24,6 +24,6 @@ lint = { cmd = "ruff check src tests && ruff format --check src tests" }
 format = "ruff format src tests"
 typecheck = "basedpyright src tests"
 build = "python -m build"
-ci = { depends-on = ["lint", "typecheck", "test"] }
-# test-integration / test-e2e join `ci` once tasks 21/22 land their first cases
-# (pytest exit-5 on no-tests-collected breaks the chain otherwise).
+ci = { depends-on = ["lint", "typecheck", "test", "test-integration"] }
+# test-e2e joins `ci` once Task 22 lands its first case (pytest exit-5 on
+# no-tests-collected breaks the chain otherwise).
