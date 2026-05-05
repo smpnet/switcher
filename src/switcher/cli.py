@@ -111,6 +111,81 @@ def status() -> None:
     console.print(table)
 
 
+# -- mutating commands ------------------------------------------------------
+
+
+@app.command()
+@handle_errors
+def init() -> None:
+    """One-time setup: detect tools, snapshot current config, create vanilla."""
+    name = get_deps().service.init()
+    console.print(f"Initialized profile {name!r}")
+
+
+@app.command()
+@handle_errors
+def use(
+    name: str,
+    only: str | None = typer.Option(
+        None,
+        "--only",
+        help="Comma-separated tool IDs; default: all tools the profile includes.",
+    ),
+) -> None:
+    """Switch a profile (atomically re-points the live config dirs)."""
+    only_list = [t.strip() for t in only.split(",")] if only else None
+    get_deps().service.use(name, only_list)
+    if only_list is None:
+        console.print(f"Using profile {name!r} for all tools")
+    else:
+        console.print(f"Using profile {name!r} for tools: {', '.join(only_list)}")
+
+
+@app.command()
+@handle_errors
+def create(name: str) -> None:
+    """Create a new profile, seeding credentials from the current active profile."""
+    get_deps().service.create(name)
+    console.print(f"Created profile {name!r}")
+
+
+@app.command()
+@handle_errors
+def save(name: str) -> None:
+    """Snapshot current live config into a new profile."""
+    get_deps().service.save(name)
+    console.print(f"Saved live config as {name!r}")
+
+
+@app.command()
+@handle_errors
+def rename(old: str, new: str) -> None:
+    """Rename a profile. Active tools auto-relink to the new name."""
+    get_deps().service.rename(old, new)
+    console.print(f"Renamed {old!r} -> {new!r}")
+
+
+@app.command()
+@handle_errors
+def delete(
+    name: str,
+    force: bool = typer.Option(False, "--force", help="Skip the interactive confirmation."),
+) -> None:
+    """Delete a profile. Refuses if the profile is active for any tool."""
+    if not force and not typer.confirm(f"Delete profile {name!r}?"):
+        raise typer.Exit(code=0)
+    get_deps().service.delete(name)
+    console.print(f"Deleted profile {name!r}")
+
+
+@app.command()
+@handle_errors
+def which(tool: str) -> None:
+    """Show which profile a specific tool is currently using."""
+    name = get_deps().service.which(tool)
+    console.print(name)
+
+
 @tools_app.callback(invoke_without_command=True)
 @handle_errors
 def tools_main(ctx: typer.Context) -> None:
