@@ -2,6 +2,11 @@
 
 The atomicity test runs a concurrent reader against a junction being replaced
 and asserts the reader never observes a missing target -- only old or new.
+
+Exits non-zero (1) if any verification fails or if the atomicity reader
+observes any FileNotFoundError, since a non-zero miss count means
+swap_link's Windows path needs the delete-then-create fallback documented
+in spec section 4.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ if sys.platform != "win32":
     sys.exit(0)
 
 
-def test_create_junction(workdir: Path) -> None:
+def test_create_junction(workdir: Path) -> bool:
     target = workdir / "target"
     target.mkdir()
     (target / "marker").write_text("hello")
@@ -27,15 +32,20 @@ def test_create_junction(workdir: Path) -> None:
         import _winapi  # type: ignore[import-not-found]
 
         _winapi.CreateJunction(str(target), str(link))
-        print("PASS _winapi.CreateJunction works")
     except Exception as e:
         print(f"FAIL _winapi.CreateJunction failed: {e}")
-        return
-    assert (link / "marker").read_text() == "hello"
-    assert os.path.isjunction(link)
+        return False
+    if (link / "marker").read_text() != "hello":
+        print("FAIL junction does not resolve to target contents")
+        return False
+    if not os.path.isjunction(link):
+        print("FAIL os.path.isjunction did not recognize the junction")
+        return False
+    print("PASS _winapi.CreateJunction works")
+    return True
 
 
-def test_atomic_replace(workdir: Path) -> None:
+def test_atomic_replace(workdir: Path) -> bool:
     target_a = workdir / "a"
     target_a.mkdir()
     (target_a / "v").write_text("A")
@@ -68,25 +78,35 @@ def test_atomic_replace(workdir: Path) -> None:
         os.replace(new, link)
     stop.set()
     t.join()
-    print(f"PASS atomic replace; misses={misses}, seen={seen}")
     if misses > 0:
         print(
-            "WARN Atomicity hedge confirmed needed: "
+            f"FAIL atomic replace; misses={misses}, seen={seen} -- "
+            "atomicity hedge confirmed needed: "
             "switch to delete-then-create fallback"
         )
+        return False
+    print(f"PASS atomic replace; misses=0, seen={seen}")
+    return True
 
 
-def main() -> None:
+def main() -> int:
     workdir = Path("./.junction-spike")
     if workdir.exists():
         shutil.rmtree(workdir)
     workdir.mkdir()
+    # Each test gets its own subdir so a junction created by one test cannot
+    # collide with the destination path of the next.
     try:
-        test_create_junction(workdir)
-        test_atomic_replace(workdir)
+        create_dir = workdir / "create"
+        create_dir.mkdir()
+        atomic_dir = workdir / "atomic"
+        atomic_dir.mkdir()
+        ok = test_create_junction(create_dir)
+        ok = test_atomic_replace(atomic_dir) and ok
+        return 0 if ok else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

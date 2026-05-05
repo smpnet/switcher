@@ -17,11 +17,21 @@ pytestmark = pytest.mark.e2e
 
 
 def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProcess[str]:
+    """Boot `python -m switcher <args>` against an isolated env.
+
+    The conftest fixtures already set HOME/USERPROFILE/LOCALAPPDATA via
+    monkeypatch and `os.environ.copy()` would inherit those, but we re-set
+    every config root the codepath consults here — making this helper
+    self-contained instead of implicitly relying on which fixtures the
+    caller pulled in.
+    """
     env = os.environ.copy()
     if sys.platform == "win32":
         env["USERPROFILE"] = str(home)
+        env["LOCALAPPDATA"] = str(home / "AppData" / "Local")
     else:
         env["HOME"] = str(home)
+        env.pop("XDG_CONFIG_HOME", None)
     env["SWITCHER_STATE_DIR"] = str(state)
     return subprocess.run(
         [sys.executable, "-m", "switcher", *args],
@@ -54,7 +64,8 @@ def test_init_then_status(tmp_home: Path, tmp_state: Path) -> None:
 
 
 def test_init_twice_errors(tmp_home: Path, tmp_state: Path) -> None:
-    _run(["init"], tmp_home, tmp_state)
+    first = _run(["init"], tmp_home, tmp_state)
+    assert first.returncode == 0, first.stderr
     r = _run(["init"], tmp_home, tmp_state)
     assert r.returncode == 1
     assert "already initialized" in r.stderr
@@ -67,7 +78,8 @@ def test_which_before_init_errors(tmp_home: Path, tmp_state: Path) -> None:
 
 
 def test_use_unknown_profile_errors(tmp_home: Path, tmp_state: Path) -> None:
-    _run(["init"], tmp_home, tmp_state)
+    first = _run(["init"], tmp_home, tmp_state)
+    assert first.returncode == 0, first.stderr
     r = _run(["use", "nonexistent"], tmp_home, tmp_state)
     assert r.returncode == 1
     assert "not found" in r.stderr
