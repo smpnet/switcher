@@ -46,6 +46,12 @@ jobs:
       - name: E2E tests
         run: pixi run test-e2e
 
+      - name: Windows verification spikes
+        # Self-skips with `SKIP: Windows only` on POSIX runners; we still run
+        # it here so the workflow's step list mirrors `pixi run ci` exactly.
+        # Lets pixi.toml stay the single source of truth for what's tested.
+        run: pixi run verify-windows
+
       - name: Build wheel
         run: pixi run build
 
