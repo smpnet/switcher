@@ -1,11 +1,12 @@
-"""Full filesystem lifecycle exercise.
+"""Full filesystem lifecycle exercise at the ProfileService level.
 
-Runs init -> status -> use vanilla -> save snapshot -> create experiment
--> use experiment -> delete vanilla (after switching off it) -> rename.
-Asserts disk state at each step: which entries are dirs, which are links,
-where each link points -- for *every* registered tool, not just claude.
-A regression that only breaks symlink/junction handling for one tool's
-secondary config dir would otherwise slip through.
+Drives the service API directly -- CLI wiring (Typer command
+registration, option parsing, handle_errors rendering) is the E2E
+suite's scope (Task 22 in the v0.1.0 plan). Walks the full lifecycle
+(init -> use -> save -> create -> use -> delete -> rename) and
+asserts disk state at every step for *every* registered tool, so a
+regression confined to one tool's secondary config_dir can't pass
+silently.
 """
 
 from __future__ import annotations
