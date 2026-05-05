@@ -94,10 +94,13 @@ def test_use_only_strips_empty_entries(runner: CliRunner, tmp_home: Path, tmp_st
     assert result.stdout.rstrip().endswith("claude")
 
 
-def test_use_only_rejects_empty_list(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    """`--only ""` and `--only ","` must fail fast with a usage error."""
+@pytest.mark.parametrize("arg", ["", ","])
+def test_use_only_rejects_empty_list(
+    runner: CliRunner, tmp_home: Path, tmp_state: Path, arg: str
+) -> None:
+    """Both an empty string and a comma-only value must fail with a usage error."""
     _setup(runner, "init")
-    result = runner.invoke(app, ["use", "vanilla", "--only", ""])
+    result = runner.invoke(app, ["use", "vanilla", "--only", arg])
     assert result.exit_code == 2
     assert "at least one tool id" in result.stderr
 
@@ -169,6 +172,13 @@ def test_tools_scaffold_with_out(runner: CliRunner, tmp_state: Path, tmp_path: P
     result = runner.invoke(app, ["tools", "scaffold", "x", "--out", str(out)])
     assert result.exit_code == 0
     assert out.exists()
+
+
+def test_tools_scaffold_expands_tilde(runner: CliRunner, tmp_state: Path, tmp_home: Path) -> None:
+    """`--out ~/foo.toml` must resolve via expanduser, not be taken literally."""
+    result = runner.invoke(app, ["tools", "scaffold", "x", "--out", "~/x.toml"])
+    assert result.exit_code == 0
+    assert (tmp_home / "x.toml").exists()
 
 
 def test_tools_scaffold_refuses_overwrite(runner: CliRunner, tmp_state: Path) -> None:

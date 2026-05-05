@@ -204,7 +204,9 @@ def tools_scaffold(
 ) -> None:
     """Write a stub TOML for a new user tool."""
     deps = get_deps()
-    target = Path(out) if out else deps.store.state_dir() / "registry.d" / f"{tool_id}.toml"
+    target = (
+        Path(out).expanduser() if out else deps.store.state_dir() / "registry.d" / f"{tool_id}.toml"
+    )
     scaffold_tool(tool_id, target)
     console.print(f"Wrote scaffold to {target}")
 
