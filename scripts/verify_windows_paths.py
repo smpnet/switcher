@@ -1,5 +1,10 @@
 """Verify the Windows config paths in our builtin TOMLs match where the AI
 tools actually store config on Windows. Run on a real Windows machine.
+
+Exits non-zero (1) if any expected path expands incompletely, is missing,
+or points to a regular file instead of a directory -- otherwise the
+\"verification\" added to CI would never fail and pinning these paths in
+the builtin TOMLs gives a false sense of coverage.
 """
 
 from __future__ import annotations
@@ -20,13 +25,14 @@ EXPECTATIONS = {
 }
 
 
-def main() -> None:
+def main() -> int:
     if sys.platform != "win32":
         print("SKIP: Windows only")
-        return
+        return 0
     print(f"USERPROFILE = {os.environ.get('USERPROFILE')}")
     print(f"LOCALAPPDATA = {os.environ.get('LOCALAPPDATA')}")
     print()
+    failures: list[str] = []
     for tool, paths in EXPECTATIONS.items():
         print(f"--- {tool} ---")
         for raw in paths:
@@ -36,17 +42,27 @@ def main() -> None:
                 # expandvars leaves unknown %VAR% tokens untouched, so a path
                 # like '%LOCALAPPDATA%\foo' would otherwise be reported as
                 # MISSING with no hint that the env var was the actual problem.
-                print(f"    -> WARN: env var not expanded: {expanded_str}")
+                print(f"    -> FAIL: env var not expanded: {expanded_str}")
+                failures.append(f"{tool}: unexpanded {raw}")
                 continue
             expanded = Path(expanded_str)
             if not expanded.exists():
                 status = "MISSING"
+                failures.append(f"{tool}: missing {expanded}")
             elif expanded.is_dir():
                 status = "DIR"
             else:
                 status = "FILE (expected directory!)"
+                failures.append(f"{tool}: file-not-dir {expanded}")
             print(f"    -> {expanded} [{status}]")
+    if failures:
+        print()
+        print(f"FAIL {len(failures)} path(s) failed verification:")
+        for f in failures:
+            print(f"  - {f}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

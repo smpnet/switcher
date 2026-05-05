@@ -16,11 +16,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,                  python: "3.13" }
-          - { os: macos-latest,                   python: "3.13" }
-          - { os: [self-hosted, Windows, X64],    python: "3.13" }
+          - { os: ubuntu-latest }
+          - { os: macos-latest }
+          - { os: [self-hosted, Windows, X64] }
 
     runs-on: ${{ matrix.os }}
+    # Python version is pinned via pixi.toml ([dependencies] python = ">=3.13,<3.14")
+    # and resolved by setup-pixi -- no system Python is consulted, so a matrix
+    # `python` dimension here would be dead noise.
 
     steps:
       - uses: actions/checkout@v4
