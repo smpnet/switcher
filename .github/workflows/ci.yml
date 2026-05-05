@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Trigger on every push (no branch filter) so feature-branch development
+  # gets CI signal before a PR exists -- catches regressions early and
+  # exercises the workflow itself before relying on it for a PR gate.
   push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -19,13 +21,18 @@ jobs:
   # ============================================================================
 
   # GitHub-hosted runners: always run, including for fork PRs. These are
-  # ephemeral and isolated, so untrusted PR code is safe here.
+  # ephemeral and isolated, so untrusted PR code is safe here. windows-latest
+  # is included in the hosted matrix so the verify-windows scripts get
+  # exercised on every push/PR (including fork PRs), closing the gap where
+  # the self-hosted Windows job is gated away from forks. The test-windows
+  # job below stays for the host-state diagnostics that need a provisioned
+  # runner with Claude Code / Copilot CLI actually installed.
   test:
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     # Python version is pinned via pixi.toml ([dependencies] python = ">=3.13,<3.14")
     # and resolved by setup-pixi -- no system Python is consulted, so a matrix
