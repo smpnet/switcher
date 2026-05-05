@@ -245,7 +245,17 @@ class ProfileService:
             self._seed_credentials(src_profile, name, tool)
 
     def which(self, tool_id: str) -> str:
+        """Return the active profile name for `tool_id`.
+
+        Distinguishes two failure modes the spec keeps separate: a tool ID
+        that the registry doesn't know about (``UnknownToolError``) vs. a
+        registered tool that just hasn't been activated yet
+        (``ToolHasNoActiveProfileError``). Routing both through the latter
+        would let typos masquerade as "no profile" answers.
+        """
         self._require_initialized()
+        if find_tool(self._registry, tool_id) is None:
+            raise UnknownToolError(f"unknown tool {tool_id!r}")
         active = self._store.get_active()
         if tool_id not in active:
             raise ToolHasNoActiveProfileError(f"tool {tool_id!r} has no active profile")
@@ -257,9 +267,31 @@ class ProfileService:
             raise UnknownProfileError(f"profile {old!r} not found")
         if self._store.profile_dir(new).exists():
             raise ProfileExistsError(f"profile {new!r} already exists")
-        self._store.rename(old, new)
+        # Pre-flight: every affected tool's live path must be a link (broken
+        # or valid) or a non-existent path. A real directory at the live path
+        # would let store.rename succeed, then swap_link refuse mid-loop with
+        # IsADirectoryError, leaving the rename half-applied (profile dir
+        # moved, some live links updated, others stale). Same "validate, then
+        # mutate" discipline as use() / save() / init(). True transactional
+        # rollback on transient swap_link failures is v0.2.0 (tracked-ops).
         active = self._store.get_active()
         affected_ids = [tid for tid, p in active.items() if p == old]
+        for tid in affected_ids:
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                continue
+            for i in range(len(tool.config_dirs)):
+                live = self._resolver.tool_dir(tool, i)
+                if not self._resolver.is_link(live) and live.exists() and not live.is_dir():
+                    raise PathNotADirectoryError(
+                        f"{live} exists but is not a directory; cannot relink"
+                    )
+                if not self._resolver.is_link(live) and live.is_dir():
+                    raise PathNotADirectoryError(
+                        f"{live} is a real directory, not a switcher link; "
+                        f"refusing to rename {old!r} to {new!r}"
+                    )
+        self._store.rename(old, new)
         for tid in affected_ids:
             tool = find_tool(self._registry, tid)
             if tool is None:

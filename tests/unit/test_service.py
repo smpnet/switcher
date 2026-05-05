@@ -386,9 +386,29 @@ def test_which_returns_active_profile(service: ProfileService) -> None:
 
 
 def test_which_unknown_tool_raises(service: ProfileService) -> None:
+    """A tool ID not in the registry is a typo, not a known-but-inactive tool.
+
+    UnknownToolError exists for exactly this case; routing it through
+    ToolHasNoActiveProfileError would mask typos as "no profile" answers.
+    """
+    service.init()
+    with pytest.raises(UnknownToolError):
+        service.which("nonexistent_tool")
+
+
+def test_which_registered_but_inactive_tool_raises(
+    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
+) -> None:
+    """Registered tool that wasn't installed at init time is missing from
+    active — caller learns it's *registered* but inactive, not unknown."""
+    # Make claude appear uninstalled so init() doesn't add it to active
+    shutil.rmtree(tmp_home / ".claude")
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, registry)
     service.init()
     with pytest.raises(ToolHasNoActiveProfileError):
-        service.which("nonexistent_tool")
+        service.which("claude")
 
 
 def test_which_before_init_raises(service: ProfileService) -> None:
@@ -428,6 +448,29 @@ def test_rename_to_existing_raises(service: ProfileService) -> None:
 def test_rename_before_init_raises(service: ProfileService) -> None:
     with pytest.raises(StateNotInitializedError):
         service.rename("a", "b")
+
+
+def test_rename_pre_validates_live_paths_are_links(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A real directory at a live path must fail BEFORE store.rename mutates anything.
+
+    Without pre-flight, store.rename would succeed; swap_link would then
+    refuse with IsADirectoryError on the first affected tool, leaving the
+    rename half-applied (profile dir moved, live links stale).
+    """
+    name = service.init()
+    # Replace the claude symlink with a real directory
+    claude = tmp_home / ".claude"
+    if claude.is_symlink() or (IS_WINDOWS and os.path.isjunction(claude)):
+        claude.unlink() if not IS_WINDOWS else claude.rmdir()
+    claude.mkdir()
+    with pytest.raises(PathNotADirectoryError):
+        service.rename(name, "client-A")
+    # Pre-flight ran before store.rename, so the old profile is still there
+    store = FileProfileStore(tmp_state)
+    assert store.profile_dir(name).exists()
+    assert not store.profile_dir("client-A").exists()
 
 
 # ---------------- delete ----------------
