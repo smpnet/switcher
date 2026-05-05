@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from switcher.cli import app, handle_errors
 from switcher.errors import SwitcherError
+from switcher.store import FileProfileStore
 
 
 @pytest.fixture
@@ -107,19 +108,26 @@ def test_rename_command(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> N
     assert result.exit_code == 0
 
 
+def _dated_profile_name(state_dir: Path) -> str:
+    """Read the dated profile name from disk (init creates two: dated + vanilla).
+
+    Bypasses both init's and `list`'s stdout formats, so changes to the
+    naming convention or the table renderer don't break these tests.
+    """
+    return next(p.name for p in FileProfileStore(state_dir).list() if p.name != "vanilla")
+
+
 def test_delete_with_force(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
     runner.invoke(app, ["init"])
     runner.invoke(app, ["use", "vanilla"])  # switch off the dated profile
-    listed = runner.invoke(app, ["list"]).stdout
-    dated = next(line.split()[-1] for line in listed.splitlines() if "current" in line)
+    dated = _dated_profile_name(tmp_state)
     result = runner.invoke(app, ["delete", dated, "--force"])
     assert result.exit_code == 0
 
 
 def test_delete_active_refused(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
     runner.invoke(app, ["init"])
-    listed = runner.invoke(app, ["list"]).stdout
-    dated = next(line.split()[-1] for line in listed.splitlines() if "current" in line)
+    dated = _dated_profile_name(tmp_state)
     blocked = runner.invoke(app, ["delete", dated, "--force"])
     assert blocked.exit_code == 1
     assert "active for" in blocked.stderr
