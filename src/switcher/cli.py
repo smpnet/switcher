@@ -134,7 +134,12 @@ def use(
     ),
 ) -> None:
     """Switch a profile (atomically re-points the live config dirs)."""
-    only_list = [t.strip() for t in only.split(",")] if only else None
+    if only is None:
+        only_list = None
+    else:
+        only_list = [t.strip() for t in only.split(",") if t.strip()]
+        if not only_list:
+            raise typer.BadParameter("--only must contain at least one tool id")
     get_deps().service.use(name, only_list)
     if only_list is None:
         console.print(f"Using profile {name!r} for all tools")

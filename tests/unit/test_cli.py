@@ -69,6 +69,24 @@ def test_use_only_filter(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> 
     assert "claude" in result.stdout
 
 
+def test_use_only_strips_empty_entries(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
+    """Trailing-comma / whitespace shouldn't surface as `unknown tool ''`."""
+    runner.invoke(app, ["init"])
+    result = runner.invoke(app, ["use", "vanilla", "--only", "claude, "])
+    assert result.exit_code == 0
+    # Output must not contain the empty entry that the naive split would produce
+    assert ", ," not in result.stdout
+    assert result.stdout.rstrip().endswith("claude")
+
+
+def test_use_only_rejects_empty_list(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
+    """`--only ""` and `--only ","` must fail fast with a usage error."""
+    runner.invoke(app, ["init"])
+    result = runner.invoke(app, ["use", "vanilla", "--only", ""])
+    assert result.exit_code == 2
+    assert "at least one tool id" in result.stderr
+
+
 def test_create_then_list(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
     runner.invoke(app, ["init"])
     result = runner.invoke(app, ["create", "experiment"])
