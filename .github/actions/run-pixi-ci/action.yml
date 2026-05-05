@@ -10,13 +10,7 @@ description: >
 runs:
   using: composite
   steps:
-    # Pinned to immutable commit SHA (= tag v0.8.1) so an upstream
-    # tag retarget can't silently change CI behavior; bump along
-    # with any other action audits during the v0.2.0 security review.
-    - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659  # v0.8.1
-      with:
-        pixi-version: v0.66.0
-        cache: true
+    - uses: ./.github/actions/setup-pixi-pinned
 
     # Per-platform shell selection: `shell: bash` would assume Git for
     # Windows is installed on every Windows runner, which holds for

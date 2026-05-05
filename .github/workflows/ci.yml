@@ -77,14 +77,14 @@ jobs:
     timeout-minutes: 15
     runs-on: [self-hosted, Windows, X64]
     steps:
-      # Pinned to immutable commit SHA (= tag v4) for the same supply-chain
-      # hardening reason setup-pixi is pinned in run-pixi-ci/action.yml;
-      # bump on the v0.2.0 security review.
+      # checkout pinned to immutable commit SHA (= tag v4) for the same
+      # supply-chain hardening reason setup-pixi is pinned; bump on the
+      # v0.2.0 security review.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659  # v0.8.1
-        with:
-          pixi-version: v0.66.0
-          cache: true
+      # Pinned setup-pixi lives in setup-pixi-pinned/action.yml so this
+      # job and run-pixi-ci/ share one source of truth for the SHA +
+      # pixi-version, preventing silent bootstrap drift between jobs.
+      - uses: ./.github/actions/setup-pixi-pinned
       - name: Verify provisioned tool state (host-strict)
         shell: powershell
         run: pixi run verify-windows-strict

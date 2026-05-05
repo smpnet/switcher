@@ -1,0 +1,18 @@
+name: Set up pinned pixi
+description: >
+  Single source of truth for the prefix-dev/setup-pixi action SHA and the
+  pinned pixi-version. Bump both here and every dependent (test job's
+  composite, test-windows's direct invocation) picks up the change
+  automatically -- prevents the SHA / version from drifting silently
+  between bootstrap callsites.
+
+runs:
+  using: composite
+  steps:
+    # Pinned to immutable commit SHA (= tag v0.8.1) for supply-chain
+    # hardening. Bump along with any other action audits during the
+    # v0.2.0 security review.
+    - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659  # v0.8.1
+      with:
+        pixi-version: v0.66.0
+        cache: true

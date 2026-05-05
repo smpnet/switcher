@@ -54,11 +54,16 @@ def _shipped_tool_ids() -> list[str]:
 _TOOL_IDS = _shipped_tool_ids()
 assert _TOOL_IDS, f"no builtin TOMLs discovered under {_BUILTINS_DIR}"
 
-# Split on whitespace AND Rich table border glyphs so a tool ID can be
-# checked as a discrete token rather than a substring. Without this, an
-# assertion like `"claude" in r.stdout` would match a hypothetical future
+# Split on whitespace AND table border glyphs so a tool ID can be checked
+# as a discrete token rather than a substring. Without this, an assertion
+# like `"claude" in r.stdout` would match a hypothetical future
 # "claude-code" tool ID's row, manufacturing a false-positive coverage.
-_TABLE_TOKEN_SPLIT = re.compile(r"[\s│┃┏┓┗┛━┳┻┃╇╋│]+")
+# Includes both Rich's default Unicode borders and the ASCII pipe `|` for
+# environments where Rich renders the simpler table style. `-` is
+# intentionally omitted -- it's a legitimate character inside tool IDs
+# (e.g. "claude-code") and ASCII row separators (---+---) span whole
+# lines without participating in the token assertions.
+_TABLE_TOKEN_SPLIT = re.compile(r"[\s│┃┏┓┗┛━┳┻╇╋|]+")
 
 
 def _tokens(text: str) -> list[str]:
