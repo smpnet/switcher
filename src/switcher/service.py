@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 
 from switcher.errors import (
     AlreadyLinkedError,
+    ProfileExistsError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
     ToolNotInProfileError,
@@ -131,3 +132,36 @@ class ProfileService:
                 swap_link(target, live)
             active[tid] = profile_name
         self._store.set_active(active)
+
+    def save(self, name: str) -> None:
+        self._require_initialized()
+        if self._store.profile_dir(name).exists():
+            raise ProfileExistsError(f"profile {name!r} already exists")
+        installed = self.detect_installed()
+        installed_by_id = {t.id: t for t in installed}
+        active = self._store.get_active()
+        # Save tools that are either currently installed OR have an active
+        # profile entry — covers the case where a tool was uninstalled live but
+        # still has historical state worth snapshotting.
+        tools_to_save: list[Tool] = []
+        seen_ids: set[str] = set()
+        for tid in list(installed_by_id) + list(active):
+            if tid in seen_ids:
+                continue
+            tool = installed_by_id.get(tid) or find_tool(self._registry, tid)
+            if tool is not None:
+                tools_to_save.append(tool)
+                seen_ids.add(tid)
+        self._store.create(name, {t.id: True for t in tools_to_save})
+        for tool in tools_to_save:
+            for i, dm in enumerate(tool.config_dirs):
+                live = self._resolver.tool_dir(tool, i)
+                target = self._store.profile_dir(name) / dm.profile_subdir
+                target.mkdir(parents=True, exist_ok=True)
+                if not live.exists():
+                    continue
+                # Resolve through the symlink so we copy the actual data
+                # under the active profile, not the link itself.
+                src = live.resolve() if live.is_symlink() else live
+                if src.is_dir():
+                    shutil.copytree(src, target, dirs_exist_ok=True)

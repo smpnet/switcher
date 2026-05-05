@@ -10,6 +10,7 @@ import pytest
 
 from switcher.errors import (
     AlreadyLinkedError,
+    ProfileExistsError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
     ToolNotInProfileError,
@@ -162,3 +163,29 @@ def test_use_is_idempotent(service: ProfileService, tmp_state: Path) -> None:
     active = FileProfileStore(tmp_state).get_active()
     for v in active.values():
         assert v == "vanilla"
+
+
+# ---------------- save ----------------
+
+
+def test_save_snapshots_live_state(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    service.init()
+    # Modify the live config (writes through the symlink)
+    (tmp_home / ".claude" / "marker.txt").write_text("hello")
+    service.save("snapshot")
+    snap_marker = FileProfileStore(tmp_state).profile_dir("snapshot") / "claude" / "marker.txt"
+    assert snap_marker.read_text() == "hello"
+
+
+def test_save_rejects_existing_profile(service: ProfileService) -> None:
+    service.init()
+    service.save("snap1")
+    with pytest.raises(ProfileExistsError):
+        service.save("snap1")
+
+
+def test_save_before_init_raises(service: ProfileService) -> None:
+    with pytest.raises(StateNotInitializedError):
+        service.save("any")
