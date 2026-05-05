@@ -358,11 +358,17 @@ def test_create_makes_profile_with_credentials_seeded(
 def test_create_skips_missing_credentials(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    """If the active profile has no credential file yet, create() must not error."""
+    """If the active profile has no credential file yet, create() must not error.
+
+    The profile_subdir layout must still be materialized — _seed_credentials
+    creates the dirs unconditionally so a later use()/save() against this
+    profile finds the directory structure it expects.
+    """
     service.init()
     service.create("fresh")
-    cred_dst = FileProfileStore(tmp_state).profile_dir("fresh") / "claude" / ".credentials.json"
-    assert not cred_dst.exists()
+    fresh_dir = FileProfileStore(tmp_state).profile_dir("fresh")
+    assert (fresh_dir / "claude").is_dir()  # subdir materialized
+    assert not (fresh_dir / "claude" / ".credentials.json").exists()
 
 
 def test_create_rejects_existing_profile(service: ProfileService) -> None:
@@ -480,6 +486,7 @@ def test_delete_inactive_profile_succeeds(service: ProfileService) -> None:
     name = service.init()
     service.use("vanilla")  # switch off `name`, freeing it for delete
     service.delete(name)
+    assert name not in [p.name for p in service.list_profiles()]
 
 
 def test_delete_active_profile_refuses(service: ProfileService) -> None:

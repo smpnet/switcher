@@ -282,14 +282,14 @@ class ProfileService:
                 continue
             for i in range(len(tool.config_dirs)):
                 live = self._resolver.tool_dir(tool, i)
-                if not self._resolver.is_link(live) and live.exists() and not live.is_dir():
+                if not self._resolver.is_link(live) and live.exists():
+                    if live.is_dir():
+                        raise PathNotADirectoryError(
+                            f"{live} is a real directory, not a switcher link; "
+                            f"refusing to rename {old!r} to {new!r}"
+                        )
                     raise PathNotADirectoryError(
                         f"{live} exists but is not a directory; cannot relink"
-                    )
-                if not self._resolver.is_link(live) and live.is_dir():
-                    raise PathNotADirectoryError(
-                        f"{live} is a real directory, not a switcher link; "
-                        f"refusing to rename {old!r} to {new!r}"
                     )
         self._store.rename(old, new)
         for tid in affected_ids:
