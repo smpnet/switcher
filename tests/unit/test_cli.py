@@ -18,6 +18,20 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
+def _setup(runner: CliRunner, *args: str) -> None:
+    """Run a CLI command as setup for another test and assert it succeeded.
+
+    Setup invokes (init, use vanilla, scaffold gemini, ...) that silently
+    error would otherwise let the next assertion fail in a misleading way --
+    e.g., a broken init would surface as `delete vanilla` returning a path-
+    not-found error, hiding the actual init regression.
+    """
+    result = runner.invoke(app, list(args))
+    assert result.exit_code == 0, (
+        f"setup `{' '.join(args)}` failed (exit {result.exit_code}): {result.stderr}"
+    )
+
+
 def test_version_command(runner: CliRunner) -> None:
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0
@@ -50,21 +64,21 @@ def test_init_run_succeeds(runner: CliRunner, tmp_home: Path, tmp_state: Path) -
 
 
 def test_init_then_status_shows_active(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
     assert "claude" in result.stdout
 
 
 def test_use_vanilla_after_init(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     result = runner.invoke(app, ["use", "vanilla"])
     assert result.exit_code == 0
     assert "vanilla" in result.stdout
 
 
 def test_use_only_filter(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     result = runner.invoke(app, ["use", "vanilla", "--only", "claude"])
     assert result.exit_code == 0
     assert "claude" in result.stdout
@@ -72,7 +86,7 @@ def test_use_only_filter(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> 
 
 def test_use_only_strips_empty_entries(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
     """Trailing-comma / whitespace shouldn't surface as `unknown tool ''`."""
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     result = runner.invoke(app, ["use", "vanilla", "--only", "claude, "])
     assert result.exit_code == 0
     # Output must not contain the empty entry that the naive split would produce
@@ -82,14 +96,14 @@ def test_use_only_strips_empty_entries(runner: CliRunner, tmp_home: Path, tmp_st
 
 def test_use_only_rejects_empty_list(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
     """`--only ""` and `--only ","` must fail fast with a usage error."""
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     result = runner.invoke(app, ["use", "vanilla", "--only", ""])
     assert result.exit_code == 2
     assert "at least one tool id" in result.stderr
 
 
 def test_create_then_list(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     result = runner.invoke(app, ["create", "experiment"])
     assert result.exit_code == 0
     listed = runner.invoke(app, ["list"])
@@ -97,13 +111,13 @@ def test_create_then_list(runner: CliRunner, tmp_home: Path, tmp_state: Path) ->
 
 
 def test_save_command(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     result = runner.invoke(app, ["save", "snap"])
     assert result.exit_code == 0
 
 
 def test_rename_command(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     result = runner.invoke(app, ["rename", "vanilla", "fresh"])
     assert result.exit_code == 0
 
@@ -118,15 +132,15 @@ def _dated_profile_name(state_dir: Path) -> str:
 
 
 def test_delete_with_force(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    runner.invoke(app, ["init"])
-    runner.invoke(app, ["use", "vanilla"])  # switch off the dated profile
+    _setup(runner, "init")
+    _setup(runner, "use", "vanilla")  # switch off the dated profile
     dated = _dated_profile_name(tmp_state)
     result = runner.invoke(app, ["delete", dated, "--force"])
     assert result.exit_code == 0
 
 
 def test_delete_active_refused(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     dated = _dated_profile_name(tmp_state)
     blocked = runner.invoke(app, ["delete", dated, "--force"])
     assert blocked.exit_code == 1
@@ -134,7 +148,7 @@ def test_delete_active_refused(runner: CliRunner, tmp_home: Path, tmp_state: Pat
 
 
 def test_which_command(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:
-    runner.invoke(app, ["init"])
+    _setup(runner, "init")
     result = runner.invoke(app, ["which", "claude"])
     assert result.exit_code == 0
     assert "current" in result.stdout
@@ -157,7 +171,7 @@ def test_tools_scaffold_with_out(runner: CliRunner, tmp_state: Path, tmp_path: P
 
 
 def test_tools_scaffold_refuses_overwrite(runner: CliRunner, tmp_state: Path) -> None:
-    runner.invoke(app, ["tools", "scaffold", "gemini"])
+    _setup(runner, "tools", "scaffold", "gemini")
     result = runner.invoke(app, ["tools", "scaffold", "gemini"])
     assert result.exit_code == 1
     assert "overwrite" in result.stderr
