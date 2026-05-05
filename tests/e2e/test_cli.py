@@ -42,12 +42,20 @@ def _shipped_tool_ids() -> list[str]:
         with toml_path.open("rb") as f:
             data = tomllib.load(f)
         try:
-            ids.append(str(data["id"]))
+            tool_id = data["id"]
         except KeyError as e:
             # File-qualified error mirrors verify_windows_paths.load_expectations
             # so a malformed builtin TOML doesn't fail at module import with a
             # bare `KeyError: 'id'` traceback that doesn't name the file.
             raise KeyError(f"{toml_path.name}: missing required key {e.args[0]!r}") from e
+        # Reject non-string `id` rather than silently coercing via str().
+        # A malformed `id = []` or `id = 42` would otherwise produce
+        # nonsense tool keys that pass through to test assertions.
+        if not isinstance(tool_id, str):
+            raise TypeError(
+                f"{toml_path.name}: 'id' must be a string, got {type(tool_id).__name__}"
+            )
+        ids.append(tool_id)
     return ids
 
 
@@ -177,6 +185,10 @@ def test_use_unknown_profile_errors(tmp_home: Path, tmp_state: Path) -> None:
 def test_help_lists_commands(tmp_home: Path, tmp_state: Path) -> None:
     r = _run(["--help"], tmp_home, tmp_state)
     assert r.returncode == 0, r.stderr
+    # Tokenize the help output for the same reason test_tools does -- a
+    # short command like "use" could otherwise match prose ("use the foo
+    # command") and pass even if the command itself were missing.
+    tokens = _tokens(r.stdout)
     for cmd in [
         "init",
         "use",
@@ -190,4 +202,4 @@ def test_help_lists_commands(tmp_home: Path, tmp_state: Path) -> None:
         "which",
         "version",
     ]:
-        assert cmd in r.stdout, f"missing {cmd!r} in --help output"
+        assert cmd in tokens, f"missing {cmd!r} as a discrete token in --help output: {r.stdout!r}"

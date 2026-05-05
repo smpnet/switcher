@@ -60,10 +60,19 @@ def load_expectations() -> dict[str, list[str]]:
         with toml_path.open("rb") as f:
             data = tomllib.load(f)
         try:
-            tool_id = str(data["id"])
+            tool_id_raw = data["id"]
             config_dirs = data["config_dirs"]
         except KeyError as e:
             raise KeyError(f"{toml_path.name}: missing required key {e.args[0]!r}") from e
+        # Reject non-string `id` instead of silently coercing via str(). A
+        # malformed `id = []` or `id = 42` would otherwise produce nonsense
+        # tool keys like "[]" or "42" that pass downstream checks.
+        if not isinstance(tool_id_raw, str):
+            raise TypeError(
+                f"{toml_path.name}: 'id' must be a string, "
+                f"got {type(tool_id_raw).__name__}"
+            )
+        tool_id = tool_id_raw
         if not isinstance(config_dirs, list):
             # E.g. someone wrote `config_dirs = "claude"` instead of
             # `[[config_dirs]]`. Without this check the for-loop below would
@@ -81,6 +90,7 @@ def load_expectations() -> dict[str, list[str]]:
                 f"{toml_path.name}: 'config_dirs' is empty "
                 f"(every builtin requires at least one config dir)"
             )
+        windows_paths: list[str] = []
         for i, entry in enumerate(config_dirs):
             # Each config_dirs entry must be a [[config_dirs]] table. A
             # malformed value like `config_dirs = ["foo"]` (list of strings)
@@ -91,11 +101,17 @@ def load_expectations() -> dict[str, list[str]]:
                     f"{toml_path.name}: config_dirs[{i}] must be a table, "
                     f"got {type(entry).__name__}"
                 )
-        # Filter to entries that declare a windows_path. POSIX-only builtins
-        # leave the list empty; a partially-Windows-aware builtin with some
-        # but not all config_dirs declaring windows_path still gets its
-        # declared paths verified.
-        windows_paths = [str(d["windows_path"]) for d in config_dirs if "windows_path" in d]
+            # windows_path is optional (POSIX-only tools leave it out), but
+            # if present it must be a string -- reject non-string values
+            # rather than silently coerce, same reason as `id` above.
+            if "windows_path" in entry:
+                wp = entry["windows_path"]
+                if not isinstance(wp, str):
+                    raise TypeError(
+                        f"{toml_path.name}: config_dirs[{i}].windows_path "
+                        f"must be a string, got {type(wp).__name__}"
+                    )
+                windows_paths.append(wp)
         if tool_id in expectations:
             # Two builtin TOMLs claiming the same id would otherwise silently
             # overwrite, masking one of them and letting CI report a false pass.
