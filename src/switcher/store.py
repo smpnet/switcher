@@ -169,4 +169,12 @@ class FileProfileStore:
         if not isinstance(active, dict):
             raise StorageError(f"malformed config.json: {path}")
         active_typed = cast("dict[object, object]", active)
-        return {str(k): str(v) for k, v in active_typed.items()}
+        # Reject non-string keys/values up-front. Coercing via str() turns
+        # config corruption into bogus profile names (null → "None") and
+        # masks the real failure mode.
+        result: dict[str, str] = {}
+        for k, v in active_typed.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise StorageError(f"malformed config.json: {path}")
+            result[k] = v
+        return result

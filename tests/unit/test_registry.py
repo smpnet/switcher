@@ -106,23 +106,44 @@ def test_build_registry_user_overrides_user_emits_distinct_warning(
     assert "overrides builtin" not in err
 
 
+def test_build_registry_two_user_files_overriding_builtin_attribute_correctly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When two user TOMLs both target the same builtin id, the FIRST is a
+    builtin-override and the SECOND is a duplicate-user — the immediate
+    conflict for the second file is with the earlier user file, not the
+    builtin. Misattributing both as builtin-overrides hides the real
+    conflict and makes user-config debugging painful."""
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    a = USER_TOOL.replace('id = "gemini"', 'id = "claude"').replace('"Gemini CLI"', '"First"')
+    b = USER_TOOL.replace('id = "gemini"', 'id = "claude"').replace('"Gemini CLI"', '"Second"')
+    (rd / "a-first.toml").write_text(a, encoding="utf-8")
+    (rd / "b-second.toml").write_text(b, encoding="utf-8")
+    build_registry(rd)
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert len(lines) == 2
+    assert "overrides builtin" in lines[0]
+    assert "duplicate user tool" in lines[1]
+
+
 def test_find_tool_returns_none_when_missing() -> None:
     tools = load_builtin_tools()
     assert find_tool(tools, "nonexistent") is None
 
 
 def test_scaffold_writes_valid_toml(tmp_path: Path) -> None:
-    out = tmp_path / "registry.d" / "myool.toml"
-    scaffold_tool("myool", out)
+    out = tmp_path / "registry.d" / "mytool.toml"
+    scaffold_tool("mytool", out)
     content = out.read_text(encoding="utf-8")
-    assert 'id = "myool"' in content
+    assert 'id = "mytool"' in content
     # Verify the scaffold itself parses (after the user fills in `name`)
     parsed = tomllib.loads(content)
-    assert parsed["id"] == "myool"
+    assert parsed["id"] == "mytool"
 
 
 def test_scaffold_refuses_to_overwrite(tmp_path: Path) -> None:
     out = tmp_path / "exists.toml"
     out.write_text("# existing", encoding="utf-8")
     with pytest.raises(StorageError, match="overwrite"):
-        scaffold_tool("myool", out)
+        scaffold_tool("mytool", out)

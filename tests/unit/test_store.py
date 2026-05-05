@@ -38,6 +38,15 @@ def test_get_unknown_raises(store: FileProfileStore) -> None:
         store.get("missing")
 
 
+def test_get_raises_storage_error_on_corrupt_metadata(store: FileProfileStore) -> None:
+    """Corrupt metadata.json must surface as StorageError so callers can
+    distinguish 'profile is broken' from 'profile is missing'."""
+    store.create("corrupt", {})
+    (store.profile_dir("corrupt") / "metadata.json").write_text("not valid json", encoding="utf-8")
+    with pytest.raises(StorageError):
+        store.get("corrupt")
+
+
 def test_list_returns_sorted_profiles(store: FileProfileStore) -> None:
     store.create("b-second", {})
     store.create("a-first", {})
@@ -96,6 +105,28 @@ def test_get_active_raises_on_corrupt_config(store: FileProfileStore, tmp_path: 
     cfg = tmp_path / "state" / "config.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text("not valid json", encoding="utf-8")
+    with pytest.raises(StorageError):
+        store.get_active()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"active": {"claude": null}}',
+        '{"active": {"claude": 42}}',
+        '{"active": {"claude": ["vanilla"]}}',
+        '{"active": {"claude": {"nested": "x"}}}',
+    ],
+)
+def test_get_active_rejects_non_string_values(
+    store: FileProfileStore, tmp_path: Path, payload: str
+) -> None:
+    """Coercing arbitrary JSON values via str() turns config corruption into
+    bogus profile names (e.g. null → "None"). Reject up-front so the
+    caller sees the real failure mode."""
+    cfg = tmp_path / "state" / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(payload, encoding="utf-8")
     with pytest.raises(StorageError):
         store.get_active()
 
@@ -184,7 +215,9 @@ def test_rename_is_recoverable_when_directory_move_fails(
         store.get("old")
 
 
-@pytest.mark.parametrize("bad_name", ["../etc", "../../escape", "a/b", ".hidden"])
+@pytest.mark.parametrize(
+    "bad_name", ["../etc", "../../escape", "a/b", ".hidden", "", " ", "\t", "."]
+)
 def test_profile_methods_reject_unsafe_names(store: FileProfileStore, bad_name: str) -> None:
     """profile_dir is a choke point — every method routing through it must
     refuse path-traversal-style names so callers cannot escape the state dir."""

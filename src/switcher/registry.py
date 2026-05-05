@@ -49,22 +49,28 @@ def build_registry(registry_dir: Path) -> tuple[Tool, ...]:
     stderr warning so the override is visible. A second user TOML colliding
     with an earlier user TOML is reported as a duplicate, not a builtin
     override — distinguishing the two helps users find the actual conflict.
+
+    Order of checks matters: once a user file has claimed a slot, the next
+    collision is user-vs-user even if the slot started as a builtin. Check
+    `user_seen` first so the second user file gets the right attribution.
     """
     builtins = load_builtin_tools()
     builtin_ids = frozenset(t.id for t in builtins)
     by_id: dict[str, Tool] = {t.id: t for t in builtins}
+    user_seen: set[str] = set()
     for t in load_user_tools(registry_dir):
-        if t.id in builtin_ids:
-            print(
-                f"warning: user tool {t.id!r} overrides builtin",
-                file=sys.stderr,
-            )
-        elif t.id in by_id:
+        if t.id in user_seen:
             print(
                 f"warning: duplicate user tool {t.id!r} (later file wins)",
                 file=sys.stderr,
             )
+        elif t.id in builtin_ids:
+            print(
+                f"warning: user tool {t.id!r} overrides builtin",
+                file=sys.stderr,
+            )
         by_id[t.id] = t
+        user_seen.add(t.id)
     return tuple(by_id.values())
 
 
