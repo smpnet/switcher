@@ -35,10 +35,14 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
     if sys.platform == "win32":
         env["USERPROFILE"] = str(home)
         env["LOCALAPPDATA"] = str(home / "AppData" / "Local")
-        # Clear the POSIX-side roots too: Path.home() on Windows reads HOME
-        # before USERPROFILE, and any code consulting XDG_CONFIG_HOME would
-        # otherwise resolve into the runner's real user dir.
+        # Clear every other root expanduser / Path.home() consults. Python's
+        # os.path.expanduser('~') on Windows tries HOME, then USERPROFILE,
+        # then HOMEDRIVE+HOMEPATH; any of those still pointing at the real
+        # runner profile would let the subprocess escape the temp home.
+        # Also clear XDG_CONFIG_HOME for code paths that consult it.
         env.pop("HOME", None)
+        env.pop("HOMEDRIVE", None)
+        env.pop("HOMEPATH", None)
         env.pop("XDG_CONFIG_HOME", None)
     else:
         env["HOME"] = str(home)
@@ -81,15 +85,16 @@ def test_init_then_status(tmp_home: Path, tmp_state: Path) -> None:
 
     r = _run(["status"], tmp_home, tmp_state)
     assert r.returncode == 0, r.stderr
-    # Both registered tools must show up in status with the same dated
-    # active profile. Bare 'claude' substring would have passed even on a
-    # status that lost copilot or that printed the tool ID without an
-    # active profile column.
-    assert "claude" in r.stdout
-    assert "copilot" in r.stdout
-    assert _DATED_PROFILE.search(r.stdout), (
-        f"no dated active profile in status output: {r.stdout!r}"
-    )
+    # Each registered tool must appear on a line that ALSO carries a dated
+    # active-profile name. A bare-substring approach would have passed even
+    # on a status output where one tool's row had no active profile, since
+    # the same dated string from the other row would satisfy a global
+    # search. Per-line enforcement is what the comment actually claims.
+    status_lines = r.stdout.splitlines()
+    for tool in ("claude", "copilot"):
+        assert any(tool in line and _DATED_PROFILE.search(line) for line in status_lines), (
+            f"no dated active profile on the {tool!r} line of status: {r.stdout!r}"
+        )
 
 
 def test_init_twice_errors(tmp_home: Path, tmp_state: Path) -> None:
