@@ -3,8 +3,11 @@
 `tmp_home`: tmp_path with the live config dirs pre-seeded; HOME (POSIX) or
 USERPROFILE (Windows) pointed at it.
 
-`tmp_state`: SWITCHER_STATE_DIR pointed at <tmp_path>/state; XDG_DATA_HOME and
-LOCALAPPDATA cleared for belt-and-suspenders isolation.
+`tmp_state`: SWITCHER_STATE_DIR pointed at <tmp_path>/state; XDG_DATA_HOME
+cleared as belt-and-suspenders. LOCALAPPDATA is intentionally NOT cleared —
+when `tmp_home` is also active it sets LOCALAPPDATA to a per-test path that
+the github-copilot resolution depends on; clearing it in `tmp_state` would
+race the two fixtures and break Windows tool detection.
 """
 
 from __future__ import annotations
