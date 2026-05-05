@@ -282,6 +282,31 @@ def test_save_rejects_non_dir_live_path(
     assert not FileProfileStore(tmp_state).profile_dir("snap").exists()
 
 
+def test_save_rolls_back_on_copytree_failure(
+    service: ProfileService,
+    tmp_home: Path,
+    tmp_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-snapshot copytree failure must clean up the partial profile.
+
+    Pre-flight catches every static precondition (missing dirs, files at live
+    paths, dangling links), but copytree can still fail for runtime reasons —
+    transient I/O, permissions, concurrent deletion. Without rollback the
+    persisted-but-empty profile dir would block save() retry with
+    ProfileExistsError. Mirrors store.create's own metadata-write rollback.
+    """
+    service.init()
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated transient I/O failure")
+
+    monkeypatch.setattr("switcher.service.shutil.copytree", boom)
+    with pytest.raises(OSError, match="simulated"):
+        service.save("snap")
+    assert not FileProfileStore(tmp_state).profile_dir("snap").exists()
+
+
 def test_save_rejects_dangling_symlink_live_path(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

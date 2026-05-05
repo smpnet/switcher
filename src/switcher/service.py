@@ -201,14 +201,24 @@ class ProfileService:
                         f"{live} exists but is not a directory; cannot snapshot"
                     )
         self._store.create(name, {t.id: True for t in installed})
-        for tool in installed:
-            for i, dm in enumerate(tool.config_dirs):
-                live = self._resolver.tool_dir(tool, i)
-                target = self._store.profile_dir(name) / dm.profile_subdir
-                target.mkdir(parents=True, exist_ok=True)
-                if not live.exists():
-                    continue
-                # Resolve through the symlink so we copy the actual data
-                # under the active profile, not the link itself.
-                src = live.resolve() if live.is_symlink() else live
-                shutil.copytree(src, target, dirs_exist_ok=True)
+        try:
+            for tool in installed:
+                for i, dm in enumerate(tool.config_dirs):
+                    live = self._resolver.tool_dir(tool, i)
+                    target = self._store.profile_dir(name) / dm.profile_subdir
+                    target.mkdir(parents=True, exist_ok=True)
+                    if not live.exists():
+                        continue
+                    # Resolve through the symlink so we copy the actual data
+                    # under the active profile, not the link itself.
+                    src = live.resolve() if live.is_symlink() else live
+                    shutil.copytree(src, target, dirs_exist_ok=True)
+        except Exception:
+            # No-debris discipline: copytree can fail mid-snapshot for
+            # runtime reasons that pre-flight can't catch (transient I/O,
+            # permissions, concurrent deletion). Without rollback the
+            # partial profile would block save() retry with
+            # ProfileExistsError. Mirrors store.create()'s own rollback on
+            # metadata-write failure.
+            shutil.rmtree(self._store.profile_dir(name), ignore_errors=True)
+            raise
