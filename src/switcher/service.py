@@ -17,6 +17,7 @@ from switcher.errors import (
     ProfileExistsError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
+    ToolHasNoActiveProfileError,
     ToolNotInProfileError,
     UnknownToolError,
 )
@@ -222,3 +223,28 @@ class ProfileService:
             # metadata-write failure.
             shutil.rmtree(self._store.profile_dir(name), ignore_errors=True)
             raise
+
+    def create(self, name: str) -> None:
+        self._require_initialized()
+        if self._store.profile_dir(name).exists():
+            raise ProfileExistsError(f"profile {name!r} already exists")
+        installed = self.detect_installed()
+        active = self._store.get_active()
+        self._store.create(name, {t.id: True for t in installed})
+        for tool in installed:
+            src_profile = active.get(tool.id)
+            if src_profile is None:
+                # Just ensure layout exists; no source to seed from.
+                for dm in tool.config_dirs:
+                    (self._store.profile_dir(name) / dm.profile_subdir).mkdir(
+                        parents=True, exist_ok=True
+                    )
+                continue
+            self._seed_credentials(src_profile, name, tool)
+
+    def which(self, tool_id: str) -> str:
+        self._require_initialized()
+        active = self._store.get_active()
+        if tool_id not in active:
+            raise ToolHasNoActiveProfileError(f"tool {tool_id!r} has no active profile")
+        return active[tool_id]

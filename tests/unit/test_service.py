@@ -14,6 +14,7 @@ from switcher.errors import (
     ProfileExistsError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
+    ToolHasNoActiveProfileError,
     ToolNotInProfileError,
     UnknownProfileError,
     UnknownToolError,
@@ -336,3 +337,59 @@ def test_save_rejects_dangling_symlink_live_path(
     with pytest.raises(PathNotADirectoryError):
         service.save("snap")
     assert not FileProfileStore(tmp_state).profile_dir("snap").exists()
+
+
+# ---------------- create ----------------
+
+
+def test_create_makes_profile_with_credentials_seeded(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    name = service.init()
+    store = FileProfileStore(tmp_state)
+    cred_src = store.profile_dir(name) / "claude" / ".credentials.json"
+    cred_src.write_text('{"token": "abc"}')
+    service.create("experiment")
+    cred_dst = store.profile_dir("experiment") / "claude" / ".credentials.json"
+    assert cred_dst.read_text() == '{"token": "abc"}'
+
+
+def test_create_skips_missing_credentials(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """If the active profile has no credential file yet, create() must not error."""
+    service.init()
+    service.create("fresh")
+    cred_dst = FileProfileStore(tmp_state).profile_dir("fresh") / "claude" / ".credentials.json"
+    assert not cred_dst.exists()
+
+
+def test_create_rejects_existing_profile(service: ProfileService) -> None:
+    service.init()
+    service.create("expt")
+    with pytest.raises(ProfileExistsError):
+        service.create("expt")
+
+
+def test_create_before_init_raises(service: ProfileService) -> None:
+    with pytest.raises(StateNotInitializedError):
+        service.create("anything")
+
+
+# ---------------- which ----------------
+
+
+def test_which_returns_active_profile(service: ProfileService) -> None:
+    name = service.init()
+    assert service.which("claude") == name
+
+
+def test_which_unknown_tool_raises(service: ProfileService) -> None:
+    service.init()
+    with pytest.raises(ToolHasNoActiveProfileError):
+        service.which("nonexistent_tool")
+
+
+def test_which_before_init_raises(service: ProfileService) -> None:
+    with pytest.raises(StateNotInitializedError):
+        service.which("claude")
