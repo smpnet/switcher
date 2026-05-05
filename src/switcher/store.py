@@ -108,9 +108,17 @@ class FileProfileStore:
         if not path.exists():
             raise UnknownProfileError(f"profile {name!r} not found")
         try:
-            return Profile.model_validate_json(path.read_text(encoding="utf-8"))
+            profile = Profile.model_validate_json(path.read_text(encoding="utf-8"))
         except Exception as e:
             raise StorageError(f"error reading {path}: {e}") from e
+        # The directory name is the canonical identifier; metadata.name is a
+        # cached display copy that can drift during a partial-failure rename
+        # (metadata rewritten, dir move failed). Reconcile here so list() and
+        # other observers see a consistent view: caller-visible name matches
+        # the on-disk path. The cached name is repaired on the next rewrite.
+        if profile.name != name:
+            profile = Profile(name=name, created_at=profile.created_at, tools=profile.tools)
+        return profile
 
     def list(self) -> list[Profile]:
         if not self._profiles_dir().exists():

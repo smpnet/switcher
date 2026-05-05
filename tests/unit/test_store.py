@@ -178,6 +178,37 @@ def test_create_cleans_up_dir_when_metadata_write_fails(
     assert store.get("vanilla").tools == {"claude": True}
 
 
+def test_list_during_partial_rename_uses_dir_name_as_source_of_truth(
+    store: FileProfileStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If metadata is rewritten but the directory move fails, list() must
+    report the directory name (still 'old'), not the metadata's name field
+    (now 'new'). Otherwise concurrent observers and post-crash callers see
+    a profile under a name whose dir doesn't exist — get('new') would
+    raise UnknownProfileError despite list() showing 'new'."""
+    store.create("old", {"claude": True})
+
+    original = Path.replace
+    state = {"calls": 0}
+
+    def fail_dir_move(self: Path, target: Path) -> Path:
+        state["calls"] += 1
+        if state["calls"] == 2:
+            raise OSError("simulated dir move failure")
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_dir_move)
+    with pytest.raises(OSError, match="simulated"):
+        store.rename("old", "new")
+
+    # Crucial: the visible store must still call this profile "old".
+    profiles = store.list()
+    assert [p.name for p in profiles] == ["old"]
+    # And get("old") must return a Profile named "old", not the metadata's
+    # stale "new" — that would let callers ignore a successful retry.
+    assert store.get("old").name == "old"
+
+
 def test_rename_is_recoverable_when_directory_move_fails(
     store: FileProfileStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

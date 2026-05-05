@@ -26,10 +26,11 @@ profile_subdir = "gemini"
 """
 
 
-def test_load_builtins_returns_two_tools() -> None:
-    tools = load_builtin_tools()
-    ids = sorted(t.id for t in tools)
-    assert ids == ["claude", "copilot"]
+def test_load_builtins_includes_claude_and_copilot() -> None:
+    """Subset assertion so adding new builtins later doesn't trip the test
+    on legitimate growth — we only care that the day-one set is loaded."""
+    ids = {t.id for t in load_builtin_tools()}
+    assert {"claude", "copilot"} <= ids
 
 
 def test_load_user_tools_empty_when_no_dir(tmp_path: Path) -> None:
