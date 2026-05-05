@@ -84,6 +84,22 @@ def test_atomic_replace(workdir: Path) -> bool:
     writer_errors: list[str] = []
     t = threading.Thread(target=reader)
     t.start()
+
+    # Wait for the reader to observe the initial 'A' before starting swaps,
+    # so the {A, B} coverage check below isn't sensitive to thread-scheduling
+    # delays at startup. If the reader can't even observe the initial junction
+    # within a generous deadline, something is structurally broken and the
+    # whole atomicity claim is moot -- fail loudly rather than continue into
+    # a 200-iter loop that would just confirm the same thing.
+    deadline = time.monotonic() + 2.0
+    while "A" not in seen and time.monotonic() < deadline:
+        time.sleep(0.001)
+    if "A" not in seen:
+        stop.set()
+        t.join()
+        print("FAIL atomic replace; reader never observed the initial 'A'")
+        return False
+
     try:
         for i in range(200):
             new = workdir / f"link.{i}.tmp"

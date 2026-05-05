@@ -11,6 +11,15 @@ on:
 permissions:
   contents: read
 
+# Cancel an older run for the same branch / PR when a newer push or PR-sync
+# arrives. Without this, push + pull_request both fire on a same-repo PR
+# branch update, doubling the runner spend (especially the self-hosted
+# Windows job). Grouping by `head_ref || ref_name` collapses both event
+# shapes onto one logical key per branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   # The actual step list (setup-pixi, lint, typecheck, test, test-integration,
   # test-e2e, verify-windows, build) lives in .github/actions/run-pixi-ci/
