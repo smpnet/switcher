@@ -94,12 +94,24 @@ class ProfileService:
         if self._store.list():
             raise StateAlreadyInitializedError("switcher is already initialized")
         installed = self.detect_installed()
-        # Pre-flight: refuse if any first dir is already a link.
+        # Pre-flight: every detected live path must be a (real) directory or a
+        # plain non-existent path. Two pathological shapes need to fail BEFORE
+        # the first _store.create() call — otherwise the dated profile gets
+        # persisted, _capture_tool fails mid-loop, and a retry is blocked by
+        # StateAlreadyInitializedError:
+        #   - already a link/junction → AlreadyLinkedError
+        #   - exists but is a regular file → PathNotADirectoryError
+        # The link case is detect_installed-aware (resolver.is_link); the file
+        # case mirrors save()'s pre-flight and move_or_seed_dir's stance.
         for tool in installed:
             for i in range(len(tool.config_dirs)):
                 live = self._resolver.tool_dir(tool, i)
                 if self._resolver.is_link(live):
                     raise AlreadyLinkedError(f"{live} is already a link; refusing to initialize")
+                if live.exists() and not live.is_dir():
+                    raise PathNotADirectoryError(
+                        f"{live} exists but is not a directory; cannot initialize"
+                    )
         current_name = now().strftime("%Y-%m-%d") + "-current"
         self._store.create(current_name, {t.id: True for t in installed})
         for tool in installed:

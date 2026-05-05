@@ -97,6 +97,29 @@ def test_init_refuses_when_already_initialized(service: ProfileService) -> None:
         service.init()
 
 
+def test_init_rejects_non_dir_live_path(
+    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
+) -> None:
+    """A live path that's a regular file (not link, not dir) must fail pre-flight.
+
+    detect_installed includes any path resolver.exists() reports as present —
+    including regular files. Without the is_dir() pre-flight, init() would
+    create the dated profile, then fail mid-_capture_tool when move_or_seed_dir
+    hit the file, leaving switcher partially initialized and a retry blocked
+    by StateAlreadyInitializedError.
+    """
+    claude = tmp_home / ".claude"
+    shutil.rmtree(claude)
+    claude.write_text("not a directory")
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, registry)
+    with pytest.raises(PathNotADirectoryError):
+        service.init()
+    # Pre-flight runs before any _store.create(), so no profiles persisted
+    assert not store.list()
+
+
 def test_init_refuses_when_live_dir_already_linked(
     tmp_home: Path,
     tmp_state: Path,
