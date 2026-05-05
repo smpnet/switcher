@@ -227,22 +227,34 @@ class ProfileService:
             raise
 
     def create(self, name: str) -> None:
+        """Create a new profile, seeding credentials from each tool's active source.
+
+        Unlike init(), no live data is moved — only credential files are
+        copied from existing profile dirs. That makes the rollback safe:
+        on any failure during the seeding loop, rmtree the half-built
+        profile so a retry isn't blocked by ProfileExistsError. Mirrors
+        save()'s rollback discipline.
+        """
         self._require_initialized()
         if self._store.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
         installed = self.detect_installed()
         active = self._store.get_active()
         self._store.create(name, {t.id: True for t in installed})
-        for tool in installed:
-            src_profile = active.get(tool.id)
-            if src_profile is None:
-                # Just ensure layout exists; no source to seed from.
-                for dm in tool.config_dirs:
-                    (self._store.profile_dir(name) / dm.profile_subdir).mkdir(
-                        parents=True, exist_ok=True
-                    )
-                continue
-            self._seed_credentials(src_profile, name, tool)
+        try:
+            for tool in installed:
+                src_profile = active.get(tool.id)
+                if src_profile is None:
+                    # Just ensure layout exists; no source to seed from.
+                    for dm in tool.config_dirs:
+                        (self._store.profile_dir(name) / dm.profile_subdir).mkdir(
+                            parents=True, exist_ok=True
+                        )
+                    continue
+                self._seed_credentials(src_profile, name, tool)
+        except Exception:
+            shutil.rmtree(self._store.profile_dir(name), ignore_errors=True)
+            raise
 
     def which(self, tool_id: str) -> str:
         """Return the active profile name for `tool_id`.
@@ -262,6 +274,19 @@ class ProfileService:
         return active[tool_id]
 
     def rename(self, old: str, new: str) -> None:
+        """Rename a profile, re-pointing affected live links to the new name.
+
+        Pre-flight catches the deterministic failure modes (real directory
+        at a live path, missing tool, target name in use). After pre-flight,
+        the remaining failure surface is transient I/O during swap_link.
+        Such a mid-loop failure leaves the rename half-applied: the profile
+        directory has been renamed, but some tools' live links still point
+        at the now-missing old path. Recovery is non-destructive — re-run
+        ``rename`` (idempotent on store side) or ``use(<new-name>)`` to
+        complete the relinking. True transactional rollback requires a
+        tracked-ops design and is deferred to v0.2.0; the same constraint
+        applies to init() multi-step failures.
+        """
         self._require_initialized()
         if not self._store.profile_dir(old).exists():
             raise UnknownProfileError(f"profile {old!r} not found")

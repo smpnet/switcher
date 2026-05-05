@@ -378,6 +378,33 @@ def test_create_rejects_existing_profile(service: ProfileService) -> None:
         service.create("expt")
 
 
+def test_create_rolls_back_on_seed_failure(
+    service: ProfileService,
+    tmp_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure mid-seed must remove the half-built profile so retry isn't blocked.
+
+    Without rollback, the profile directory would persist after the failure
+    and a retry would hit ProfileExistsError instead of letting the user
+    try again. Mirrors save()'s rollback contract.
+    """
+    service.init()
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated mid-seed failure")
+
+    monkeypatch.setattr("switcher.service.shutil.copy2", boom)
+    # Seed the source profile with a credential so copy2 actually fires
+    store = FileProfileStore(tmp_state)
+    active_name = next(iter(store.get_active().values()))
+    cred_src = store.profile_dir(active_name) / "claude" / ".credentials.json"
+    cred_src.write_text('{"token": "x"}')
+    with pytest.raises(OSError, match="simulated"):
+        service.create("doomed")
+    assert not store.profile_dir("doomed").exists()
+
+
 def test_create_before_init_raises(service: ProfileService) -> None:
     with pytest.raises(StateNotInitializedError):
         service.create("anything")
