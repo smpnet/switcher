@@ -229,6 +229,15 @@ class ProfileService:
     def create(self, name: str) -> None:
         """Create a new profile, seeding credentials from each tool's active source.
 
+        The tool set is taken from the *active* map, not from
+        ``detect_installed()``: create() is a state-store data copy, not a
+        live-config operation. A tool that's currently uninstalled but
+        already managed by switcher (e.g., user temporarily removed it)
+        must still be carried into the new profile so its credentials
+        survive the round-trip. Orphan tool IDs (in active but not in the
+        registry) keep their entry in ``profile.tools`` for consistency
+        but skip the credential-seeding step (no known config_dirs).
+
         Unlike init(), no live data is moved — only credential files are
         copied from existing profile dirs. That makes the rollback safe:
         on any failure during the seeding loop, rmtree the half-built
@@ -238,18 +247,16 @@ class ProfileService:
         self._require_initialized()
         if self._store.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
-        installed = self.detect_installed()
         active = self._store.get_active()
-        self._store.create(name, {t.id: True for t in installed})
+        self._store.create(name, dict.fromkeys(active, True))
         try:
-            for tool in installed:
-                src_profile = active.get(tool.id)
-                if src_profile is None:
-                    # Just ensure layout exists; no source to seed from.
-                    for dm in tool.config_dirs:
-                        (self._store.profile_dir(name) / dm.profile_subdir).mkdir(
-                            parents=True, exist_ok=True
-                        )
+            for tid, src_profile in active.items():
+                tool = find_tool(self._registry, tid)
+                if tool is None:
+                    # Orphan: registry drift since init. Tool entry stays
+                    # in profile.tools so the management surface is
+                    # accurate, but we can't seed credentials (config_dirs
+                    # / credentials list unknown).
                     continue
                 self._seed_credentials(src_profile, name, tool)
         except Exception:

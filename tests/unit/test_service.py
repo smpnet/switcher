@@ -378,6 +378,33 @@ def test_create_rejects_existing_profile(service: ProfileService) -> None:
         service.create("expt")
 
 
+def test_create_includes_uninstalled_active_tools(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A tool in active but not currently installed must still land in the new profile.
+
+    create() is a state-store data copy, not a live-config operation.
+    Tying its tool set to detect_installed() would let a temporarily
+    uninstalled tool's credentials evaporate the next time the user
+    creates a profile. The tool set must come from the active map.
+    """
+    service.init()
+    # Uninstall copilot live (but it's still in active from init)
+    if IS_WINDOWS:
+        shutil.rmtree(tmp_home / "AppData" / "Local" / "github-copilot")
+    else:
+        # Live link → still appears as a link to a now-missing target
+        copilot_link = tmp_home / ".copilot"
+        if copilot_link.is_symlink():
+            copilot_link.unlink()
+        elif copilot_link.exists():
+            shutil.rmtree(copilot_link)
+    service.create("backup")
+    backup = FileProfileStore(tmp_state).get("backup")
+    assert "copilot" in backup.tools
+    assert "claude" in backup.tools
+
+
 def test_create_rolls_back_on_seed_failure(
     service: ProfileService,
     tmp_state: Path,
