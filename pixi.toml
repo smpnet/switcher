@@ -24,8 +24,18 @@ lint = { cmd = "ruff check src tests && ruff format --check src tests" }
 format = "ruff format src tests"
 typecheck = "basedpyright src tests"
 build = "python -m build"
-# Run the §11 verification spikes. Both scripts SKIP on non-Windows, so
-# this task is safe to invoke on any host but is only meaningful on the
-# Windows CI runner.
-verify-windows = { cmd = "python scripts/verify_windows_paths.py && python scripts/verify_junction.py" }
+# Deterministic Windows path verification: parses the shipped builtin TOMLs
+# and confirms every windows_path expands without leaving %VAR% tokens.
+# SKIPs cleanly on non-Windows. Safe as a CI gate -- pure static check, no
+# timing or scheduling sensitivity.
+verify-windows = "python scripts/verify_windows_paths.py"
+
+# Junction atomicity probe -- *not* in `ci` aggregate. The script is
+# explicitly probabilistic ("not a proof") and gating CI on a race-probe
+# would invite scheduler-induced flakes on shared runners. Run manually
+# when investigating Windows swap_link behavior; if the result ever drives
+# a production code change, revisit whether to wire it back in (and how to
+# make the assertion deterministic first).
+verify-junction = "python scripts/verify_junction.py"
+
 ci = { depends-on = ["lint", "typecheck", "test", "test-integration", "test-e2e", "verify-windows", "build"] }

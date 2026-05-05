@@ -11,13 +11,13 @@ on:
 permissions:
   contents: read
 
-# Cancel an older run for the same branch / PR when a newer push or PR-sync
-# arrives. Without this, push + pull_request both fire on a same-repo PR
-# branch update, doubling the runner spend (especially the self-hosted
-# Windows job). Grouping by `head_ref || ref_name` collapses both event
-# shapes onto one logical key per branch.
+# Cancel older in-progress runs for the same logical unit of work when a
+# newer one arrives. Use PR number on pull_request events (fork-unique --
+# two forks with the same branch name don't collide) and the full ref on
+# push events. Same-repo push+PR double-fires aren't deduped; that's the
+# acceptable cost for fork-PR isolation correctness.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
