@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -66,7 +67,11 @@ def test_atomic_replace(workdir: Path) -> bool:
         while not stop.is_set():
             try:
                 seen.add((link / "v").read_text())
-            except FileNotFoundError:
+            except OSError:
+                # Catch any read-window failure, not only FileNotFoundError --
+                # PermissionError or other transient OSErrors during the swap
+                # also indicate the path isn't safely readable through the
+                # replacement, which is what we're trying to detect.
                 misses += 1
             time.sleep(0.0001)
 
@@ -90,10 +95,9 @@ def test_atomic_replace(workdir: Path) -> bool:
 
 
 def main() -> int:
-    workdir = Path("./.junction-spike")
-    if workdir.exists():
-        shutil.rmtree(workdir)
-    workdir.mkdir()
+    # tempfile.mkdtemp instead of a relative path so the spike works regardless
+    # of which CWD pixi run / the CI runner happens to invoke us from.
+    workdir = Path(tempfile.mkdtemp(prefix="junction-spike-"))
     # Each test gets its own subdir so a junction created by one test cannot
     # collide with the destination path of the next.
     try:

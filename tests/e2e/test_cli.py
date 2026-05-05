@@ -39,6 +39,7 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
         text=True,
         env=env,
         check=False,
+        timeout=30,
     )
 
 

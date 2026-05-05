@@ -11,6 +11,12 @@ permissions:
 
 jobs:
   test:
+    # Skip fork-PR runs: the matrix includes a self-hosted Windows runner,
+    # and self-hosted infrastructure must not execute untrusted PR code
+    # (privilege escalation / secret exfiltration via workflow injection).
+    # Same-repo PRs and pushes still run normally; this is a no-op while the
+    # repo is private but is forward-compatible with going public later.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
     strategy:
       fail-fast: false
