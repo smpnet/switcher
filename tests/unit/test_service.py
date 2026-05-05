@@ -10,6 +10,7 @@ import pytest
 
 from switcher.errors import (
     AlreadyLinkedError,
+    PathNotADirectoryError,
     ProfileExistsError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
@@ -185,6 +186,29 @@ def test_use_pre_validates_tools_before_mutating(
     original_target = claude_link.resolve()
     with pytest.raises(UnknownToolError):
         service.use("stale")
+    assert claude_link.resolve() == original_target
+
+
+def test_use_pre_validates_target_subdirs_before_mutating(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A profile missing one tool's profile_subdir must fail before any swap.
+
+    Setup: only seed 'claude' subdir; intentionally omit copilot's subdirs.
+    Sorted target order is ['claude', 'copilot'] — without pre-flight 2,
+    swap_link succeeds for claude (its subdir exists) and then raises on
+    copilot's missing subdir, leaving claude pointed at the partial profile.
+    Pre-flight must reject the whole call without touching any link.
+    """
+    service.init()
+    store = FileProfileStore(tmp_state)
+    store.create("partial", {"claude": True, "copilot": True})
+    (store.profile_dir("partial") / "claude").mkdir()
+    # Intentionally do NOT create copilot-auth / copilot-config subdirs.
+    claude_link = tmp_home / ".claude"
+    original_target = claude_link.resolve()
+    with pytest.raises(PathNotADirectoryError):
+        service.use("partial")
     assert claude_link.resolve() == original_target
 
 
