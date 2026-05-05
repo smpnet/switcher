@@ -361,6 +361,14 @@ class ProfileService:
                 swap_link(target, live)
 
     def delete(self, name: str) -> None:
+        """Delete a profile, refusing if it's active for any tool.
+
+        The active-profile check is the safety net against orphaning live
+        links: deleting a profile that some tool is currently using would
+        leave the live link pointing at a now-missing target. The user
+        must explicitly switch off the profile (via ``use(<other>)``)
+        before deletion is permitted.
+        """
         self._require_initialized()
         if not self._store.profile_dir(name).exists():
             raise UnknownProfileError(f"profile {name!r} not found")
