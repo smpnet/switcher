@@ -22,9 +22,6 @@ switcher = "switcher.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["src/switcher"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/switcher/builtins" = "switcher/builtins"
-
 [tool.ruff]
 line-length = 100
 target-version = "py313"
