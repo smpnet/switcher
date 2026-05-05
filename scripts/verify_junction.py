@@ -105,7 +105,15 @@ def test_atomic_replace(workdir: Path) -> bool:
     finally:
         stop.set()
         t.join()
-    if writer_errors or misses > 0:
+    # Both target values must be observed for the run to mean anything: a
+    # green miss count alongside `seen={"A"}` would prove only that no read
+    # error happened while one value was visible, NOT that the reader
+    # successfully traversed any actual swap. abby round 13 caught this as
+    # a false-positive surface; require {"A", "B"} so a one-sided run fails
+    # loudly instead of masquerading as evidence of atomic behavior.
+    expected_seen = {"A", "B"}
+    incomplete_observation = seen != expected_seen
+    if writer_errors or misses > 0 or incomplete_observation:
         print(
             f"FAIL atomic replace; misses={misses}, "
             f"writer_errors={len(writer_errors)}, seen={seen}"
@@ -116,6 +124,14 @@ def test_atomic_replace(workdir: Path) -> bool:
             print(
                 "  reader: atomicity hedge confirmed needed -- "
                 "switch to delete-then-create fallback"
+            )
+        if incomplete_observation:
+            missing = expected_seen - seen
+            print(
+                f"  reader: only observed {sorted(seen)!r}; expected to see "
+                f"both 'A' and 'B' across the swap window (missing: "
+                f"{sorted(missing)!r}). Run did not actually exercise the "
+                f"swap -- treat the result as inconclusive."
             )
         return False
     print(f"PASS atomic replace; misses=0, seen={seen}")

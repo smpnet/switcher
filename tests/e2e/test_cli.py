@@ -51,6 +51,12 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
         env=env,
         check=False,
         timeout=30,
+        # Pin CWD to the per-test home so the subprocess boot path is
+        # independent of whatever directory pytest happens to be invoked
+        # from. switcher itself doesn't read CWD-relative paths today, but
+        # asserting hermeticity at the helper saves us from later debugging
+        # an "only fails in CI" mystery.
+        cwd=str(home),
     )
 
 
