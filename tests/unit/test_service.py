@@ -236,3 +236,24 @@ def test_save_rejects_existing_profile(service: ProfileService) -> None:
 def test_save_before_init_raises(service: ProfileService) -> None:
     with pytest.raises(StateNotInitializedError):
         service.save("any")
+
+
+def test_save_rejects_non_dir_live_path(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """If a live config 'dir' is actually a file, save() must fail loudly.
+
+    detect_installed only filters by exists(), so a regular file at the live
+    path slips through. Without pre-flight, copytree is silently skipped and
+    the snapshot records an empty dir — a profile that looks valid until the
+    user tries to use it. Pre-flight matches move_or_seed_dir's stance.
+    """
+    service.init()
+    # Replace the live ~/.claude link with a regular file
+    claude = tmp_home / ".claude"
+    claude.unlink()
+    claude.write_text("not a directory")
+    with pytest.raises(PathNotADirectoryError):
+        service.save("snap")
+    # Pre-flight runs before _store.create(), so the profile must not exist
+    assert not FileProfileStore(tmp_state).profile_dir("snap").exists()

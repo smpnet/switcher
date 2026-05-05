@@ -168,6 +168,21 @@ class ProfileService:
         if self._store.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
         installed = self.detect_installed()
+        # Pre-flight: every existing live path must be a directory. Without
+        # this, a regular file at a live config path slips through — copytree
+        # is skipped and the snapshot records an empty dir, hiding corruption
+        # behind a profile that looks valid. Matches move_or_seed_dir's stance
+        # in init(): fail loudly rather than silently produce bogus state.
+        for tool in installed:
+            for i in range(len(tool.config_dirs)):
+                live = self._resolver.tool_dir(tool, i)
+                if not live.exists():
+                    continue
+                src = live.resolve() if live.is_symlink() else live
+                if not src.is_dir():
+                    raise PathNotADirectoryError(
+                        f"{live} exists but is not a directory; cannot snapshot"
+                    )
         self._store.create(name, {t.id: True for t in installed})
         for tool in installed:
             for i, dm in enumerate(tool.config_dirs):
@@ -179,5 +194,4 @@ class ProfileService:
                 # Resolve through the symlink so we copy the actual data
                 # under the active profile, not the link itself.
                 src = live.resolve() if live.is_symlink() else live
-                if src.is_dir():
-                    shutil.copytree(src, target, dirs_exist_ok=True)
+                shutil.copytree(src, target, dirs_exist_ok=True)
