@@ -188,6 +188,12 @@ per-OS table further down) and re-run `switcher init`.
 >    tool, look at the profile name from step 1's `switcher status` output
 >    and restore from `profiles/<that-profile>/<config_subdir>/`. The
 >    link-removal step is OS-specific:
+>
+>    > **One `<active-profile>` per tool, not one for the whole step.**
+>    > If `switcher status` showed `claude → vanilla` and `copilot →
+>    > experiment`, restore Claude from `profiles/vanilla/claude/` and
+>    > Copilot from `profiles/experiment/copilot/`. Substituting the same
+>    > value for both is the most likely way to lose work.
 >    ```bash
 >    # macOS / Linux — symlinks: use `rm` (NOT rmdir).
 >    # Substitute <active-profile> per `switcher status` output for this tool.
@@ -296,6 +302,32 @@ credential_files = ["oauth_creds.json"]   # auto-expands
 posix_path = "~/.gemini"
 windows_path = "%USERPROFILE%\\.gemini"
 profile_subdir = "gemini"
+```
+
+A worked multi-dir example (illustrative — not a real tool). Suppose
+some hypothetical CLI keeps shell config in `~/.foocli/` but stashes
+its OAuth token in `~/.config/foocli/auth.json`. The shorthand
+wouldn't fit (the credential isn't in the first registered dir), so
+write the `[[credentials]]` block explicitly and set `config_dir` to
+the matching `profile_subdir`:
+
+```toml
+id = "foocli"
+name = "Foo CLI"
+
+[[config_dirs]]
+posix_path = "~/.foocli"
+windows_path = "%USERPROFILE%\\.foocli"
+profile_subdir = "foocli"
+
+[[config_dirs]]
+posix_path = "~/.config/foocli"
+windows_path = "%APPDATA%\\foocli"
+profile_subdir = "foocli-xdg"
+
+[[credentials]]
+config_dir = "foocli-xdg"        # matches the second config_dirs entry
+path = "auth.json"
 ```
 
 ## Development
