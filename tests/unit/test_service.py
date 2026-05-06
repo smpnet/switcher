@@ -390,14 +390,30 @@ def test_create_includes_uninstalled_active_tools(
     creates a profile. The tool set must come from the active map.
     """
     service.init()
-    # Uninstall copilot live (but it's still in active from init).
-    # After init, the live path is a junction (Windows) or symlink (POSIX) into
-    # the captured profile. shutil.rmtree refuses both shapes -- it raises
-    # "Cannot call rmtree on a symbolic link" because os.path.islink returns
-    # True for both classic symlinks and (per Python 3.13's ntpath) Windows
-    # junctions. Use the link-aware removal path on each platform.
+    # Determine copilot's live path per platform. After init, the path is a
+    # junction (Windows) or symlink (POSIX) into the captured profile.
+    # shutil.rmtree refuses both shapes -- it raises "Cannot call rmtree on
+    # a symbolic link" because os.path.islink returns True for both classic
+    # symlinks and (per Python 3.13's ntpath) Windows junctions. Use the
+    # link-aware removal path on each platform.
     if IS_WINDOWS:
         copilot_live = tmp_home / "AppData" / "Local" / "github-copilot"
+    else:
+        copilot_live = tmp_home / ".copilot"
+
+    # Pre-assert: the simulated "uninstall" must actually have something to
+    # remove, otherwise the test stops proving the "uninstalled active tool"
+    # behavior its name claims. If init's capture ever broke or the runner's
+    # path layout drifted, this surfaces immediately rather than the test
+    # silently no-op'ing through both branches below.
+    is_link = copilot_live.is_symlink() or (IS_WINDOWS and os.path.isjunction(copilot_live))
+    assert is_link or copilot_live.exists(), (
+        f"setup precondition: copilot's live path {copilot_live} should exist "
+        f"as a link/junction or directory after service.init() captured it"
+    )
+
+    # Uninstall copilot live (but it's still in active from init).
+    if IS_WINDOWS:
         # Junction: rmdir works (RemoveDirectory handles the reparse point);
         # DeleteFile (Path.unlink) and shutil.rmtree do not.
         if os.path.isjunction(copilot_live):
@@ -406,11 +422,25 @@ def test_create_includes_uninstalled_active_tools(
             shutil.rmtree(copilot_live)
     else:
         # Live link → still appears as a link to a now-missing target
-        copilot_link = tmp_home / ".copilot"
-        if copilot_link.is_symlink():
-            copilot_link.unlink()
-        elif copilot_link.exists():
-            shutil.rmtree(copilot_link)
+        if copilot_live.is_symlink():
+            copilot_live.unlink()
+        elif copilot_live.exists():
+            shutil.rmtree(copilot_live)
+
+    # Post-assert: confirm the removal actually changed filesystem state.
+    # Pairs with the pre-assert above to keep this test honest -- without
+    # both, a future regression where neither branch fired (e.g.,
+    # is_junction misclassification) would silently pass.
+    still_present = (
+        copilot_live.is_symlink()
+        or (IS_WINDOWS and os.path.isjunction(copilot_live))
+        or copilot_live.exists()
+    )
+    assert not still_present, (
+        f"copilot's live path {copilot_live} should be gone after the "
+        f"simulated uninstall, but it still exists in some form"
+    )
+
     service.create("backup")
     backup = FileProfileStore(tmp_state).get("backup")
     assert "copilot" in backup.tools
