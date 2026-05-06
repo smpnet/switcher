@@ -145,40 +145,17 @@ def swap_link(target: Path, link_path: Path) -> None:
 
 
 def _swap_link_windows(target: Path, link_path: Path) -> None:
-    """Windows-specific link replacement: rmdir + CreateJunction.
+    """Windows-specific link replacement: defensive remove + CreateJunction.
 
-    Belt-and-suspenders compared to the original implementation:
-
-    - Removes link_path defensively regardless of what `is_link` checks
-      reported. `os.path.isjunction` on hosted Windows runners has been
-      observed misclassifying broken junctions (target renamed away),
-      which would have left the old junction in place when the swap loop
-      relied on `is_link` alone to gate removal.
-    - Tries multiple removal strategies (rmdir for junctions/empty dirs,
-      unlink for symlinks/files) before falling through. Failure of any
-      single strategy doesn't abort the swap.
-    - After CreateJunction, verifies the new junction's target string
-      matches expectations. Catches the case where CreateJunction
-      "succeeded" but didn't actually update the reparse point because
-      the destination still had the old junction.
+    Tries multiple removal strategies before re-creating the junction:
+    rmdir handles junctions and empty dirs, unlink handles symlinks and
+    files, rmtree is the heavy-hammer fallback. Each strategy short-
+    circuits on FileNotFoundError (already gone) or success; any other
+    OSError advances to the next strategy. Defensive ordering exists
+    because os.path.isjunction is unreliable on some Windows hosts for
+    broken junctions, so we don't trust the upstream `is_link` check
+    to have correctly gated removal.
     """
-    debug = os.environ.get("SWITCHER_DEBUG_LINKS")
-
-    def _log(msg: str) -> None:
-        if debug:
-            print(f"[swap_link_windows] {msg}", file=sys.stderr)
-
-    _log(f"swap target={target} link_path={link_path}")
-    _log(
-        f"  pre: exists={link_path.exists()} "
-        f"is_symlink={link_path.is_symlink()} "
-        f"isjunction={os.path.isjunction(link_path)}"
-    )
-
-    # Defensive removal: try every strategy until one works or all fail.
-    # Pre-flight already rejected real (non-link) dirs upstream, so any
-    # remaining state at link_path is acceptable to remove.
-    removed = False
     for strategy in ("rmdir", "unlink", "rmtree"):
         try:
             if strategy == "rmdir":
@@ -187,32 +164,12 @@ def _swap_link_windows(target: Path, link_path: Path) -> None:
                 link_path.unlink()
             else:
                 shutil.rmtree(link_path, ignore_errors=True)
-            removed = True
-            _log(f"  removed via {strategy}")
             break
         except FileNotFoundError:
-            removed = True
-            _log(f"  nothing to remove ({strategy} -> FileNotFoundError)")
             break
-        except OSError as e:
-            _log(f"  {strategy} failed: {e!r}")
+        except OSError:
             continue
-
-    if not removed:
-        _log("  WARNING: all removal strategies failed; CreateJunction likely to fail")
-
-    _log(f"  post-remove: exists={link_path.exists()} isjunction={os.path.isjunction(link_path)}")
-
     link_dir(target, link_path)
-
-    if debug:
-        # Read back the junction's target via lstat; verifies CreateJunction
-        # actually updated the reparse point.
-        try:
-            actual_target = link_path.readlink()
-            _log(f"  post-create: junction target = {actual_target}")
-        except OSError as e:
-            _log(f"  post-create: readlink failed: {e!r}")
 
 
 def move_or_seed_dir(live: Path, profile_target: Path) -> None:
