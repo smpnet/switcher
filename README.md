@@ -4,8 +4,10 @@ Switch between AI-agent configuration profiles in one command.
 
 `switcher` re-points each managed tool's live config directory at a profile
 directory under a state store, so you can move between, say, a "full setup"
-with plugins and hooks and a "vanilla" clean slate — credential files are
-shared across profiles, so you don't re-authenticate when switching.
+with plugins and hooks and a "vanilla" clean slate. Credential files are
+copied into each new profile at create-time (seeded from whichever profile
+is active), so day-to-day switching doesn't re-prompt for auth — every
+profile starts life carrying the same credential snapshot.
 
 Each per-directory swap is atomic (a `replace`-style symlink rename on POSIX,
 a junction recreate on Windows — the platform-specific atomicity scope is
@@ -169,6 +171,10 @@ per-OS table further down) and re-run `switcher init`.
 >    # macOS example — adjust the source path per the per-OS table below
 >    cp -R "$HOME/Library/Application Support/switcher" ~/switcher-state-backup
 >    ```
+>    Find the actual `<dated>-current` directory name (referenced
+>    throughout the steps below) by running `switcher status` before
+>    wiping, or by `ls "$HOME/Library/Application Support/switcher/profiles"`
+>    — it'll be something like `2026-05-06-current`.
 > 2. **Restore the active tool configs to their live paths first.** After
 >    `init`, each managed tool's live config dir is a symlink/junction
 >    pointing into `<state_dir>`. If you delete `<state_dir>` while those
@@ -200,23 +206,25 @@ per-OS table further down) and re-run `switcher init`.
 >    `switcher use <name>` them — the fresh `init` resets the active map
 >    to the new dated-current; prior active state is not preserved.
 >
->    **Note on credentials in restored profiles.** "Shared across
->    profiles" means each profile is *seeded* with credentials at
->    `create`/`init` time, not that credentials live in one shared
->    location at runtime. A restored profile carries the credentials it
->    was created with — which may be stale if tokens have rotated
->    since the backup. If `switcher use <restored>` followed by the
->    tool's first action triggers a re-auth prompt, that's expected;
->    completing the auth updates the live config dir, which IS the
->    restored profile while it's active, so the new credentials persist
->    in that profile.
+>    **Note on credentials in restored profiles.** Per the seed-not-share
+>    credential model described in "How it works," a restored profile
+>    carries the credentials it was created with — which may be stale
+>    if tokens have rotated since the backup. If `switcher use <restored>`
+>    followed by the tool's first action triggers a re-auth prompt,
+>    that's expected; completing the auth updates the live config dir,
+>    which IS the restored profile while it's active, so the new
+>    credentials persist in that profile.
 
 Profile contents (what `save`/`create`/`use` move around): each profile is
 a directory of full per-tool config trees. Credential files (declared in
-each tool's `[[credentials]]` block) are *shared across profiles* — `create`
-seeds them from the active profile, and `init` carries them into `vanilla`
-— so switching profiles never re-prompts for auth. Everything else (plugins,
-hooks, settings, history) is profile-specific.
+each tool's `[[credentials]]` block) are *seeded across profiles*, not
+shared at runtime — `create` copies them in from whichever profile is
+currently active, and `init` carries them into `vanilla`. After seeding,
+each profile owns its own credential files; if you re-auth while a profile
+is active, that profile's copy is updated, but other profiles' copies
+remain untouched. The seeding model is what gives the "switch without
+re-auth" guarantee day-to-day. Everything else (plugins, hooks, settings,
+history) is profile-specific from the start.
 
 The state directory is chosen by `platformdirs.user_data_dir("switcher")`:
 
