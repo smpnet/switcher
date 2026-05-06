@@ -73,6 +73,12 @@ the same ref, run `pipx upgrade switcher` — but note that pinned tags
 (`@v0.1.0`) won't move past the tag. To switch to a different tag, reinstall
 with the new ref (`pipx install --force git+ssh://...@v0.2.0`).
 
+While the repo is private, both upgrade and reinstall still need the same
+GitHub auth that worked at install time (SSH key in your agent, or
+`gh auth status` showing a valid login). If `pipx upgrade switcher` fails
+with a `git clone`-style auth error, that's a GitHub auth problem, not a
+`switcher` bug — refresh the SSH agent or re-run `gh auth login`.
+
 ## Usage
 
 ```bash
