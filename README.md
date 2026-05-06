@@ -14,8 +14,10 @@ pre-flight validation runs before any mutation, but `init` and `rename` have
 narrow documented failure windows where a partial state may need manual
 reconciliation. Day-to-day `use` and `save` are the well-trodden paths.
 
-**Day-one tools:** Claude Code, GitHub Copilot CLI. Additional tools are
-user-extensible via TOML files (see "Adding a tool").
+**Day-one tools:** Claude Code and GitHub Copilot CLI ship as built-in
+registry entries (in `src/switcher/builtins/`). Additional tools are
+user-extensible via TOML files dropped into `<state_dir>/registry.d/`
+(see "Adding a tool").
 
 **Supported OSes:** macOS, Linux, Windows.
 
@@ -141,23 +143,39 @@ In both cases, a tool installed *after* `init` is not retroactively picked
 up. The recovery path today is to delete the state directory (see the
 per-OS table further down) and re-run `switcher init`.
 
-> **Destructive recovery — last resort.** Deleting `<state_dir>` removes
-> *all* saved profiles, not just the dated-current snapshot. Always back
-> up first if you've built up profiles you care about:
+> **Destructive recovery — last resort.** This procedure has multiple
+> failure modes. Read it through before running any of the steps. A
+> non-destructive `rescan` command on the v0.2.0 roadmap will replace
+> this dance.
 >
-> ```bash
-> # macOS example — adjust the source path per the per-OS table below
-> cp -R "$HOME/Library/Application Support/switcher/profiles" ~/switcher-profiles-backup
-> ```
->
-> After re-running `switcher init` against a fresh state dir, you can copy
-> profile directories back from the backup into the new
-> `<state_dir>/profiles/` and they will reappear in `switcher list`.
-> Restored profiles are inert until you `switcher use <name>` them — the
-> fresh `init` resets the active map to point only at the new dated-current
-> snapshot, so prior active-state from the backup is not preserved. A
-> non-destructive "rescan" command is on the v0.2.0 roadmap so this whole
-> dance won't be needed.
+> 1. **Back up profiles.** Deleting `<state_dir>` removes *all* saved
+>    profiles, not just the dated-current snapshot. Including the captured
+>    tool configs (the dated-current dir is where your real Claude/Copilot
+>    config lives after `init`). Copy `<state_dir>/profiles/` somewhere
+>    safe first:
+>    ```bash
+>    # macOS example — adjust the source path per the per-OS table below
+>    cp -R "$HOME/Library/Application Support/switcher/profiles" ~/switcher-profiles-backup
+>    ```
+> 2. **Restore the active tool configs to their live paths first.** After
+>    `init`, each managed tool's live config dir is a symlink/junction
+>    pointing into `<state_dir>`. If you delete `<state_dir>` while those
+>    links exist, they dangle — and `switcher init` will then refuse to
+>    run with `AlreadyLinkedError`. Before wiping, copy each captured
+>    tool's config back to its live path. For example on macOS:
+>    ```bash
+>    # remove the link, restore the real dir from the backup
+>    rm ~/.claude
+>    cp -R ~/switcher-profiles-backup/<dated>-current/claude ~/.claude
+>    ```
+> 3. **Wipe `<state_dir>` and re-run `switcher init`.** With real config
+>    dirs at the live paths, init captures every installed tool fresh.
+> 4. **(Optional) Restore additional named profiles.** Copy non-current
+>    profile directories from your backup into the new
+>    `<state_dir>/profiles/`. They will reappear in `switcher list` but are
+>    inert until you `switcher use <name>` them — the fresh `init` resets
+>    the active map to the new dated-current; prior active state is not
+>    preserved.
 
 Profile contents (what `save`/`create`/`use` move around): each profile is
 a directory of full per-tool config trees. Credential files (declared in
