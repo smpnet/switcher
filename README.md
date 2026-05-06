@@ -175,8 +175,10 @@ Override with `SWITCHER_STATE_DIR=<path>`.
 
 ## Adding a tool
 
-Drop a TOML in `<state_dir>/registry.d/` matching the schema. Generate a stub
-with `switcher tools scaffold <id>`:
+Beyond listing what's registered, `switcher tools` also has a `scaffold`
+subcommand for generating new registry entries. To add a tool, drop a TOML
+in `<state_dir>/registry.d/` matching the schema — generate a stub with
+`switcher tools scaffold <id>`:
 
 ```bash
 switcher tools scaffold gemini
