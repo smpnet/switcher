@@ -14,23 +14,42 @@ user-extensible via TOML files (see "Adding a tool").
 
 ## Install
 
-The repo is private during the v0.1.0 scaffolding phase, so installing requires
-an authenticated GitHub remote (SSH key or personal access token). Pick whichever
-matches how you already authenticate to GitHub:
+The repo is private during the v0.1.0 scaffolding phase, so `pipx` needs an
+authenticated path to GitHub. Two safe options — pick whichever matches how
+you already authenticate. **Don't embed a personal access token directly in
+the URL** (it ends up in shell history and process listings).
+
+### macOS / Linux
 
 ```bash
-# SSH (recommended if you already use SSH for GitHub)
+# Option A: SSH (recommended if you already use SSH for GitHub)
 pipx install git+ssh://git@github.com/smpnet74/switcher.git@v0.1.0
 
-# HTTPS with a personal access token (PAT must have repo:read on this repo)
-pipx install git+https://<token>@github.com/smpnet74/switcher.git@v0.1.0
+# Option B: HTTPS via the gh credential helper (no token in argv)
+gh auth login                            # one-time
+gh auth setup-git                        # registers gh as git's credential helper
+pipx install git+https://github.com/smpnet74/switcher.git@v0.1.0
 
-# Latest main (substitute for the @v0.1.0 ref above)
-pipx install git+ssh://git@github.com/smpnet74/switcher.git
+# Latest main: substitute the @v0.1.0 ref
 ```
 
-`switcher` lands on PATH globally. Works the same on macOS, Linux, and Windows
-(pipx ships per-OS bin dirs).
+### Windows
+
+The same two options work on Windows, but you need a working git auth setup
+first. Pick the one matching your existing setup:
+
+- **SSH:** install [Git for Windows](https://git-scm.com/download/win) (ships
+  OpenSSH), generate a key, add it to your GitHub account, and ensure
+  `ssh-agent` is running. Then use the SSH `pipx install` line above from
+  PowerShell or Git Bash.
+- **HTTPS via gh:** install [GitHub CLI](https://cli.github.com/), run
+  `gh auth login` then `gh auth setup-git`, then use the HTTPS `pipx install`
+  line above.
+
+`pipx` itself works the same across macOS, Linux, and Windows (it ships
+per-OS bin dirs). The Windows code paths (junctions, `%LOCALAPPDATA%`,
+`%USERPROFILE%` env-var expansion) are exercised by the test suite on every
+push via the GitHub Actions Windows matrix.
 
 ## Usage
 
@@ -63,7 +82,8 @@ switcher which claude
 # Rename (auto-relinks if active)
 switcher rename experiment client-A
 
-# Delete (refuses if profile is active; --force skips confirmation)
+# Delete a profile. Active profiles are always refused (use `switcher use
+# <other>` first); --force only suppresses the interactive y/N prompt.
 switcher delete old-profile
 switcher delete old-profile --force
 
