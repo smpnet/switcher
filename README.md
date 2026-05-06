@@ -2,10 +2,17 @@
 
 Switch between AI-agent configuration profiles in one command.
 
-`switcher` atomically re-points each managed tool's live config directory at a
-profile directory under a state store, so you can move between, say, a "full
-setup" with plugins and hooks and a "vanilla" clean slate — without losing
-credentials and without re-authenticating.
+`switcher` re-points each managed tool's live config directory at a profile
+directory under a state store, so you can move between, say, a "full setup"
+with plugins and hooks and a "vanilla" clean slate — credential files are
+shared across profiles, so you don't re-authenticate when switching.
+
+Each per-directory swap is atomic (a `replace`-style symlink rename on POSIX,
+a junction recreate on Windows — the platform-specific atomicity scope is
+covered in the design doc). Multi-dir / multi-tool sequencing is best-effort;
+pre-flight validation runs before any mutation, but `init` and `rename` have
+narrow documented failure windows where a partial state may need manual
+reconciliation. Day-to-day `use` and `save` are the well-trodden paths.
 
 **Day-one tools:** Claude Code, GitHub Copilot CLI. Additional tools are
 user-extensible via TOML files (see "Adding a tool").
@@ -13,6 +20,9 @@ user-extensible via TOML files (see "Adding a tool").
 **Supported OSes:** macOS, Linux, Windows.
 
 ## Install
+
+**Prerequisites:** `pipx` and `git`. The HTTPS install option also needs
+[`gh`](https://cli.github.com/) for the credential helper.
 
 The repo is private during the v0.1.0 scaffolding phase, so `pipx` needs an
 authenticated path to GitHub. Two safe options — pick whichever matches how
@@ -48,8 +58,8 @@ first. Pick the one matching your existing setup:
 
 `pipx` itself works the same across macOS, Linux, and Windows (it ships
 per-OS bin dirs). The Windows code paths (junctions, `%LOCALAPPDATA%`,
-`%USERPROFILE%` env-var expansion) are exercised by the test suite on every
-push via the GitHub Actions Windows matrix.
+`%USERPROFILE%` env-var expansion) are covered by the test suite, which
+runs on a Windows runner in CI (see `.github/workflows/ci.yml`).
 
 ## Usage
 
@@ -98,13 +108,15 @@ switcher version
 
 `switcher init` performs a one-time setup:
 
-1. Detects which AI tools are installed (by checking their first config dir).
+1. Detects which managed tools are installed by looking for an existing
+   configuration directory each tool registers.
 2. Moves each tool's live config dirs into `<state_dir>/profiles/<dated>-current/`.
 3. Creates symlinks (or junctions on Windows) from the original paths back into the profile.
 4. Creates a `vanilla` profile containing only credential files — no plugins, hooks, or extensions.
 5. Records `<dated>-current` as active for every detected tool.
 
-After that, `switcher use <name>` is a single atomic symlink swap per managed dir.
+After that, `switcher use <name>` re-links each managed dir to the new
+profile — one atomic per-directory swap each.
 
 The state directory is chosen by `platformdirs.user_data_dir("switcher")`:
 
@@ -140,9 +152,14 @@ profile_subdir = "gemini"
 env_override = "GEMINI_HOME"   # optional
 
 [[credentials]]
-config_dir = "gemini"
+config_dir = "gemini"            # references a config_dirs[].profile_subdir
 path = "oauth_creds.json"
 ```
+
+`credentials[].config_dir` is *not* the tool `id` and not a filesystem path —
+it must equal the `profile_subdir` of one of the `config_dirs` entries. That
+identifies which managed dir the credential file lives in; `path` is then
+relative to that dir.
 
 For single-dir tools, the shorthand also works:
 
