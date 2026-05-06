@@ -21,8 +21,9 @@ user-extensible via TOML files (see "Adding a tool").
 
 ## Install
 
-**Prerequisites:** `pipx` and `git`. The HTTPS install option also needs
-[`gh`](https://cli.github.com/) for the credential helper.
+**Prerequisites:** Python 3.13 or newer, `pipx`, and `git`. The HTTPS
+install option also needs [`gh`](https://cli.github.com/) for the
+credential helper.
 
 The repo is private during the v0.1.0 scaffolding phase, so `pipx` needs an
 authenticated path to GitHub. Two safe options — pick whichever matches how
@@ -140,11 +141,20 @@ In both cases, a tool installed *after* `init` is not retroactively picked
 up. The recovery path today is to delete the state directory (see the
 per-OS table further down) and re-run `switcher init`.
 
-> **Destructive recovery.** Deleting `<state_dir>` removes all saved
-> profiles, not just the dated-current snapshot. If you've already built
-> up profiles you care about, copy `<state_dir>/profiles/` somewhere safe
-> before wiping. A non-destructive "rescan" command is on the v0.2.0
-> roadmap.
+> **Destructive recovery — last resort.** Deleting `<state_dir>` removes
+> *all* saved profiles, not just the dated-current snapshot. Always back
+> up first if you've built up profiles you care about:
+>
+> ```bash
+> # macOS example — adjust the source path per the per-OS table below
+> cp -R "$HOME/Library/Application Support/switcher/profiles" ~/switcher-profiles-backup
+> ```
+>
+> After re-running `switcher init` against a fresh state dir, you can copy
+> profile directories back from the backup into the new
+> `<state_dir>/profiles/` and they will reappear in `switcher list`. A
+> non-destructive "rescan" command is on the v0.2.0 roadmap so this whole
+> dance won't be needed.
 
 Profile contents (what `save`/`create`/`use` move around): each profile is
 a directory of full per-tool config trees. Credential files (declared in
