@@ -43,12 +43,12 @@ the URL** (it ends up in shell history and process listings).
 
 ```bash
 # Option A: SSH (recommended if you already use SSH for GitHub)
-pipx install git+ssh://git@github.com/smpnet74/switcher.git@v0.1.0
+pipx install git+ssh://git@github.com/smpnet/switcher.git@v0.1.0
 
 # Option B: HTTPS via the gh credential helper (no token in argv)
 gh auth login                            # one-time
 gh auth setup-git                        # registers gh as git's credential helper
-pipx install git+https://github.com/smpnet74/switcher.git@v0.1.0
+pipx install git+https://github.com/smpnet/switcher.git@v0.1.0
 
 # For a different version: replace @v0.1.0 with the desired tag
 # (or omit the @<ref> entirely to install the latest main).
