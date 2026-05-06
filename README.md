@@ -137,9 +137,14 @@ at the moment you run it, and then refuses to run again
   are simply not in the active map.
 
 In both cases, a tool installed *after* `init` is not retroactively picked
-up. The recovery path today is: delete the `<state_dir>` shown in the table
-above, then re-run `switcher init`. A safer "rescan" command is on the
-v0.2.0 roadmap.
+up. The recovery path today is to delete the state directory (see the
+per-OS table further down) and re-run `switcher init`.
+
+> **Destructive recovery.** Deleting `<state_dir>` removes all saved
+> profiles, not just the dated-current snapshot. If you've already built
+> up profiles you care about, copy `<state_dir>/profiles/` somewhere safe
+> before wiping. A non-destructive "rescan" command is on the v0.2.0
+> roadmap.
 
 Profile contents (what `save`/`create`/`use` move around): each profile is
 a directory of full per-tool config trees. Credential files (declared in
