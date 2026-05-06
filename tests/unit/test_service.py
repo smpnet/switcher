@@ -553,6 +553,14 @@ def test_rename_remains_recoverable_when_swap_link_fails(
     ``rename(old, new)`` would raise UnknownProfileError, leaving the user
     with no programmatic recovery.
     """
+    # Enable swap_link's Windows debug logging for this specific test so that
+    # if the defensive removal in _swap_link_windows fails to clear the broken
+    # junction (the failure mode that motivated the defensive rewrite), CI logs
+    # show exactly which removal strategy the runner accepted and what the
+    # post-create junction target was. No effect on POSIX (the env var is
+    # only consulted in the Windows code path); no effect on assertions either
+    # since debug output goes to stderr.
+    monkeypatch.setenv("SWITCHER_DEBUG_LINKS", "1")
     name = service.init()
 
     call_count = {"n": 0}
