@@ -193,6 +193,13 @@ per-OS table further down) and re-run `switcher init`.
 >    # macOS example — adjust the source path per the per-OS table below
 >    cp -R "$HOME/Library/Application Support/switcher" ~/switcher-state-backup
 >    ```
+>    > **🔒 The backup contains credentials.** Per the seed-not-share
+>    > model, every profile in `<state_dir>/profiles/` carries its own
+>    > copy of every tool's credential files (OAuth tokens, API keys,
+>    > etc.). Treat `~/switcher-state-backup` as secret material:
+>    > restrict permissions, do not commit it, and delete it once
+>    > recovery is complete. On POSIX: `chmod -R go-rwx
+>    > ~/switcher-state-backup` after copying.
 > 2. **Restore each tool's active-profile config to its live path before
 >    wiping.** After `init`/`use`, each managed tool's live config dir is
 >    a symlink/junction pointing into `<state_dir>`. If you delete
@@ -268,6 +275,16 @@ Beyond listing what's registered, `switcher tools` also has a `scaffold`
 subcommand for generating new registry entries. To add a tool, drop a TOML
 in `<state_dir>/registry.d/` matching the schema — generate a stub with
 `switcher tools scaffold <id>`:
+
+> **Same `init`-is-one-shot caveat applies.** Registering a new tool TOML
+> after `init` makes it visible to `switcher tools` and `switcher list`,
+> but it is NOT automatically captured into existing profiles or
+> the active map. To bring a newly registered tool under management in
+> v0.1.0, you have to use the destructive recovery procedure (back up
+> state, restore live configs, wipe state, re-init) so that `init` sees
+> the new tool's live config dir at run time. The forthcoming `rescan`
+> command (v0.2.0 roadmap) will replace both this case and the
+> "tool installed after init" case with a non-destructive flow.
 
 ```bash
 switcher tools scaffold gemini
