@@ -389,9 +389,20 @@ def test_create_includes_uninstalled_active_tools(
     creates a profile. The tool set must come from the active map.
     """
     service.init()
-    # Uninstall copilot live (but it's still in active from init)
+    # Uninstall copilot live (but it's still in active from init).
+    # After init, the live path is a junction (Windows) or symlink (POSIX) into
+    # the captured profile. shutil.rmtree refuses both shapes -- it raises
+    # "Cannot call rmtree on a symbolic link" because os.path.islink returns
+    # True for both classic symlinks and (per Python 3.13's ntpath) Windows
+    # junctions. Use the link-aware removal path on each platform.
     if IS_WINDOWS:
-        shutil.rmtree(tmp_home / "AppData" / "Local" / "github-copilot")
+        copilot_live = tmp_home / "AppData" / "Local" / "github-copilot"
+        # Junction: rmdir works (RemoveDirectory handles the reparse point);
+        # DeleteFile (Path.unlink) and shutil.rmtree do not.
+        if os.path.isjunction(copilot_live):
+            copilot_live.rmdir()
+        elif copilot_live.exists():
+            shutil.rmtree(copilot_live)
     else:
         # Live link → still appears as a link to a now-missing target
         copilot_link = tmp_home / ".copilot"

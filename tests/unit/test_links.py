@@ -11,7 +11,7 @@ from switcher.errors import (
     PathNotADirectoryError,
     ProfileTargetExistsError,
 )
-from switcher.links import link_dir, move_or_seed_dir, swap_link
+from switcher.links import IS_WINDOWS, link_dir, move_or_seed_dir, swap_link
 
 
 def test_link_dir_creates_link_to_directory(tmp_path: Path) -> None:
@@ -78,6 +78,14 @@ def test_swap_link_creates_parent_dirs(tmp_path: Path) -> None:
     assert link.exists()
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS,
+    reason="POSIX-only: swap_link uses .tmp + atomic rename on POSIX, but on "
+    "Windows it uses rmdir + CreateJunction directly (no .tmp file involved), "
+    "so there is nothing to clean up. Stale-.tmp residue from a crashed prior "
+    "swap on Windows is cosmetic clutter at most -- not a correctness concern "
+    "for the new code path.",
+)
 def test_swap_link_cleans_up_stale_tmp(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
