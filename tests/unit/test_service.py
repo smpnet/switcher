@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -542,7 +543,6 @@ def test_rename_remains_recoverable_when_swap_link_fails(
     service: ProfileService,
     tmp_home: Path,
     tmp_state: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If swap_link fails mid-rename, the active map MUST already say `new`
     so that ``use(<new>)`` is a clean idempotent recovery path.
@@ -553,16 +553,6 @@ def test_rename_remains_recoverable_when_swap_link_fails(
     ``rename(old, new)`` would raise UnknownProfileError, leaving the user
     with no programmatic recovery.
     """
-    # Enable swap_link's Windows debug logging for this specific test so that
-    # if the defensive removal in _swap_link_windows fails to clear the broken
-    # junction (the failure mode that motivated the defensive rewrite), CI logs
-    # show exactly which removal strategy the runner accepted and what the
-    # post-create junction target was. Use os.environ directly (not
-    # monkeypatch.setenv) -- monkeypatch.undo() further down ALSO unsets
-    # env vars, which would hide the diagnostic output from the post-undo
-    # service.use() call (the call that actually needs diagnosing). Cleanup
-    # not needed; subsequent tests don't depend on this var being unset.
-    os.environ["SWITCHER_DEBUG_LINKS"] = "1"
     name = service.init()
 
     call_count = {"n": 0}
@@ -571,19 +561,30 @@ def test_rename_remains_recoverable_when_swap_link_fails(
         call_count["n"] += 1
         raise OSError("simulated swap failure")
 
-    monkeypatch.setattr("switcher.service.swap_link", boom)
-    with pytest.raises(OSError, match="simulated"):
-        service.rename(name, "client-A")
+    # Patch swap_link via unittest.mock.patch.object scoped to this `with`
+    # block. Earlier versions of this test used the shared monkeypatch
+    # fixture and called monkeypatch.undo() to restore swap_link before
+    # the recovery service.use() call -- but on Windows that ALSO undid
+    # the conftest fixture's USERPROFILE/HOME env-var setup (since the
+    # monkeypatch fixture is shared with conftest), causing service.use()
+    # to expand `~` against the runner's REAL profile dir and create
+    # junctions in the wrong filesystem location entirely. patch.object's
+    # context-manager teardown only undoes our specific replacement,
+    # leaving fixture state alone.
+    import switcher.service as svc
 
-    # After the failure: store dir was renamed, active says new
-    store = FileProfileStore(tmp_state)
-    assert store.profile_dir("client-A").exists()
-    assert not store.profile_dir(name).exists()
-    after_active = store.get_active()
-    assert all(v == "client-A" for v in after_active.values())
+    with patch.object(svc, "swap_link", new=boom):
+        with pytest.raises(OSError, match="simulated"):
+            service.rename(name, "client-A")
+
+        # After the failure: store dir was renamed, active says new
+        store = FileProfileStore(tmp_state)
+        assert store.profile_dir("client-A").exists()
+        assert not store.profile_dir(name).exists()
+        after_active = store.get_active()
+        assert all(v == "client-A" for v in after_active.values())
 
     # And `use(<new>)` must be a clean recovery path
-    monkeypatch.undo()  # restore real swap_link
     service.use("client-A")
     claude_link = tmp_home / ".claude"
     expected = (store.profile_dir("client-A") / "claude").resolve()
