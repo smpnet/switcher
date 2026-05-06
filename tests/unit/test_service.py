@@ -557,10 +557,12 @@ def test_rename_remains_recoverable_when_swap_link_fails(
     # if the defensive removal in _swap_link_windows fails to clear the broken
     # junction (the failure mode that motivated the defensive rewrite), CI logs
     # show exactly which removal strategy the runner accepted and what the
-    # post-create junction target was. No effect on POSIX (the env var is
-    # only consulted in the Windows code path); no effect on assertions either
-    # since debug output goes to stderr.
-    monkeypatch.setenv("SWITCHER_DEBUG_LINKS", "1")
+    # post-create junction target was. Use os.environ directly (not
+    # monkeypatch.setenv) -- monkeypatch.undo() further down ALSO unsets
+    # env vars, which would hide the diagnostic output from the post-undo
+    # service.use() call (the call that actually needs diagnosing). Cleanup
+    # not needed; subsequent tests don't depend on this var being unset.
+    os.environ["SWITCHER_DEBUG_LINKS"] = "1"
     name = service.init()
 
     call_count = {"n": 0}
