@@ -199,6 +199,17 @@ per-OS table further down) and re-run `switcher init`.
 >    reappear in `switcher list` but are inert until you
 >    `switcher use <name>` them — the fresh `init` resets the active map
 >    to the new dated-current; prior active state is not preserved.
+>
+>    **Note on credentials in restored profiles.** "Shared across
+>    profiles" means each profile is *seeded* with credentials at
+>    `create`/`init` time, not that credentials live in one shared
+>    location at runtime. A restored profile carries the credentials it
+>    was created with — which may be stale if tokens have rotated
+>    since the backup. If `switcher use <restored>` followed by the
+>    tool's first action triggers a re-auth prompt, that's expected;
+>    completing the auth updates the live config dir, which IS the
+>    restored profile while it's active, so the new credentials persist
+>    in that profile.
 
 Profile contents (what `save`/`create`/`use` move around): each profile is
 a directory of full per-tool config trees. Credential files (declared in
