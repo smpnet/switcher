@@ -165,38 +165,43 @@ per-OS table further down) and re-run `switcher init`.
 > steps. A non-destructive `rescan` command on the v0.2.0 roadmap will
 > replace this dance.
 >
-> 1. **Back up the entire state directory** — non-negotiable first step.
->    Copy the whole tree, not just `profiles/`, so user-added registry
->    entries and the active map come along:
+> 1. **Record the active profile per tool, then back up the entire state
+>    directory.** The active profile is what each tool's live config
+>    actually points at right now — and it may differ across tools
+>    (e.g. Claude on `vanilla`, Copilot on `experiment`). Restoring from
+>    the wrong profile silently discards newer changes:
+>    ```bash
+>    switcher status      # capture this output — it tells you which
+>                         # profile to restore from for each tool
+>    ```
+>    Then back up the whole state tree (not just `profiles/`) so user-added
+>    registry entries and the active map come along:
 >    ```bash
 >    # macOS example — adjust the source path per the per-OS table below
 >    cp -R "$HOME/Library/Application Support/switcher" ~/switcher-state-backup
 >    ```
->    Find the actual `<dated>-current` directory name (referenced
->    throughout the steps below) by running `switcher status` before
->    wiping, or by listing `<state_dir>/profiles/` directly (substitute
->    your OS's path from the per-OS table). It'll be something like
->    `2026-05-06-current`.
-> 2. **Restore the active tool configs to their live paths first.** After
->    `init`, each managed tool's live config dir is a symlink/junction
->    pointing into `<state_dir>`. If you delete `<state_dir>` while those
->    links exist, they dangle — and `switcher init` will then refuse to
->    run with `AlreadyLinkedError`. Before wiping, remove the link and
->    copy each captured tool's config back to its live path. The link-
->    removal step is OS-specific:
+> 2. **Restore each tool's active-profile config to its live path before
+>    wiping.** After `init`/`use`, each managed tool's live config dir is
+>    a symlink/junction pointing into `<state_dir>`. If you delete
+>    `<state_dir>` while those links exist, they dangle — and `switcher
+>    init` will then refuse to run with `AlreadyLinkedError`. For each
+>    tool, look at the profile name from step 1's `switcher status` output
+>    and restore from `profiles/<that-profile>/<config_subdir>/`. The
+>    link-removal step is OS-specific:
 >    ```bash
->    # macOS / Linux — symlinks: use `rm` (NOT rmdir)
+>    # macOS / Linux — symlinks: use `rm` (NOT rmdir).
+>    # Substitute <active-profile> per `switcher status` output for this tool.
 >    rm ~/.claude
->    cp -R ~/switcher-state-backup/profiles/<dated>-current/claude ~/.claude
+>    cp -R ~/switcher-state-backup/profiles/<active-profile>/claude ~/.claude
 >    ```
 >    ```powershell
 >    # Windows — junctions: use `rmdir` from cmd, or Remove-Item from PowerShell.
 >    # `rm`/`del` will fail or behave unexpectedly on a junction.
 >    cmd /c rmdir "$env:USERPROFILE\.claude"
->    Copy-Item -Recurse "$env:USERPROFILE\switcher-state-backup\profiles\<dated>-current\claude" "$env:USERPROFILE\.claude"
+>    Copy-Item -Recurse "$env:USERPROFILE\switcher-state-backup\profiles\<active-profile>\claude" "$env:USERPROFILE\.claude"
 >    ```
->    Repeat for every tool that `init` originally captured (check `switcher
->    status` output before wiping to know which tools are managed).
+>    Repeat for every tool listed in `switcher status` — each may need a
+>    different `<active-profile>` source.
 > 3. **Wipe `<state_dir>` and re-run `switcher init`.** With real config
 >    dirs at the live paths, init captures every installed tool fresh.
 > 4. **Restore user-added registry entries and additional profiles.**
