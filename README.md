@@ -127,15 +127,26 @@ switcher version
 After that, `switcher use <name>` re-links each managed dir to the new
 profile — one atomic per-directory swap each.
 
-If `init` runs with no managed tools installed (no Claude Code or Copilot CLI
-config dirs found), it still succeeds — but with empty profiles and no active
-tools, so `status` will show "no active profiles." Install at least one
-managed tool first, then re-run `init`.
+**`init` is one-shot.** It snapshots whichever managed tools are installed
+at the moment you run it, and then refuses to run again
+(`StateAlreadyInitialized`). Two cases worth knowing:
 
-If only some managed tools are installed at `init` time, only those are
-captured. Tools installed later are not retroactively picked up — you'd need
-to wipe the state directory and re-run `init` (a "rescan" command is on the
-v0.2.0 roadmap).
+- *No managed tools installed yet:* `init` still succeeds — but with empty
+  profiles and no active tools, so `status` will show "no active profiles."
+- *Only some managed tools installed:* only those are captured; the rest
+  are simply not in the active map.
+
+In both cases, a tool installed *after* `init` is not retroactively picked
+up. The recovery path today is: delete the `<state_dir>` shown in the table
+above, then re-run `switcher init`. A safer "rescan" command is on the
+v0.2.0 roadmap.
+
+Profile contents (what `save`/`create`/`use` move around): each profile is
+a directory of full per-tool config trees. Credential files (declared in
+each tool's `[[credentials]]` block) are *shared across profiles* — `create`
+seeds them from the active profile, and `init` carries them into `vanilla`
+— so switching profiles never re-prompts for auth. Everything else (plugins,
+hooks, settings, history) is profile-specific.
 
 The state directory is chosen by `platformdirs.user_data_dir("switcher")`:
 
