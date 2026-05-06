@@ -62,6 +62,13 @@ per-OS bin dirs). The Windows code paths (junctions, `%LOCALAPPDATA%`,
 `%USERPROFILE%` env-var expansion) are covered by the test suite, which
 runs on a Windows runner in CI (see `.github/workflows/ci.yml`).
 
+### Upgrading
+
+`pipx` remembers the URL the package came from. To pull a newer commit on
+the same ref, run `pipx upgrade switcher` — but note that pinned tags
+(`@v0.1.0`) won't move past the tag. To switch to a different tag, reinstall
+with the new ref (`pipx install --force git+ssh://...@v0.2.0`).
+
 ## Usage
 
 ```bash
@@ -119,6 +126,16 @@ switcher version
 
 After that, `switcher use <name>` re-links each managed dir to the new
 profile — one atomic per-directory swap each.
+
+If `init` runs with no managed tools installed (no Claude Code or Copilot CLI
+config dirs found), it still succeeds — but with empty profiles and no active
+tools, so `status` will show "no active profiles." Install at least one
+managed tool first, then re-run `init`.
+
+If only some managed tools are installed at `init` time, only those are
+captured. Tools installed later are not retroactively picked up — you'd need
+to wipe the state directory and re-run `init` (a "rescan" command is on the
+v0.2.0 roadmap).
 
 The state directory is chosen by `platformdirs.user_data_dir("switcher")`:
 
