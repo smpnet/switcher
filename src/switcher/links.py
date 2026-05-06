@@ -1,11 +1,27 @@
-"""Directory link creation and atomic replacement.
+"""Directory link creation and replacement.
 
 POSIX: symbolic links. Windows: junctions (no Developer Mode required).
 
-`swap_link` writes a temp link beside the target path then atomically renames.
-On POSIX `rename(2)` is documented atomic; on Windows `MoveFileExW` with
-REPLACE_EXISTING|WRITE_THROUGH is atomic for junctions in our verified testing
-(see plan task "verification spike").
+`swap_link` follows different paths per platform:
+
+- **POSIX:** writes a temp symlink beside the target path then `rename(2)`s
+  it over the existing link. `rename(2)` is documented atomic for symlinks,
+  so observers either see the old target or the new target — never a
+  torn intermediate state.
+- **Windows:** removes the existing junction then creates a fresh junction
+  at the live path. NOT atomic — Microsoft's `MoveFileExW` with
+  `MOVEFILE_REPLACE_EXISTING` explicitly does not accept directory entries
+  (and junctions are directory reparse points), so the POSIX trick has no
+  Windows analogue. The window between rmdir and CreateJunction is
+  measured in microseconds; `scripts/verify_junction.py` is a probabilistic
+  probe of observable tearing under contention.
+
+An earlier docstring claimed the Windows path was atomic via
+`REPLACE_EXISTING|WRITE_THROUGH`. That was an unverified claim — Windows
+CI was never actually run on this code path before v0.1.1, so the
+disagreement between the docstring's atomicity claim and Microsoft's
+documented behavior went unnoticed until tests started failing on the
+hosted Windows runner.
 """
 
 from __future__ import annotations
@@ -88,19 +104,22 @@ def _force_remove(path: Path) -> None:
 
 
 def swap_link(target: Path, link_path: Path) -> None:
-    """Atomically replace an existing link/file at `link_path` with a link to `target`.
+    """Replace any existing link at `link_path` with a link to `target`.
 
-    Pattern: write to `link_path + ".tmp"`, then `Path.replace` over `link_path`.
-    Idempotent: pointing the link to where it already points is safe.
+    Atomic on POSIX (rename-over-symlink); not atomic on Windows (rmdir +
+    CreateJunction, microseconds apart) — see the module docstring for why.
+    Idempotent: pointing the link to where it already points is safe and
+    re-creates the link rather than no-op'ing.
 
     Refuses when `link_path` is a real (non-link) directory — replacing it
-    via rename would either fail noisily (POSIX EISDIR / Windows
-    ERROR_ACCESS_DENIED) or, worse, silently destroy whatever lives inside.
-    Callers that genuinely want to replace a real directory must run
-    `move_or_seed_dir` first, then call swap_link against the resulting link.
+    would either fail noisily (POSIX EISDIR / Windows ERROR_ACCESS_DENIED)
+    or silently destroy whatever lives inside. Callers that genuinely want
+    to replace a real directory must run `move_or_seed_dir` first, then
+    call swap_link against the resulting link.
 
     All preconditions are validated *before* any filesystem mutation
-    (parent-mkdir or stale-.tmp cleanup), so a failed call leaves no debris.
+    (parent-mkdir or stale-.tmp cleanup on POSIX, rmdir on Windows), so a
+    failed call leaves no debris.
     """
     if not target.is_dir():
         raise PathNotADirectoryError(f"link target must be an existing directory: {target}")
@@ -111,12 +130,46 @@ def swap_link(target: Path, link_path: Path) -> None:
             "move_or_seed_dir it first, then swap_link the resulting link"
         )
     # Preconditions all passed — only now mutate.
-    tmp = link_path.with_name(link_path.name + ".tmp")
-    if tmp.exists() or tmp.is_symlink() or (IS_WINDOWS and os.path.isjunction(tmp)):
-        _force_remove(tmp)
     link_path.parent.mkdir(parents=True, exist_ok=True)
-    link_dir(target, tmp)
-    tmp.replace(link_path)
+    if IS_WINDOWS:
+        _swap_link_windows(target, link_path)
+    else:
+        # POSIX: write to a sibling tmp path, then rename atomically. The
+        # tmp pattern is what makes the swap atomic — observers either see
+        # the old symlink or the new one, never a missing entry.
+        tmp = link_path.with_name(link_path.name + ".tmp")
+        if tmp.exists() or tmp.is_symlink():
+            _force_remove(tmp)
+        link_dir(target, tmp)
+        tmp.replace(link_path)
+
+
+def _swap_link_windows(target: Path, link_path: Path) -> None:
+    """Windows-specific link replacement: defensive remove + CreateJunction.
+
+    Tries multiple removal strategies before re-creating the junction:
+    rmdir handles junctions and empty dirs, unlink handles symlinks and
+    files, rmtree is the heavy-hammer fallback. Each strategy short-
+    circuits on FileNotFoundError (already gone) or success; any other
+    OSError advances to the next strategy. Defensive ordering exists
+    because os.path.isjunction is unreliable on some Windows hosts for
+    broken junctions, so we don't trust the upstream `is_link` check
+    to have correctly gated removal.
+    """
+    for strategy in ("rmdir", "unlink", "rmtree"):
+        try:
+            if strategy == "rmdir":
+                link_path.rmdir()
+            elif strategy == "unlink":
+                link_path.unlink()
+            else:
+                shutil.rmtree(link_path, ignore_errors=True)
+            break
+        except FileNotFoundError:
+            break
+        except OSError:
+            continue
+    link_dir(target, link_path)
 
 
 def move_or_seed_dir(live: Path, profile_target: Path) -> None:

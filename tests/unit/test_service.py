@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -389,16 +390,57 @@ def test_create_includes_uninstalled_active_tools(
     creates a profile. The tool set must come from the active map.
     """
     service.init()
-    # Uninstall copilot live (but it's still in active from init)
+    # Determine copilot's live path per platform. After init, the path is a
+    # junction (Windows) or symlink (POSIX) into the captured profile.
+    # shutil.rmtree refuses both shapes -- it raises "Cannot call rmtree on
+    # a symbolic link" because os.path.islink returns True for both classic
+    # symlinks and (per Python 3.13's ntpath) Windows junctions. Use the
+    # link-aware removal path on each platform.
     if IS_WINDOWS:
-        shutil.rmtree(tmp_home / "AppData" / "Local" / "github-copilot")
+        copilot_live = tmp_home / "AppData" / "Local" / "github-copilot"
+    else:
+        copilot_live = tmp_home / ".copilot"
+
+    # Pre-assert: the simulated "uninstall" must actually have something to
+    # remove, otherwise the test stops proving the "uninstalled active tool"
+    # behavior its name claims. If init's capture ever broke or the runner's
+    # path layout drifted, this surfaces immediately rather than the test
+    # silently no-op'ing through both branches below.
+    is_link = copilot_live.is_symlink() or (IS_WINDOWS and os.path.isjunction(copilot_live))
+    assert is_link or copilot_live.exists(), (
+        f"setup precondition: copilot's live path {copilot_live} should exist "
+        f"as a link/junction or directory after service.init() captured it"
+    )
+
+    # Uninstall copilot live (but it's still in active from init).
+    if IS_WINDOWS:
+        # Junction: rmdir works (RemoveDirectory handles the reparse point);
+        # DeleteFile (Path.unlink) and shutil.rmtree do not.
+        if os.path.isjunction(copilot_live):
+            copilot_live.rmdir()
+        elif copilot_live.exists():
+            shutil.rmtree(copilot_live)
     else:
         # Live link → still appears as a link to a now-missing target
-        copilot_link = tmp_home / ".copilot"
-        if copilot_link.is_symlink():
-            copilot_link.unlink()
-        elif copilot_link.exists():
-            shutil.rmtree(copilot_link)
+        if copilot_live.is_symlink():
+            copilot_live.unlink()
+        elif copilot_live.exists():
+            shutil.rmtree(copilot_live)
+
+    # Post-assert: confirm the removal actually changed filesystem state.
+    # Pairs with the pre-assert above to keep this test honest -- without
+    # both, a future regression where neither branch fired (e.g.,
+    # is_junction misclassification) would silently pass.
+    still_present = (
+        copilot_live.is_symlink()
+        or (IS_WINDOWS and os.path.isjunction(copilot_live))
+        or copilot_live.exists()
+    )
+    assert not still_present, (
+        f"copilot's live path {copilot_live} should be gone after the "
+        f"simulated uninstall, but it still exists in some form"
+    )
+
     service.create("backup")
     backup = FileProfileStore(tmp_state).get("backup")
     assert "copilot" in backup.tools
@@ -531,7 +573,6 @@ def test_rename_remains_recoverable_when_swap_link_fails(
     service: ProfileService,
     tmp_home: Path,
     tmp_state: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If swap_link fails mid-rename, the active map MUST already say `new`
     so that ``use(<new>)`` is a clean idempotent recovery path.
@@ -550,19 +591,30 @@ def test_rename_remains_recoverable_when_swap_link_fails(
         call_count["n"] += 1
         raise OSError("simulated swap failure")
 
-    monkeypatch.setattr("switcher.service.swap_link", boom)
-    with pytest.raises(OSError, match="simulated"):
-        service.rename(name, "client-A")
+    # Patch swap_link via unittest.mock.patch.object scoped to this `with`
+    # block. Earlier versions of this test used the shared monkeypatch
+    # fixture and called monkeypatch.undo() to restore swap_link before
+    # the recovery service.use() call -- but on Windows that ALSO undid
+    # the conftest fixture's USERPROFILE/HOME env-var setup (since the
+    # monkeypatch fixture is shared with conftest), causing service.use()
+    # to expand `~` against the runner's REAL profile dir and create
+    # junctions in the wrong filesystem location entirely. patch.object's
+    # context-manager teardown only undoes our specific replacement,
+    # leaving fixture state alone.
+    import switcher.service as svc
 
-    # After the failure: store dir was renamed, active says new
-    store = FileProfileStore(tmp_state)
-    assert store.profile_dir("client-A").exists()
-    assert not store.profile_dir(name).exists()
-    after_active = store.get_active()
-    assert all(v == "client-A" for v in after_active.values())
+    with patch.object(svc, "swap_link", new=boom):
+        with pytest.raises(OSError, match="simulated"):
+            service.rename(name, "client-A")
+
+        # After the failure: store dir was renamed, active says new
+        store = FileProfileStore(tmp_state)
+        assert store.profile_dir("client-A").exists()
+        assert not store.profile_dir(name).exists()
+        after_active = store.get_active()
+        assert all(v == "client-A" for v in after_active.values())
 
     # And `use(<new>)` must be a clean recovery path
-    monkeypatch.undo()  # restore real swap_link
     service.use("client-A")
     claude_link = tmp_home / ".claude"
     expected = (store.profile_dir("client-A") / "claude").resolve()
