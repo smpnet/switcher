@@ -101,6 +101,15 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
     caller pulled in.
     """
     env = os.environ.copy()
+    # Force ANSI-free output so the tokenizer in `_tokens` works regardless of
+    # what the runner does with FORCE_COLOR / TTY detection. NO_COLOR is the
+    # cross-tool standard (Rich, Click, Typer all honor it). Without this,
+    # GitHub Actions hosted runners can hand Rich a FORCE_COLOR=1-shaped env,
+    # making `python -m switcher --help` emit ANSI escape sequences even though
+    # stdout is captured via subprocess.PIPE -- which broke
+    # test_help_lists_commands mid-2026 when GH rolled out updated runner
+    # images.
+    env["NO_COLOR"] = "1"
     if sys.platform == "win32":
         env["USERPROFILE"] = str(home)
         env["LOCALAPPDATA"] = str(home / "AppData" / "Local")
