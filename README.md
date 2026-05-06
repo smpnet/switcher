@@ -11,9 +11,12 @@ profile starts life carrying the same credential snapshot. (Credentials
 are seeded once and then become profile-local; see "How it works" for the
 implications.)
 
-Each per-directory swap is atomic (a `replace`-style symlink rename on POSIX,
-a junction recreate on Windows — the platform-specific atomicity scope is
-covered in the design doc). Multi-dir / multi-tool sequencing is best-effort;
+Each per-directory swap is atomic (a `replace`-style symlink rename on POSIX
+gives kernel-level atomicity; on Windows the implementation hedges by removing
+the existing junction and recreating it, which is *not* a single atomic
+operation but completes in well under the typical observation window — see
+`scripts/verify_junction.py` for the probabilistic atomicity probe).
+Multi-dir / multi-tool sequencing is best-effort;
 pre-flight validation runs before any mutation, but `init` and `rename` have
 narrow documented failure windows where a partial state may need manual
 reconciliation. Day-to-day `use` and `save` are the well-trodden paths.
