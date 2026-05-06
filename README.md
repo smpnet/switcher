@@ -228,8 +228,14 @@ per-OS table further down) and re-run `switcher init`.
 >    ```
 >    Repeat for every tool listed in `switcher status` — each may need a
 >    different `<active-profile>` source.
-> 3. **Wipe `<state_dir>` and re-run `switcher init`.** With real config
->    dirs at the live paths, init captures every installed tool fresh.
+> 3. **Verify, then wipe `<state_dir>` and re-run `switcher init`.**
+>    Before wiping, confirm each tool's live config path is now a real
+>    directory (not a symlink/junction) — `ls -lh ~/.claude` on POSIX
+>    or `Get-Item ~/.claude | Select Mode` in PowerShell will show this.
+>    If any path is still a link, repeat step 2 for that tool. With real
+>    config dirs at every live path, init captures every installed tool
+>    fresh. After init, run `switcher status` to confirm the expected
+>    active profiles per tool before moving on to step 4.
 > 4. **Restore user-added registry entries and additional profiles.**
 >    Copy any TOMLs from your backup's `registry.d/` into the new
 >    `<state_dir>/registry.d/` so user-added tools are recognized again,
