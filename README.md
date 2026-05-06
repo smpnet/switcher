@@ -23,10 +23,10 @@ user-extensible via TOML files dropped into `<state_dir>/registry.d/`
 
 ## Install
 
-**Prerequisites:** Python 3.13 or newer (the codebase uses 3.13-era stdlib
-features like `tomllib` and `os.path.isjunction`), `pipx`, and `git`. The
-HTTPS install option also needs [`gh`](https://cli.github.com/) for the
-credential helper.
+**Prerequisites:** Python 3.13 or newer (matches the project's pinned
+target in `pyproject.toml` and the pixi dev environment), `pipx`, and
+`git`. The HTTPS install option also needs
+[`gh`](https://cli.github.com/) for the credential helper.
 
 The repo is private during the v0.1.0 scaffolding phase, so `pipx` needs an
 authenticated path to GitHub. Two safe options — pick whichever matches how
@@ -144,16 +144,17 @@ In both cases, a tool installed *after* `init` is not retroactively picked
 up. The recovery path today is to delete the state directory (see the
 per-OS table further down) and re-run `switcher init`.
 
-> **Destructive recovery — last resort.** This procedure has multiple
-> failure modes. Read it through before running any of the steps. A
+> **⚠ Destructive recovery — last resort.** This is an exceptional
+> manual procedure with multiple failure modes, not a routine
+> operation. **You will lose every saved profile (and your live tool
+> config) if you do not back up `<state_dir>/profiles/` first.** The
+> `<dated>-current` profile is where your real Claude/Copilot config
+> lives after `init` — the live `~/.claude` etc. are just symlinks into
+> it. Read the whole procedure before running any of the steps. A
 > non-destructive `rescan` command on the v0.2.0 roadmap will replace
 > this dance.
 >
-> 1. **Back up profiles.** Deleting `<state_dir>` removes *all* saved
->    profiles, not just the dated-current snapshot. Including the captured
->    tool configs (the dated-current dir is where your real Claude/Copilot
->    config lives after `init`). Copy `<state_dir>/profiles/` somewhere
->    safe first:
+> 1. **Back up profiles** — non-negotiable first step:
 >    ```bash
 >    # macOS example — adjust the source path per the per-OS table below
 >    cp -R "$HOME/Library/Application Support/switcher/profiles" ~/switcher-profiles-backup
