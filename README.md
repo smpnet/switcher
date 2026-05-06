@@ -84,6 +84,14 @@ with a `git clone`-style auth error, that's a GitHub auth problem, not a
 
 ## Usage
 
+> **⚠ Run `switcher init` only after the tools you want to manage are
+> already installed.** `init` is one-shot — it captures whichever tools
+> exist at the moment you run it, then refuses to run again. Tools you
+> install *after* `init` are not picked up automatically. The only
+> recovery in v0.1.0 is the destructive procedure documented under "How
+> it works" (back up state, restore live configs, wipe state, re-init).
+> A non-destructive `rescan` command is on the v0.2.0 roadmap.
+
 ```bash
 # One-time setup: detect installed tools, snapshot current config, create vanilla.
 switcher init
