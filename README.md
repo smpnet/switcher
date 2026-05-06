@@ -152,7 +152,10 @@ per-OS table further down) and re-run `switcher init`.
 >
 > After re-running `switcher init` against a fresh state dir, you can copy
 > profile directories back from the backup into the new
-> `<state_dir>/profiles/` and they will reappear in `switcher list`. A
+> `<state_dir>/profiles/` and they will reappear in `switcher list`.
+> Restored profiles are inert until you `switcher use <name>` them — the
+> fresh `init` resets the active map to point only at the new dated-current
+> snapshot, so prior active-state from the backup is not preserved. A
 > non-destructive "rescan" command is on the v0.2.0 roadmap so this whole
 > dance won't be needed.
 
@@ -208,7 +211,14 @@ it must equal the `profile_subdir` of one of the `config_dirs` entries. That
 identifies which managed dir the credential file lives in; `path` is then
 relative to that dir.
 
-For single-dir tools, the shorthand also works:
+For tools whose credential files all live in their first registered config
+directory, a `credential_files` shorthand works in place of the
+`[[credentials]]` block (it auto-expands at registry-load time, anchored to
+`config_dirs[0].profile_subdir`). This is the common case — the shorthand
+is intended for single-dir tools, but it also works for multi-dir tools
+whose credentials happen to all live in the first dir. If credentials live
+in a non-first config dir, use the explicit `[[credentials]]` form so you
+can name the right `config_dir`:
 
 ```toml
 id = "gemini"
