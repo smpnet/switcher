@@ -7,7 +7,9 @@ directory under a state store, so you can move between, say, a "full setup"
 with plugins and hooks and a "vanilla" clean slate. Credential files are
 copied into each new profile at create-time (seeded from whichever profile
 is active), so day-to-day switching doesn't re-prompt for auth — every
-profile starts life carrying the same credential snapshot.
+profile starts life carrying the same credential snapshot. (Credentials
+are seeded once and then become profile-local; see "How it works" for the
+implications.)
 
 Each per-directory swap is atomic (a `replace`-style symlink rename on POSIX,
 a junction recreate on Windows — the platform-specific atomicity scope is
@@ -25,10 +27,9 @@ user-extensible via TOML files dropped into `<state_dir>/registry.d/`
 
 ## Install
 
-**Prerequisites:** Python 3.13 or newer (matches the project's pinned
-target in `pyproject.toml` and the pixi dev environment), `pipx`, and
-`git`. The HTTPS install option also needs
-[`gh`](https://cli.github.com/) for the credential helper.
+**Prerequisites:** Python 3.13 or newer, `pipx`, and `git`. The HTTPS
+install option also needs [`gh`](https://cli.github.com/) for the
+credential helper.
 
 The repo is private during the v0.1.0 scaffolding phase, so `pipx` needs an
 authenticated path to GitHub. Two safe options — pick whichever matches how
@@ -173,8 +174,9 @@ per-OS table further down) and re-run `switcher init`.
 >    ```
 >    Find the actual `<dated>-current` directory name (referenced
 >    throughout the steps below) by running `switcher status` before
->    wiping, or by `ls "$HOME/Library/Application Support/switcher/profiles"`
->    — it'll be something like `2026-05-06-current`.
+>    wiping, or by listing `<state_dir>/profiles/` directly (substitute
+>    your OS's path from the per-OS table). It'll be something like
+>    `2026-05-06-current`.
 > 2. **Restore the active tool configs to their live paths first.** After
 >    `init`, each managed tool's live config dir is a symlink/junction
 >    pointing into `<state_dir>`. If you delete `<state_dir>` while those
@@ -246,7 +248,7 @@ in `<state_dir>/registry.d/` matching the schema — generate a stub with
 ```bash
 switcher tools scaffold gemini
 # Edit the stub at <state_dir>/registry.d/gemini.toml
-switcher tools         # confirms the new tool shows up
+switcher tools         # confirms the registry entry loads (load-time validation only)
 ```
 
 The TOML schema (full form):
