@@ -93,7 +93,9 @@ with a `git clone`-style auth error, that's a GitHub auth problem, not a
 > A non-destructive `rescan` command is on the v0.2.0 roadmap.
 
 ```bash
-# One-time setup: detect installed tools, snapshot current config, create vanilla.
+# One-time setup: detect installed tools, MOVE each tool's live config dir
+# into the state store, and replace the original path with a symlink (or
+# junction on Windows) pointing into the snapshot. Then create vanilla.
 switcher init
 
 # Show what's active for each tool
@@ -267,7 +269,8 @@ in `<state_dir>/registry.d/` matching the schema — generate a stub with
 ```bash
 switcher tools scaffold gemini
 # Edit the stub at <state_dir>/registry.d/gemini.toml
-switcher tools         # confirms the registry entry loads (load-time validation only)
+switcher tools         # confirms the registry entry loads (schema validation only;
+                       # does not check whether the target paths exist on disk)
 ```
 
 The TOML schema (full form):
