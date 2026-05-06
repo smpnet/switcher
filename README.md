@@ -23,8 +23,9 @@ user-extensible via TOML files dropped into `<state_dir>/registry.d/`
 
 ## Install
 
-**Prerequisites:** Python 3.13 or newer, `pipx`, and `git`. The HTTPS
-install option also needs [`gh`](https://cli.github.com/) for the
+**Prerequisites:** Python 3.13 or newer (the codebase uses 3.13-era stdlib
+features like `tomllib` and `os.path.isjunction`), `pipx`, and `git`. The
+HTTPS install option also needs [`gh`](https://cli.github.com/) for the
 credential helper.
 
 The repo is private during the v0.1.0 scaffolding phase, so `pipx` needs an
@@ -161,13 +162,22 @@ per-OS table further down) and re-run `switcher init`.
 >    `init`, each managed tool's live config dir is a symlink/junction
 >    pointing into `<state_dir>`. If you delete `<state_dir>` while those
 >    links exist, they dangle — and `switcher init` will then refuse to
->    run with `AlreadyLinkedError`. Before wiping, copy each captured
->    tool's config back to its live path. For example on macOS:
+>    run with `AlreadyLinkedError`. Before wiping, remove the link and
+>    copy each captured tool's config back to its live path. The link-
+>    removal step is OS-specific:
 >    ```bash
->    # remove the link, restore the real dir from the backup
+>    # macOS / Linux — symlinks: use `rm` (NOT rmdir)
 >    rm ~/.claude
 >    cp -R ~/switcher-profiles-backup/<dated>-current/claude ~/.claude
 >    ```
+>    ```powershell
+>    # Windows — junctions: use `rmdir` from cmd, or Remove-Item from PowerShell.
+>    # `rm`/`del` will fail or behave unexpectedly on a junction.
+>    cmd /c rmdir "$env:USERPROFILE\.claude"
+>    Copy-Item -Recurse "$env:USERPROFILE\switcher-profiles-backup\<dated>-current\claude" "$env:USERPROFILE\.claude"
+>    ```
+>    Repeat for every tool that `init` originally captured (check `switcher
+>    status` output before wiping to know which tools are managed).
 > 3. **Wipe `<state_dir>` and re-run `switcher init`.** With real config
 >    dirs at the live paths, init captures every installed tool fresh.
 > 4. **(Optional) Restore additional named profiles.** Copy non-current
