@@ -83,9 +83,19 @@ assert _TOOL_IDS, f"no builtin TOMLs discovered under {_BUILTINS_DIR}"
 # lines without participating in the token assertions.
 _TABLE_TOKEN_SPLIT = re.compile(r"[\s│┃┏┓┗┛━┳┻╇╋|]+")
 
+# ANSI CSI escape sequences (color, style, cursor positioning, etc.). NO_COLOR=1
+# in `_run` suppresses Rich's color codes, but Rich still emits style escapes
+# (bold = ESC[1m, dim = ESC[2m) because NO_COLOR's spec only covers colors. CI
+# runners that hand Rich a FORCE_COLOR-shaped env therefore produce stdout like
+# `ESC[1minit  ESC[0m` even when stdout is piped, and the table-token splitter
+# above doesn't recognize ANSI as a separator -- which would make `init` invisible
+# as a discrete token. Strip ANSI defensively here so the test is agnostic to
+# whatever Rich/runner combination decides to emit.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
 
 def _tokens(text: str) -> list[str]:
-    return [t for t in _TABLE_TOKEN_SPLIT.split(text) if t]
+    return [t for t in _TABLE_TOKEN_SPLIT.split(_ANSI_ESCAPE.sub("", text)) if t]
 
 
 pytestmark = pytest.mark.e2e
