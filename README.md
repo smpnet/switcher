@@ -146,18 +146,22 @@ per-OS table further down) and re-run `switcher init`.
 
 > **⚠ Destructive recovery — last resort.** This is an exceptional
 > manual procedure with multiple failure modes, not a routine
-> operation. **You will lose every saved profile (and your live tool
-> config) if you do not back up `<state_dir>/profiles/` first.** The
-> `<dated>-current` profile is where your real Claude/Copilot config
-> lives after `init` — the live `~/.claude` etc. are just symlinks into
-> it. Read the whole procedure before running any of the steps. A
-> non-destructive `rescan` command on the v0.2.0 roadmap will replace
-> this dance.
+> operation. **You will lose every saved profile, your live tool
+> config, AND any user-added tool registry entries if you do not back
+> up the entire `<state_dir>` first.** The `<dated>-current` profile is
+> where your real Claude/Copilot config lives after `init` (the live
+> `~/.claude` etc. are just symlinks into it); `<state_dir>/registry.d/`
+> holds user-added tool definitions; `<state_dir>/profiles/` holds every
+> saved profile. Read the whole procedure before running any of the
+> steps. A non-destructive `rescan` command on the v0.2.0 roadmap will
+> replace this dance.
 >
-> 1. **Back up profiles** — non-negotiable first step:
+> 1. **Back up the entire state directory** — non-negotiable first step.
+>    Copy the whole tree, not just `profiles/`, so user-added registry
+>    entries and the active map come along:
 >    ```bash
 >    # macOS example — adjust the source path per the per-OS table below
->    cp -R "$HOME/Library/Application Support/switcher/profiles" ~/switcher-profiles-backup
+>    cp -R "$HOME/Library/Application Support/switcher" ~/switcher-state-backup
 >    ```
 > 2. **Restore the active tool configs to their live paths first.** After
 >    `init`, each managed tool's live config dir is a symlink/junction
@@ -169,24 +173,26 @@ per-OS table further down) and re-run `switcher init`.
 >    ```bash
 >    # macOS / Linux — symlinks: use `rm` (NOT rmdir)
 >    rm ~/.claude
->    cp -R ~/switcher-profiles-backup/<dated>-current/claude ~/.claude
+>    cp -R ~/switcher-state-backup/profiles/<dated>-current/claude ~/.claude
 >    ```
 >    ```powershell
 >    # Windows — junctions: use `rmdir` from cmd, or Remove-Item from PowerShell.
 >    # `rm`/`del` will fail or behave unexpectedly on a junction.
 >    cmd /c rmdir "$env:USERPROFILE\.claude"
->    Copy-Item -Recurse "$env:USERPROFILE\switcher-profiles-backup\<dated>-current\claude" "$env:USERPROFILE\.claude"
+>    Copy-Item -Recurse "$env:USERPROFILE\switcher-state-backup\profiles\<dated>-current\claude" "$env:USERPROFILE\.claude"
 >    ```
 >    Repeat for every tool that `init` originally captured (check `switcher
 >    status` output before wiping to know which tools are managed).
 > 3. **Wipe `<state_dir>` and re-run `switcher init`.** With real config
 >    dirs at the live paths, init captures every installed tool fresh.
-> 4. **(Optional) Restore additional named profiles.** Copy non-current
->    profile directories from your backup into the new
->    `<state_dir>/profiles/`. They will reappear in `switcher list` but are
->    inert until you `switcher use <name>` them — the fresh `init` resets
->    the active map to the new dated-current; prior active state is not
->    preserved.
+> 4. **Restore user-added registry entries and additional profiles.**
+>    Copy any TOMLs from your backup's `registry.d/` into the new
+>    `<state_dir>/registry.d/` so user-added tools are recognized again,
+>    then copy non-current profile directories from your backup's
+>    `profiles/` into the new `<state_dir>/profiles/`. Restored profiles
+>    reappear in `switcher list` but are inert until you
+>    `switcher use <name>` them — the fresh `init` resets the active map
+>    to the new dated-current; prior active state is not preserved.
 
 Profile contents (what `save`/`create`/`use` move around): each profile is
 a directory of full per-tool config trees. Credential files (declared in
