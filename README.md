@@ -40,7 +40,8 @@ gh auth login                            # one-time
 gh auth setup-git                        # registers gh as git's credential helper
 pipx install git+https://github.com/smpnet74/switcher.git@v0.1.0
 
-# Latest main: substitute the @v0.1.0 ref
+# For a different version: replace @v0.1.0 with the desired tag
+# (or omit the @<ref> entirely to install the latest main).
 ```
 
 ### Windows
@@ -92,8 +93,9 @@ switcher which claude
 # Rename (auto-relinks if active)
 switcher rename experiment client-A
 
-# Delete a profile. Active profiles are always refused (use `switcher use
-# <other>` first); --force only suppresses the interactive y/N prompt.
+# Delete a profile. Active profiles are always refused — switch them with
+# `switcher use <other>` first. The --force flag only suppresses the
+# interactive y/N prompt; it does not bypass the active-profile check.
 switcher delete old-profile
 switcher delete old-profile --force
 
