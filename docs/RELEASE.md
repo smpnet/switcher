@@ -95,7 +95,7 @@ The following are deliberately excluded from `release.yml`. Future-you / new con
 
 ## Workflow internals (when the pipeline misbehaves)
 
-`release.yml` runs ten steps in order. If a release fails, the failed step name in the workflow log tells you what went wrong:
+`release.yml` runs twelve steps in order. If a release fails, the failed step name in the workflow log tells you what went wrong:
 
 | Step | Failure mode | What to check |
 |---|---|---|
@@ -104,8 +104,10 @@ The following are deliberately excluded from `release.yml`. Future-you / new con
 | Verify tag is on main | Tag points at a commit not on `main` | Stray branch HEAD or typo'd SHA when tagging; retag pointing at a `main` commit |
 | Setup pixi | Pixi setup composite action broke | Check `.github/actions/setup-pixi-pinned/action.yml` for changes; check pixi version pin |
 | Re-run validation | A test or lint check failed on the tagged commit | Drift between merged commit and tagged commit — investigate what changed |
+| Compute expected version from tag | Shouldn't fail (deterministic sed against an already-shape-validated tag) | If it does, an upstream regex change let a malformed tag through, or the `sed` substitutions aren't covering a new prerelease shape |
 | Build artifacts | `pixi run build` failed | Most likely a hatch-vcs config issue or fetch-depth problem; check the build logs |
 | Verify dist contents | `dist/` doesn't contain exactly one wheel and one sdist | `python -m build` regression or hatchling/hatch-vcs config drift dropped one of the two artifact shapes |
+| Verify artifact version matches tag | Wheel or sdist filename version doesn't match the expected version derived from `GITHUB_REF_NAME` | hatch-vcs picked up the wrong tag (most likely cause: same-commit dual-tag ambiguity in a re-run, or the `fallback-version` activated because tag history was unreachable). Inspect the build logs for what version hatch-vcs resolved |
 | Wheel install smoke test | Wheel installs but `switcher version` mismatches filename, or `switcher tools` fails | Packaging issue: missing builtin TOMLs, wrong entry point, broken dep |
 | Determine prerelease flag | Shouldn't fail (deterministic regex) | If it does, the regex itself has a typo |
 | Create or update GitHub Release | `gh release create` / `gh release edit` returned an error | Check `permissions: contents: write` is still on the workflow; check `GH_TOKEN` env on the step |
