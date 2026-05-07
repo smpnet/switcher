@@ -45,8 +45,10 @@ verify-windows-strict = "python scripts/verify_windows_paths.py --strict"
 # make the assertion deterministic first).
 verify-junction = "python scripts/verify_junction.py"
 
-# Aggregate of all validation tasks except build. Used by the release workflow
-# (release.yml) which runs check + build separately. The CI matrix still calls
-# `pixi run ci` (which is now check + build) so its behavior is unchanged.
+# Same set of CI-gated validation tasks as `ci` minus the build step. Used by
+# the release workflow (release.yml) which runs check + build separately, so
+# without splitting the build would run twice. (verify-junction stays out of
+# both check and ci -- see its task block above for why.) The CI matrix still
+# calls `pixi run ci` (= check + build), so its behavior is unchanged.
 check = { depends-on = ["lint", "typecheck", "test", "test-integration", "test-e2e", "verify-windows"] }
 ci = { depends-on = ["check", "build"] }
