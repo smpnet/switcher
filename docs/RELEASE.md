@@ -92,4 +92,4 @@ The following are deliberately excluded from `release.yml`. Future-you / new con
 | Verify dist contents | `dist/` doesn't contain exactly one wheel and one sdist | `python -m build` regression or hatchling/hatch-vcs config drift dropped one of the two artifact shapes |
 | Wheel install smoke test | Wheel installs but `switcher version` mismatches filename, or `switcher tools` fails | Packaging issue: missing builtin TOMLs, wrong entry point, broken dep |
 | Determine prerelease flag | Shouldn't fail (deterministic regex) | If it does, the regex itself has a typo |
-| Create GitHub Release | `gh release create` returned an error | Check `permissions: contents: write` is still on the workflow; check `GH_TOKEN` env on the step |
+| Create or update GitHub Release | `gh release create` / `gh release edit` returned an error | Check `permissions: contents: write` is still on the workflow; check `GH_TOKEN` env on the step |

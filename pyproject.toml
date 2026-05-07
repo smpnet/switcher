@@ -57,6 +57,21 @@ addopts = "-ra"
 
 [tool.hatch.version]
 source = "vcs"
+# Defensive default for environments where `git describe --tags` cannot
+# resolve (e.g. installing from a `git archive` tarball, shallow clones
+# without tag history). Production wheels are built from tag pushes
+# inside release.yml, where this never fires.
+fallback-version = "0.0.0+unknown"
+
+# Note on pixi.lock churn: the local `switcher` package entry in pixi.lock
+# carries the hatch-vcs-derived dev-marker version
+# (e.g. 0.1.2.dev3+g<sha>.dYYYYMMDD). Re-resolving the lockfile on a new
+# commit will rewrite that one line, even when no dependencies have moved.
+# This is the intentional trade-off for git-tag-derived versioning per the
+# v0.1.2 design spec §2 — the alternative (literal `version = "X.Y.Z"`)
+# reintroduces the bump-then-tag coordination footgun. Reviewers should
+# treat a single-line pixi.lock diff that only updates the switcher version
+# as benign churn, not a dependency change.
 
 [tool.hatch.build.hooks.vcs]
 version-file = "src/switcher/_version.py"

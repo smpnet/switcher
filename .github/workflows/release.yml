@@ -130,17 +130,11 @@ jobs:
       # TOMLs (claude.toml, copilot.toml) are present in the wheel.
       - name: Wheel install smoke test
         run: |
-          # `pixi run build` produces exactly one wheel; if dist/ ever contains
-          # more (stale state, debug artifacts, accidental cross-build), the
-          # rest of this step would silently misbehave because dist/*.whl would
-          # expand to multiple paths. Fail fast and loud instead.
+          # The "Verify dist contents" step above already enforces exactly
+          # one wheel and one sdist before we get here — no need for a
+          # second guard. Just resolve the single wheel path.
           shopt -s nullglob
           WHEELS=(dist/*.whl)
-          if [[ "${#WHEELS[@]}" -ne 1 ]]; then
-            echo "::error::expected exactly 1 wheel in dist/, found ${#WHEELS[@]}"
-            ls -la dist/
-            exit 1
-          fi
           WHEEL_PATH="${WHEELS[0]}"
           python -m venv /tmp/smoke
           /tmp/smoke/bin/pip install "$WHEEL_PATH"
