@@ -660,6 +660,23 @@ def test_delete_active_profile_refuses(service: ProfileService) -> None:
         service.delete(name)
 
 
+def test_delete_active_profile_message_wording(service: ProfileService) -> None:
+    """Locks in the v0.1.2 wording: 'Switch to a different profile before deleting.'
+
+    The pre-v0.1.2 message said 'Switch them to a different profile...' — the 'them'
+    was awkward when only one tool was active. The new wording drops 'them' entirely;
+    the listed tool ids in the prior clause carry the antecedent.
+    """
+    name = service.init()  # name is active for everything
+
+    with pytest.raises(ProfileIsActiveError) as exc_info:
+        service.delete(name)
+
+    message = str(exc_info.value)
+    assert "Switch to a different profile before deleting." in message
+    assert "Switch them to" not in message  # explicit negative — the old wording must be gone
+
+
 def test_delete_unknown_raises(service: ProfileService) -> None:
     service.init()
     with pytest.raises(UnknownProfileError):

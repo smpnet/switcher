@@ -377,6 +377,6 @@ class ProfileService:
         if active_for:
             raise ProfileIsActiveError(
                 f"profile {name!r} is active for: {', '.join(active_for)}. "
-                f"Switch them to a different profile before deleting."
+                f"Switch to a different profile before deleting."
             )
         self._store.delete(name)
