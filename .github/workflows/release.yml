@@ -136,7 +136,12 @@ jobs:
           shopt -s nullglob
           WHEELS=(dist/*.whl)
           WHEEL_PATH="${WHEELS[0]}"
-          python -m venv /tmp/smoke
+          # Use pixi run python so the smoke-test venv is created with the
+          # pixi-pinned interpreter (Python 3.13.13 currently), not the
+          # runner's ambient python. Runner images drift; the project
+          # pins Python explicitly to avoid that drift in matrix CI, and
+          # the smoke test should match.
+          pixi run python -m venv /tmp/smoke
           /tmp/smoke/bin/pip install "$WHEEL_PATH"
           INSTALLED=$(/tmp/smoke/bin/switcher version | sed -E 's/^switcher v//')
           # PEP 427 wheel filename: {name}-{version}(-{build})?-{python}-{abi}-{platform}.whl

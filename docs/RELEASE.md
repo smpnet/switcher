@@ -16,7 +16,7 @@ The workflow builds and publishes automatically; no further manual steps. The Gi
 
 > **Do not use `git push --tags`.** It pushes every local tag, which can accidentally trigger the release workflow on stale or experimental tags that happen to be sitting in the local repo (especially after RCs and hotfixes accumulate). Push the exact tag, every time.
 
-## Pre-release recipe
+## Prerelease recipe
 
 For a release candidate, append `-rc1`, `-rc2`, etc. (or `-alpha1` / `-beta1`):
 
