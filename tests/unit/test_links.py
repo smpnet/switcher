@@ -348,9 +348,8 @@ def test_remove_link_drops_a_broken_link(tmp_path: Path) -> None:
     remove_link(link)
     # `link.exists()` is vacuously False for a broken link (it follows
     # the dangling target), so it's not evidence of removal. `lstat`
-    # inspects the link entry itself — it must now raise.
+    # inspects the link entry itself — its raise is the proof. (Both
+    # `is_symlink()` and `os.path.isjunction()` ultimately call lstat
+    # too, so the lstat check subsumes them.)
     with pytest.raises(FileNotFoundError):
         link.lstat()
-    assert not link.is_symlink()
-    if IS_WINDOWS:
-        assert not os.path.isjunction(link)

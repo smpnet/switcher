@@ -128,8 +128,12 @@ def remove_link(link_path: Path) -> None:
         try:
             link_path.rmdir()
             return
-        except OSError:
-            pass  # truly missing or not a junction — fall through to raise
+        except FileNotFoundError:
+            pass  # truly missing — fall through to raise the strict error
+        # Other OSErrors (PermissionError, sharing violations, ACL issues)
+        # propagate: this helper is for cleanup, and silently masking an
+        # operational failure would defeat the unhappy-path teardown
+        # case the docstring promises.
     if link_path.is_symlink():
         link_path.unlink(missing_ok=True)
         return
