@@ -11,7 +11,7 @@ from switcher.errors import (
     PathNotADirectoryError,
     ProfileTargetExistsError,
 )
-from switcher.links import IS_WINDOWS, link_dir, move_or_seed_dir, swap_link
+from switcher.links import IS_WINDOWS, link_dir, move_or_seed_dir, remove_link, swap_link
 
 
 def test_link_dir_creates_link_to_directory(tmp_path: Path) -> None:
@@ -286,3 +286,49 @@ def test_move_or_seed_rejects_existing_junction_target(tmp_path: Path) -> None:
     link_dir(real, target)
     with pytest.raises(ProfileTargetExistsError):
         move_or_seed_dir(live, target)
+
+
+# --- remove_link helper (v0.1.3) ----------------------------------------------
+
+
+def _make_symlink(tmp_path: Path) -> tuple[Path, Path]:
+    target = tmp_path / "real"
+    target.mkdir()
+    link = tmp_path / "link"
+    # `link_dir` is the public surface that branches to junctions on Windows
+    # and symlinks on POSIX — same behavior as the prior-art Windows-only
+    # tests above (e.g. `test_move_or_seed_rejects_existing_junction_target`).
+    link_dir(target, link)
+    return target, link
+
+
+def test_remove_link_drops_a_symlink_or_junction(tmp_path: Path) -> None:
+    target, link = _make_symlink(tmp_path)
+    remove_link(link)
+    assert not link.exists() and not link.is_symlink()
+    if IS_WINDOWS:
+        assert not os.path.isjunction(link)
+    # The target itself is unaffected.
+    assert target.is_dir()
+
+
+def test_remove_link_refuses_a_real_directory(tmp_path: Path) -> None:
+    real_dir = tmp_path / "realdir"
+    real_dir.mkdir()
+    with pytest.raises(PathNotADirectoryError):
+        remove_link(real_dir)
+    assert real_dir.is_dir()  # untouched
+
+
+def test_remove_link_refuses_a_regular_file(tmp_path: Path) -> None:
+    f = tmp_path / "file.txt"
+    f.write_text("content")
+    with pytest.raises(PathNotADirectoryError):
+        remove_link(f)
+    assert f.is_file()
+
+
+def test_remove_link_refuses_a_missing_path(tmp_path: Path) -> None:
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(PathNotADirectoryError):
+        remove_link(missing)

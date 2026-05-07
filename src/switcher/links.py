@@ -103,6 +103,25 @@ def _force_remove(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def remove_link(link_path: Path) -> None:
+    """Remove a symlink (POSIX) or junction (Windows). Raise on anything else.
+
+    Cross-platform link removal: `Path.unlink` invokes `DeleteFile` on
+    Windows, which refuses junction reparse points; `Path.rmdir`
+    invokes `RemoveDirectory`, which accepts them. POSIX symlinks always
+    go through `unlink`. Anything that's not a link (real dir, regular
+    file, missing) raises `PathNotADirectoryError` — callers that need
+    "remove anything" should use `_force_remove` instead.
+    """
+    if IS_WINDOWS and os.path.isjunction(link_path):
+        link_path.rmdir()
+        return
+    if link_path.is_symlink():
+        link_path.unlink()
+        return
+    raise PathNotADirectoryError(f"{link_path} is not a symlink or junction; refusing to remove")
+
+
 def swap_link(target: Path, link_path: Path) -> None:
     """Replace any existing link at `link_path` with a link to `target`.
 
