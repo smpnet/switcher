@@ -1,0 +1,140 @@
+name: Release
+
+# Triggers on tag push only — the tag IS the release. No workflow_dispatch
+# (would split the source-of-truth across the tag and the workflow input)
+# and no `release: types: [created]` (would split the source-of-truth across
+# the tag and the manually-created Release object).
+on:
+  push:
+    tags: ['v*']
+
+# `gh release create` needs write access to contents to create the Release
+# object and upload artifacts. Workflow-level permissions apply to all jobs
+# (there's only one); explicit declaration is required because the default
+# token has only read.
+permissions:
+  contents: write
+
+# `cancel-in-progress: false` because cancelling a release mid-flight leaves
+# a partially-uploaded Release object behind. Keyed on github.ref so the same
+# tag never has two concurrent runs; different tags don't collide.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    timeout-minutes: 20
+    # Linux only — wheel is pure-Python (identical bytes regardless of build
+    # OS). The matrix CI on the merged commit already exercised cross-OS
+    # behavior; re-validating on the tagged commit doesn't add signal.
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to the same SHA as ci.yml to keep one source of truth for the
+      # action version. fetch-depth: 0 is required for hatch-vcs to derive
+      # the version from `git describe --tags`.
+      - name: Checkout at tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+
+      # Cheapest gate first — string match against the tag name. Hard-rejects
+      # malformed tags (vfoo, v0.1, v0.1.0.0, v0.1.2-RC1 with capital R, v0.1.2-pre)
+      # before any other release machinery runs. Distinguishes "intentional
+      # prerelease" from "tag typo" — the latter never produces an artifact.
+      # The accepted shapes are vX.Y.Z (stable) or vX.Y.Z-(rc|alpha|beta)N
+      # (prerelease). Other suffixes are deliberately not supported here;
+      # extend this regex if a new prerelease shape becomes needed.
+      - name: Validate tag shape
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)[0-9]+)?$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match expected shape: vX.Y.Z or vX.Y.Z-(rc|alpha|beta)N"
+            exit 1
+          fi
+
+      # Closes the failure mode where the tag points at a stray branch HEAD or
+      # a typo'd SHA. Tag protection (configured separately as a tag ruleset)
+      # restricts who-can-tag and whether-tags-can-be-deleted, but does not
+      # restrict where-the-tag-points. This check does.
+      #
+      # Two fetch/compare details worth knowing:
+      #   1. `git fetch origin main:refs/remotes/origin/main` updates the
+      #      remote-tracking ref explicitly. Plain `git fetch origin main`
+      #      only updates FETCH_HEAD, which would leave refs/remotes/origin/main
+      #      stale or absent in the workflow's fresh clone.
+      #   2. We compare HEAD (which actions/checkout has already pointed at the
+      #      tag-resolved commit) rather than $GITHUB_SHA — HEAD is unambiguously
+      #      a commit SHA after checkout, sidestepping any annotated-tag-object-
+      #      vs-commit ambiguity.
+      # Full fetch (no --depth) is used: release safety justifies the extra
+      # seconds, and a shallow fetch could miss the merge-base relationship
+      # for older tags.
+      - name: Verify tag is on main
+        run: |
+          git fetch origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main \
+            || { echo "::error::tag $GITHUB_REF_NAME is not on main"; exit 1; }
+
+      - name: Setup pixi
+        uses: ./.github/actions/setup-pixi-pinned
+
+      # Defense-in-depth re-run on the tagged commit. Catches drift between
+      # when main CI went green and when the tag was pushed (another merge
+      # landed, an admin bypass force-pushed, a runner image updated). Calls
+      # `pixi run check` (not `pixi run ci`) so build doesn't run twice;
+      # build is the next step.
+      - name: Re-run validation on tagged commit
+        run: pixi run check
+
+      - name: Build artifacts
+        run: pixi run build
+
+      # Catches packaging-time breakage that `pixi run check` cannot — wrong
+      # entry point, missing builtin TOMLs in the wheel, dep typo that only
+      # surfaces on a fresh install.
+      #
+      # `switcher version` outputs "switcher v<version>" (per cli.py line 80) —
+      # strip the "switcher v" prefix before comparing to the wheel filename
+      # version (which has no prefix). Both pass through hatch-vcs / PEP 440
+      # normalization the same way, so an exact string match after stripping
+      # is the right contract.
+      #
+      # `switcher tools` exercises the entry point and confirms the built-in
+      # TOMLs (claude.toml, copilot.toml) are present in the wheel.
+      - name: Wheel install smoke test
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          INSTALLED=$(/tmp/smoke/bin/switcher version | sed -E 's/^switcher v//')
+          WHEEL=$(basename dist/*.whl | sed -E 's/^switcher-(.+)-py3-none-any\.whl$/\1/')
+          if [[ "$INSTALLED" != "$WHEEL" ]]; then
+            echo "::error::version mismatch: installed=$INSTALLED, wheel=$WHEEL"
+            exit 1
+          fi
+          /tmp/smoke/bin/switcher tools >/dev/null
+
+      # Stable allow-list pattern: only ^vX.Y.Z$ (no suffix, no metadata)
+      # becomes a "Latest release". Anything else that survived the tag-shape
+      # gate (i.e. -(rc|alpha|beta)N suffixes) is published as prerelease.
+      # Bias is conservative: anything not matching the strict stable pattern
+      # defaults to less visibility, not more.
+      - name: Determine prerelease flag
+        id: prerelease
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=--prerelease" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --generate-notes builds the release body from PRs and commits since
+      # the previous tag. Conventional Commits (used throughout the repo)
+      # keep the auto-output legible. CHANGELOG.md is deliberately deferred
+      # until the going-public boundary; see docs/RELEASE.md.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --generate-notes \
+            ${{ steps.prerelease.outputs.flag }}
