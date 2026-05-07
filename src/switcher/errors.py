@@ -61,3 +61,15 @@ class ToolHasNoActiveProfileError(SwitcherError):
 
 class StorageError(SwitcherError):
     """Raised on JSON corruption, IO failures, or other storage-layer problems."""
+
+
+class UninstallPreflightError(SwitcherError):
+    """`uninstall` pre-flight rejected the run (state corruption, missing data, or unsafe combination)."""
+
+
+class RescanCaptureError(SwitcherError):
+    """`rescan` per-tool capture failed and (where applicable) rollback also failed."""
+
+
+class PruneError(SwitcherError):
+    """`prune` orphan walk failed for a non-classification reason (e.g. permissions)."""
