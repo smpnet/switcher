@@ -57,6 +57,16 @@ jobs:
       # restricts who-can-tag and whether-tags-can-be-deleted, but does not
       # restrict where-the-tag-points. This check does.
       #
+      # The check is `--is-ancestor`, not exact-tip equality against
+      # `refs/remotes/origin/main`. That's deliberate: back-tagging an older
+      # `main` commit is a legitimate (if rare) operation — e.g. cutting a
+      # hotfix from a known-good earlier commit when newer `main` work isn't
+      # yet ready to ship. Branch protection on `main` enforces forward-only
+      # history (no force-push, no deletion), so any ancestor of
+      # `refs/remotes/origin/main` is by construction a commit that passed PR
+      # review and CI at the time it merged. The intent of this gate is "tag
+      # is on main", not "tag is at the current tip of main".
+      #
       # Two fetch/compare details worth knowing:
       #   1. `git fetch origin main:refs/remotes/origin/main` updates the
       #      remote-tracking ref explicitly. Plain `git fetch origin main`
@@ -135,7 +145,22 @@ jobs:
           python -m venv /tmp/smoke
           /tmp/smoke/bin/pip install "$WHEEL_PATH"
           INSTALLED=$(/tmp/smoke/bin/switcher version | sed -E 's/^switcher v//')
-          WHEEL=$(basename "$WHEEL_PATH" | sed -E 's/^switcher-(.+)-py3-none-any\.whl$/\1/')
+          # PEP 427 wheel filename: {name}-{version}(-{build})?-{python}-{abi}-{platform}.whl
+          # PEP 440-normalized versions never contain '-', so field 2 is
+          # always the version. Using `cut -s` instead of a regex is robust
+          # against future tag changes (build tag addition, abi/platform
+          # variants) and produces empty output if the filename has no '-'
+          # at all — which is what the explicit parse-failure guard below
+          # catches. This avoids the previous failure mode where a sed
+          # mismatch silently left $WHEEL as the full filename and the
+          # downstream check produced a misleading "version mismatch"
+          # error instead of "failed to parse wheel filename".
+          WHEEL_NAME=$(basename "$WHEEL_PATH")
+          WHEEL=$(echo "$WHEEL_NAME" | cut -s -d- -f2)
+          if [[ -z "$WHEEL" ]]; then
+            echo "::error::failed to parse wheel filename: $WHEEL_NAME"
+            exit 1
+          fi
           if [[ "$INSTALLED" != "$WHEEL" ]]; then
             echo "::error::version mismatch: installed=$INSTALLED, wheel=$WHEEL"
             exit 1
