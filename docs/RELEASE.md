@@ -88,7 +88,7 @@ For outside contributors: "which release does my PR ship in?" → whichever rele
 The following are deliberately excluded from `release.yml`. Future-you / new contributors should not re-implement them without revisiting why they're absent:
 
 - **Tag protection on `v*`** — already configured as a tag ruleset (Settings → Rules → Rulesets → tag ruleset with Restrict creations/updates/deletions; admin bypass available). GitHub Team plan only.
-- **Branch protection on `main`** — already configured (PR-required, status checks for the test matrix on ubuntu/macos/windows, conversation resolution, no force push, no deletion).
+- **Branch protection on `main`** — already configured (PR-required, status checks for the test matrix on Ubuntu/macOS/Windows, conversation resolution, no force push, no deletion).
 - **PyPI publishing** — deferred until the repo goes public. Switcher is currently distributed via `pipx install git+...` with the install commands documented in the README.
 - **Provenance / signing (SLSA, sigstore)** — deferred until the repo goes public; folded into the v0.1.5 security review.
 - **`CHANGELOG.md`** — deliberately not maintained at 0.1.x velocity. Release notes are auto-generated from PR/commit history via `gh release create --generate-notes`. Re-evaluate at the going-public boundary.
