@@ -54,8 +54,15 @@ jobs:
     steps:
       # Pinned to immutable commit SHA (= tag v4) for the same supply-chain
       # hardening reason setup-pixi is pinned in run-pixi-ci/action.yml;
-      # bump on the v0.2.0 security review.
+      # bump on the v0.1.5 security review.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          # hatch-vcs reads `git describe --tags` at build time to derive the
+          # package version. The CI build step (inside `pixi run ci`) needs
+          # full tag history; a shallow checkout produces a 0.0.0+local-style
+          # version and breaks the build. release.yml also has fetch-depth: 0
+          # for the same reason.
+          fetch-depth: 0
       - uses: ./.github/actions/run-pixi-ci
 
   # Self-hosted Windows runner: provisioned-tool sanity check ONLY.
@@ -78,7 +85,7 @@ jobs:
   #      in the repo's Settings -> Secrets and variables -> Actions ->
   #      Variables tab when (and only when) a runner is actually online.
   #      The decision about what to do with this job longer-term lives
-  #      in docs/v0.1.2.md ("Re-evaluate self-hosted Windows CI job").
+  #      in docs/v0.1.5.md ("Re-evaluate self-hosted Windows CI job").
   #   2. !github.event.repository.fork restricts the job to the canonical
   #      (non-fork) repo so a fork push doesn't queue a job onto a
   #      [self-hosted, Windows, X64] runner that exists only in the
@@ -98,8 +105,14 @@ jobs:
     steps:
       # checkout pinned to immutable commit SHA (= tag v4) for the same
       # supply-chain hardening reason setup-pixi is pinned; bump on the
-      # v0.2.0 security review.
+      # v0.1.5 security review.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          # See the matrix-job comment above — hatch-vcs needs full tag
+          # history. verify-windows-strict doesn't itself build, but
+          # consistency across all checkouts in this workflow is the
+          # right default.
+          fetch-depth: 0
       # Pinned setup-pixi lives in setup-pixi-pinned/action.yml so this
       # job and run-pixi-ci/ share one source of truth for the SHA +
       # pixi-version, preventing silent bootstrap drift between jobs.
