@@ -291,7 +291,7 @@ def test_move_or_seed_rejects_existing_junction_target(tmp_path: Path) -> None:
 # --- remove_link helper (v0.1.3) ----------------------------------------------
 
 
-def _make_symlink(tmp_path: Path) -> tuple[Path, Path]:
+def _make_dir_link(tmp_path: Path) -> tuple[Path, Path]:
     target = tmp_path / "real"
     target.mkdir()
     link = tmp_path / "link"
@@ -303,7 +303,7 @@ def _make_symlink(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_remove_link_drops_a_symlink_or_junction(tmp_path: Path) -> None:
-    target, link = _make_symlink(tmp_path)
+    target, link = _make_dir_link(tmp_path)
     remove_link(link)
     assert not link.exists() and not link.is_symlink()
     if IS_WINDOWS:
@@ -332,3 +332,20 @@ def test_remove_link_refuses_a_missing_path(tmp_path: Path) -> None:
     missing = tmp_path / "does-not-exist"
     with pytest.raises(PathNotADirectoryError):
         remove_link(missing)
+
+
+def test_remove_link_drops_a_broken_link(tmp_path: Path) -> None:
+    """Cleanup primitive must handle dangling links — the exact case it's
+    designed for during partial/unhappy-path teardown. POSIX `is_symlink()`
+    works on broken symlinks; Windows `os.path.isjunction()` works on
+    broken junctions because the reparse point persists even after the
+    target directory is removed."""
+    target, link = _make_dir_link(tmp_path)
+    # Break the link by removing the target. The link reparse point/
+    # symlink entry remains; only the target dir is gone.
+    target.rmdir()
+    remove_link(link)
+    assert not link.exists()
+    assert not link.is_symlink()
+    if IS_WINDOWS:
+        assert not os.path.isjunction(link)
