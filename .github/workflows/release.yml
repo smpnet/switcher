@@ -166,14 +166,31 @@ jobs:
       # during artifact upload. Detect-and-upload-with-clobber on the rerun
       # path makes this step rerun-safe — re-running a failed workflow
       # finishes the publish instead of getting stuck behind manual cleanup.
+      #
+      # Notes refresh on rerun: the rc1 fix recipe in docs/RELEASE.md uses
+      # `git tag -fa` + `git push --force` to force-move a prerelease tag
+      # at a new commit. On that rerun, --clobber takes care of the
+      # artifacts, but the existing Release notes still describe the OLD
+      # commit range. `gh release edit` doesn't expose --generate-notes
+      # directly, so we hit the API endpoint that produces the same body
+      # and feed it via --notes. Result: fresh notes on every rerun, not
+      # just fresh artifacts.
+      #
+      # PRERELEASE_FLAG is routed through env (not interpolated directly
+      # into the shell script) per GitHub's script-injection hardening
+      # guidance; the value is deterministic, but the pattern matters.
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          PRERELEASE_FLAG: ${{ steps.prerelease.outputs.flag }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            notes=$(gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+                      -f tag_name="$GITHUB_REF_NAME" --jq .body)
+            gh release edit "$GITHUB_REF_NAME" --notes "$notes"
           else
             gh release create "$GITHUB_REF_NAME" dist/* \
               --generate-notes \
-              ${{ steps.prerelease.outputs.flag }}
+              $PRERELEASE_FLAG
           fi
