@@ -103,10 +103,22 @@ jobs:
       # TOMLs (claude.toml, copilot.toml) are present in the wheel.
       - name: Wheel install smoke test
         run: |
+          # `pixi run build` produces exactly one wheel; if dist/ ever contains
+          # more (stale state, debug artifacts, accidental cross-build), the
+          # rest of this step would silently misbehave because dist/*.whl would
+          # expand to multiple paths. Fail fast and loud instead.
+          shopt -s nullglob
+          WHEELS=(dist/*.whl)
+          if [[ "${#WHEELS[@]}" -ne 1 ]]; then
+            echo "::error::expected exactly 1 wheel in dist/, found ${#WHEELS[@]}"
+            ls -la dist/
+            exit 1
+          fi
+          WHEEL_PATH="${WHEELS[0]}"
           python -m venv /tmp/smoke
-          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/pip install "$WHEEL_PATH"
           INSTALLED=$(/tmp/smoke/bin/switcher version | sed -E 's/^switcher v//')
-          WHEEL=$(basename dist/*.whl | sed -E 's/^switcher-(.+)-py3-none-any\.whl$/\1/')
+          WHEEL=$(basename "$WHEEL_PATH" | sed -E 's/^switcher-(.+)-py3-none-any\.whl$/\1/')
           if [[ "$INSTALLED" != "$WHEEL" ]]; then
             echo "::error::version mismatch: installed=$INSTALLED, wheel=$WHEEL"
             exit 1
@@ -131,10 +143,20 @@ jobs:
       # the previous tag. Conventional Commits (used throughout the repo)
       # keep the auto-output legible. CHANGELOG.md is deliberately deferred
       # until the going-public boundary; see docs/RELEASE.md.
-      - name: Create GitHub Release
+      #
+      # Idempotency: `gh release create` fails with "release already exists"
+      # if the Release object was created on a previous run that then failed
+      # during artifact upload. Detect-and-upload-with-clobber on the rerun
+      # path makes this step rerun-safe — re-running a failed workflow
+      # finishes the publish instead of getting stuck behind manual cleanup.
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --generate-notes \
-            ${{ steps.prerelease.outputs.flag }}
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --generate-notes \
+              ${{ steps.prerelease.outputs.flag }}
+          fi
