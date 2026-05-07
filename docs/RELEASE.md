@@ -4,9 +4,12 @@ Operational doc for cutting a release. Recipe-first; rationale below.
 
 ## How to cut a release
 
-Three commands:
+Sync local `main` first, then tag and push:
 
 ```bash
+git fetch origin
+git switch main
+git pull --ff-only
 git tag -a v0.1.X -m "v0.1.X"
 git push origin v0.1.X
 # then watch the Release workflow run on the Actions tab
@@ -14,13 +17,20 @@ git push origin v0.1.X
 
 The workflow builds and publishes automatically; no further manual steps. The GitHub Release object will appear under [Releases](../../releases) with the `.whl` and `.tar.gz` attached and auto-generated notes.
 
+> **Always sync first.** The release workflow only verifies that the tag commit is *an ancestor of* `main` (not that it equals the tip), so a stale local `main` will publish whatever older commit was checked out. The fetch + ff-only pull preamble is the safe default for every recipe in this doc.
+>
+> **Intentional back-tagging is an explicit exception.** If you specifically want to release an older `main` commit (for instance, to ship a hotfix from a known-good earlier point when newer work isn't ready), skip the sync, check out the target commit, and tag from there. The ancestor check in `release.yml` allows it; the burden is on the operator to know they're doing it.
+
 > **Do not use `git push --tags`.** It pushes every local tag, which can accidentally trigger the release workflow on stale or experimental tags that happen to be sitting in the local repo (especially after RCs and hotfixes accumulate). Push the exact tag, every time.
 
 ## Prerelease recipe
 
-For a release candidate, append `-rc1`, `-rc2`, etc. (or `-alpha1` / `-beta1`):
+For a release candidate, append `-rc1`, `-rc2`, etc. (or `-alpha1` / `-beta1`). Sync `main` first (same reason as above):
 
 ```bash
+git fetch origin
+git switch main
+git pull --ff-only
 git tag -a v0.1.X-rc1 -m "v0.1.X-rc1"
 git push origin v0.1.X-rc1
 ```
@@ -29,9 +39,12 @@ The release workflow detects the suffix and creates the Release with the **Pre-r
 
 **For the first release after meaningful changes to `release.yml`, `pyproject.toml`'s build configuration, or `pixi.toml`'s task aggregates, cut `vX.Y.Z-rc1` first to validate the pipeline before the stable tag.** Workflow bugs surface on the prerelease, not on the public stable release.
 
-If the rc1 build is broken, fix on `main`, then force-move the tag (keep it annotated — `-fa` not `-f`, otherwise you silently degrade to a lightweight tag):
+If the rc1 build is broken, fix on `main`, sync, then force-move the tag (keep it annotated — `-fa` not `-f`, otherwise you silently degrade to a lightweight tag):
 
 ```bash
+git fetch origin
+git switch main
+git pull --ff-only
 git tag -fa v0.1.X-rc1 -m "v0.1.X-rc1"
 git push --force origin v0.1.X-rc1
 ```
@@ -40,9 +53,12 @@ git push --force origin v0.1.X-rc1
 
 ## Hotfix recipe
 
-Bug found post-release? Fix on `main` via a normal PR, then tag the next patch version and ship. For example, if v0.1.2 just shipped and you're cutting v0.1.3 as a hotfix:
+Bug found post-release? Fix on `main` via a normal PR, then sync, tag the next patch version, and ship. For example, if v0.1.2 just shipped and you're cutting v0.1.3 as a hotfix:
 
 ```bash
+git fetch origin
+git switch main
+git pull --ff-only
 git tag -a v0.1.3 -m "v0.1.3"
 git push origin v0.1.3
 ```

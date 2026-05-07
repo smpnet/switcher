@@ -96,6 +96,24 @@ jobs:
       - name: Re-run validation on tagged commit
         run: pixi run check
 
+      # Compute the expected package version from the triggering tag.
+      # Maps GITHUB_REF_NAME (validated by 'Validate tag shape' above to
+      # vX.Y.Z[-(rc|alpha|beta)N]) to a PEP 440-canonical version string:
+      #   v0.1.2          -> 0.1.2
+      #   v0.1.2-rc1      -> 0.1.2rc1
+      #   v0.1.2-alpha1   -> 0.1.2a1
+      #   v0.1.2-beta1    -> 0.1.2b1
+      # PEP 440 normalizes alpha->a and beta->b; rc stays as rc. The
+      # tag-shape regex makes these suffixes mutually exclusive, so sed
+      # ordering doesn't matter. Used by 'Verify artifact version matches
+      # tag' below.
+      - name: Compute expected version from tag
+        id: expected_version
+        run: |
+          EXPECTED=$(echo "$GITHUB_REF_NAME" | sed -E -e 's/^v//' -e 's/-alpha/a/' -e 's/-beta/b/' -e 's/-rc/rc/')
+          echo "version=$EXPECTED" >> "$GITHUB_OUTPUT"
+          echo "Expected package version for tag $GITHUB_REF_NAME: $EXPECTED"
+
       - name: Build artifacts
         run: pixi run build
 
@@ -113,6 +131,55 @@ jobs:
           if [[ ${#wheels[@]} -ne 1 || ${#sdists[@]} -ne 1 ]]; then
             echo "::error::expected exactly 1 wheel and 1 sdist in dist/, got ${#wheels[@]} wheel(s) and ${#sdists[@]} sdist(s)"
             ls -la dist/ >&2
+            exit 1
+          fi
+
+      # Verify the built artifact's version matches the triggering tag.
+      # Catches two failure modes BEFORE the artifact ever reaches a
+      # GitHub Release object:
+      #
+      #   1. fallback-version (0.0.0+unknown) silently activates if tag
+      #      history is unreachable in CI (fetch-depth regression,
+      #      hatch-vcs behavior change). Without this gate, a
+      #      0.0.0+unknown wheel could publish on a v0.1.2 release.
+      #
+      #   2. Same-commit dual-tag ambiguity. RELEASE.md's RC dogfood
+      #      path encourages tagging both vX.Y.Z-rc1 and vX.Y.Z on
+      #      the same commit (rc1 validates -> stable on the same SHA).
+      #      `git describe --tags --exact-match` returns the most
+      #      recently CREATED tag on a commit, not necessarily the
+      #      one that triggered THIS workflow run. So a re-run of
+      #      the rc1 workflow after v0.1.2 has been added could
+      #      build version `0.1.2` and try to publish it to the
+      #      v0.1.2-rc1 Release. This gate fails loudly instead.
+      #
+      # Why post-build verification rather than env-var pinning at the
+      # source: SETUPTOOLS_SCM_PRETEND_VERSION (and its hatch-vcs
+      # equivalents) are NOT propagated through `python -m build`'s
+      # isolated build environment. Verified locally. Switching to
+      # `--no-isolation` would trade reproducibility for env-var
+      # propagation. Verifying the built artifact instead achieves the
+      # same end-state guarantee — no wrong-version artifact ever
+      # publishes — without changing the build model.
+      - name: Verify artifact version matches tag
+        env:
+          EXPECTED: ${{ steps.expected_version.outputs.version }}
+        run: |
+          shopt -s nullglob
+          wheels=( dist/*.whl )
+          sdists=( dist/*.tar.gz )
+          WHEEL_NAME=$(basename "${wheels[0]}")
+          SDIST_NAME=$(basename "${sdists[0]}")
+          # PEP 427: wheel filename is {name}-{version}-{python}-{abi}-{platform}.whl
+          # PEP 625: sdist filename is {name}-{version}.tar.gz
+          WHEEL_VERSION=$(echo "$WHEEL_NAME" | cut -s -d- -f2)
+          SDIST_VERSION=$(echo "$SDIST_NAME" | sed -E 's/^switcher-(.+)\.tar\.gz$/\1/')
+          if [[ "$WHEEL_VERSION" != "$EXPECTED" ]]; then
+            echo "::error::wheel version drift: tag=$GITHUB_REF_NAME, expected=$EXPECTED, wheel=$WHEEL_VERSION"
+            exit 1
+          fi
+          if [[ "$SDIST_VERSION" != "$EXPECTED" ]]; then
+            echo "::error::sdist version drift: tag=$GITHUB_REF_NAME, expected=$EXPECTED, sdist=$SDIST_VERSION"
             exit 1
           fi
 
