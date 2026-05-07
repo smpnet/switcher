@@ -64,3 +64,13 @@ def test_prune_error_inherits_switcher_error():
 def test_uninstall_preflight_error_carries_message():
     err = UninstallPreflightError("test")
     assert str(err) == "test"
+
+
+def test_rescan_capture_error_carries_message():
+    err = RescanCaptureError("test")
+    assert str(err) == "test"
+
+
+def test_prune_error_carries_message():
+    err = PruneError("test")
+    assert str(err) == "test"
