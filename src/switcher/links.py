@@ -116,8 +116,22 @@ def remove_link(link_path: Path) -> None:
     if IS_WINDOWS and os.path.isjunction(link_path):
         link_path.rmdir()
         return
+    # Defensive Windows fallback for broken junctions on hosts where
+    # `os.path.isjunction` is unreliable — `_swap_link_windows` documents
+    # the same caveat. For a broken junction, `exists()` returns False
+    # (target is gone) and `is_symlink()` returns False (junctions are
+    # reparse points, not symlinks), so without this branch the helper
+    # would refuse to clean up exactly the case its docstring promises.
+    # `exists()` returning True for real dirs/files keeps the rejection
+    # path below safe from accidental removal.
+    if IS_WINDOWS and not link_path.exists() and not link_path.is_symlink():
+        try:
+            link_path.rmdir()
+            return
+        except OSError:
+            pass  # truly missing or not a junction — fall through to raise
     if link_path.is_symlink():
-        link_path.unlink()
+        link_path.unlink(missing_ok=True)
         return
     raise PathNotADirectoryError(f"{link_path} is not a symlink or junction; refusing to remove")
 

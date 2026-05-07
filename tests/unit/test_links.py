@@ -305,7 +305,8 @@ def _make_dir_link(tmp_path: Path) -> tuple[Path, Path]:
 def test_remove_link_drops_a_symlink_or_junction(tmp_path: Path) -> None:
     target, link = _make_dir_link(tmp_path)
     remove_link(link)
-    assert not link.exists() and not link.is_symlink()
+    assert not link.exists()
+    assert not link.is_symlink()
     if IS_WINDOWS:
         assert not os.path.isjunction(link)
     # The target itself is unaffected.
@@ -345,7 +346,11 @@ def test_remove_link_drops_a_broken_link(tmp_path: Path) -> None:
     # symlink entry remains; only the target dir is gone.
     target.rmdir()
     remove_link(link)
-    assert not link.exists()
+    # `link.exists()` is vacuously False for a broken link (it follows
+    # the dangling target), so it's not evidence of removal. `lstat`
+    # inspects the link entry itself — it must now raise.
+    with pytest.raises(FileNotFoundError):
+        link.lstat()
     assert not link.is_symlink()
     if IS_WINDOWS:
         assert not os.path.isjunction(link)
