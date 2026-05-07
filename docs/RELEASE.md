@@ -79,7 +79,7 @@ The following are deliberately excluded from `release.yml`. Future-you / new con
 
 ## Workflow internals (when the pipeline misbehaves)
 
-`release.yml` runs nine steps in order. If a release fails, the failed step name in the workflow log tells you what went wrong:
+`release.yml` runs ten steps in order. If a release fails, the failed step name in the workflow log tells you what went wrong:
 
 | Step | Failure mode | What to check |
 |---|---|---|
@@ -89,6 +89,7 @@ The following are deliberately excluded from `release.yml`. Future-you / new con
 | Setup pixi | Pixi setup composite action broke | Check `.github/actions/setup-pixi-pinned/action.yml` for changes; check pixi version pin |
 | Re-run validation | A test or lint check failed on the tagged commit | Drift between merged commit and tagged commit — investigate what changed |
 | Build artifacts | `pixi run build` failed | Most likely a hatch-vcs config issue or fetch-depth problem; check the build logs |
+| Verify dist contents | `dist/` doesn't contain exactly one wheel and one sdist | `python -m build` regression or hatchling/hatch-vcs config drift dropped one of the two artifact shapes |
 | Wheel install smoke test | Wheel installs but `switcher version` mismatches filename, or `switcher tools` fails | Packaging issue: missing builtin TOMLs, wrong entry point, broken dep |
 | Determine prerelease flag | Shouldn't fail (deterministic regex) | If it does, the regex itself has a typo |
 | Create GitHub Release | `gh release create` returned an error | Check `permissions: contents: write` is still on the workflow; check `GH_TOKEN` env on the step |
