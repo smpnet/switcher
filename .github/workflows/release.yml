@@ -89,6 +89,23 @@ jobs:
       - name: Build artifacts
         run: pixi run build
 
+      # Defensive shape check before publish. `python -m build` produces both
+      # a wheel and an sdist by default — but a hatchling/hatch-vcs config
+      # regression (or a future build-backend bug) could silently drop one.
+      # Without this gate, the next step's `dist/*.whl` install path would
+      # still pass and `gh release create dist/*` would publish an incomplete
+      # release. Assert exactly one of each shape before we go further.
+      - name: Verify dist contents
+        run: |
+          shopt -s nullglob
+          wheels=( dist/*.whl )
+          sdists=( dist/*.tar.gz )
+          if [[ ${#wheels[@]} -ne 1 || ${#sdists[@]} -ne 1 ]]; then
+            echo "::error::expected exactly 1 wheel and 1 sdist in dist/, got ${#wheels[@]} wheel(s) and ${#sdists[@]} sdist(s)"
+            ls -la dist/ >&2
+            exit 1
+          fi
+
       # Catches packaging-time breakage that `pixi run check` cannot — wrong
       # entry point, missing builtin TOMLs in the wheel, dep typo that only
       # surfaces on a fresh install.
