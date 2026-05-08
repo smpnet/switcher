@@ -382,6 +382,26 @@ def test_update_profile_tools_unknown_profile_raises(store: FileProfileStore) ->
         store.update_profile_tools("missing", {"claude": True})
 
 
+def test_update_profile_tools_wraps_read_oserror_as_storage_error(
+    store: FileProfileStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OSError on metadata.json read (PermissionError, transient ENOENT after
+    the exists() check, sharing violation) must surface as StorageError so
+    the layer's contract — only Switcher-flavored exceptions leak — holds."""
+    store.create("work", {"claude": True})
+
+    original = Path.read_text
+
+    def boom(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "metadata.json":
+            raise PermissionError("simulated read denial")
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", boom)
+    with pytest.raises(StorageError, match="simulated read denial"):
+        store.update_profile_tools("work", {"claude": True, "copilot": True})
+
+
 def test_update_profile_tools_preserves_unknown_metadata_keys(store: FileProfileStore) -> None:
     """Symmetric with config.json's unknown-key preservation: a forward-compat
     metadata field written by a newer version must survive a v0.1.3

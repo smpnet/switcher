@@ -292,9 +292,13 @@ class FileProfileStore:
         meta_path = self._metadata_path(name)
         if not meta_path.exists():
             raise UnknownProfileError(f"profile {name!r} not found")
+        # Catch OSError too (PermissionError, sharing violations, transient
+        # ENOENT after the exists() check, etc.) so the contract that this
+        # layer only raises Switcher-flavored exceptions actually holds.
+        # _load_config does the same for config.json.
         try:
             raw = json.loads(meta_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, OSError) as e:
             raise StorageError(f"error reading {meta_path}: {e}") from e
         if not isinstance(raw, dict):
             raise StorageError(f"malformed metadata.json: {meta_path}")
