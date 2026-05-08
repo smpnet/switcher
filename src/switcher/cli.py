@@ -109,7 +109,12 @@ def status(
         return
     # `markup=False` is REQUIRED because `[ok]` / `[--]` would otherwise be
     # interpreted as Rich markup tags. Spec §6.5.
-    cache = deps.service.get_active_live_paths()
+    # Read the RAW persisted cache (not the derived view) so `[ok]` strictly
+    # means "active_live_paths[tool_id] is populated on disk" per spec §6.5.
+    # The derived view via service.get_active_live_paths() synthesizes from
+    # live links when cache is empty, which would mask the legacy / drifted
+    # state operators are trying to diagnose.
+    cache = deps.store.get_active_live_paths()
     for tool_id in sorted(active):
         profile = active[tool_id]
         cache_marker = "[ok]" if cache.get(tool_id) else "[--]"

@@ -1121,6 +1121,17 @@ class ProfileService:
                 raise UninstallPreflightError(
                     f"live path {m.live_path} reappeared during execution; refusing to overwrite"
                 )
+            # Validate temp is a REAL directory before rename, mirroring
+            # restore_real_dir's invariant. A concurrent process could have
+            # replaced temp with a link/file between classification and
+            # execution; renaming that into place would install a link in
+            # the live position instead of restoring a real dir.
+            temp_is_link = temp.is_symlink() or (IS_WINDOWS and os.path.isjunction(temp))
+            if temp_is_link or not temp.is_dir():
+                raise UninstallPreflightError(
+                    f"temp dir {temp} is not a real directory at execution time; "
+                    "refusing to rename into live position"
+                )
             temp.rename(m.live_path)
             return
         if m.state == _UninstallMappingState.ALREADY_RESTORED:

@@ -32,10 +32,10 @@ def test_status_verbose_shows_cached_paths(tmp_state: Path, tmp_home: Path) -> N
 def test_status_shows_dashes_when_active_populated_but_cache_missing(
     tmp_state: Path, tmp_home: Path
 ) -> None:
-    """Spec §6.5: simulate legacy state by clearing active_live_paths while
-    keeping the active map intact. Migration should derive cache (since live
-    links still resolve), so by default we get [ok]. Assert the indicator
-    infrastructure itself works: [ok] OR [--] is present per tool, never absent."""
+    """Spec §6.5: status reads the RAW persisted cache, not the derived view.
+    Clearing active_live_paths on disk must produce `[--]` for every active
+    tool — even if migration *could* re-derive the cache from live links —
+    so operators see the on-disk cache state when diagnosing uninstall."""
     runner = CliRunner()
     setup = runner.invoke(app, ["init"])
     assert setup.exit_code == 0, setup.stderr
@@ -47,13 +47,9 @@ def test_status_shows_dashes_when_active_populated_but_cache_missing(
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
     active = json.loads(cfg.read_text())["active"]
-    # Each active tool gets exactly one indicator line — total count of
-    # `[ok]` + `[--]` must equal the number of active tools.
-    ok_count = result.output.count("[ok]")
-    dash_count = result.output.count("[--]")
-    assert ok_count + dash_count == len(active), (
-        f"Expected {len(active)} indicators, got {ok_count} [ok] + {dash_count} [--]"
-    )
+    # Every active tool gets `[--]`; raw cache is empty by construction.
+    assert result.output.count("[--]") == len(active)
+    assert "[ok]" not in result.output
 
 
 def test_status_shows_dashes_when_live_link_broken_and_cache_empty(
