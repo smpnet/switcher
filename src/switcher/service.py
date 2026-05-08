@@ -250,7 +250,8 @@ class ProfileService:
                 live = self._resolver.tool_dir(tool, i)
                 swap_link(target, live)
             active[tid] = profile_name
-        self._store.set_active(active)
+        # Combined write that also flushes any derived migration entries.
+        self._store.set_active_state(active, self._derive_cache_for_active(active))
 
     def save(self, name: str) -> None:
         """Snapshot live config into a new profile.
@@ -433,6 +434,13 @@ class ProfileService:
         # with the store regardless of relink-ability.
         for tid in affected_ids:
             active[tid] = new
+        # Step 2: commit the active-map update. set_active is the wrapper
+        # that round-trips the existing on-disk active_live_paths cache, so
+        # an already-populated cache survives. The migration flush comes
+        # AFTER swap_link below — at this point the symlinks still point at
+        # `<old>` (Path.resolve() returns the stored target verbatim, even
+        # when it no longer exists), so the strict validator can't yet
+        # produce a usable cache entry.
         self._store.set_active(active)
         for tid in affected_ids:
             tool = find_tool(self._registry, tid)
@@ -442,6 +450,13 @@ class ProfileService:
                 target = self._store.profile_dir(new) / dm.profile_subdir
                 live = self._resolver.tool_dir(tool, i)
                 swap_link(target, live)
+        # Post-relink migration flush: now that every affected symlink points
+        # into <new>, _derive_cache_for_active can validate them against the
+        # post-rename active map. This is a second atomic write — safe
+        # because the canonical state (store dir + active map) is already
+        # consistent; the cache is a derived index, not load-bearing for
+        # recovery (recovery path is `use(<new>)` regardless).
+        self._store.set_active_live_paths(self._derive_cache_for_active(active))
 
     def delete(self, name: str) -> None:
         """Delete a profile, refusing if it's active for any tool.

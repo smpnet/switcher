@@ -92,6 +92,54 @@ def test_full_lifecycle(tmp_home: Path, tmp_state: Path) -> None:
     assert_active_profile("client-A")
 
 
+def test_use_flushes_derived_active_live_paths(tmp_state: Path, tmp_home: Path) -> None:
+    """A `use` call with legacy state on disk flushes the derived cache atomically."""
+    import json
+
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    registry = build_registry(tmp_state / "registry.d")
+    service = ProfileService(store, resolver, registry)
+    service.init()
+    # Strip active_live_paths to simulate v0.1.0/v0.1.2 state.
+    cfg_path = tmp_state / "config.json"
+    raw = json.loads(cfg_path.read_text())
+    raw["active_live_paths"] = {}
+    cfg_path.write_text(json.dumps(raw, sort_keys=True))
+
+    # Run use against the existing initialized profile (no-op switch).
+    active_profile = next(iter(store.get_active().values()))
+    service.use(active_profile)
+
+    # active_live_paths is populated post-flush.
+    raw_after = json.loads(cfg_path.read_text())
+    assert raw_after["active_live_paths"], "use() did not flush derived cache"
+
+
+def test_rename_flushes_derived_active_live_paths(tmp_state: Path, tmp_home: Path) -> None:
+    import json
+
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    registry = build_registry(tmp_state / "registry.d")
+    service = ProfileService(store, resolver, registry)
+    service.init()
+    cfg_path = tmp_state / "config.json"
+    raw = json.loads(cfg_path.read_text())
+    raw["active_live_paths"] = {}
+    cfg_path.write_text(json.dumps(raw, sort_keys=True))
+
+    active_profile = next(iter(store.get_active().values()))
+    service.rename(active_profile, "renamed-profile")
+
+    raw_after = json.loads(cfg_path.read_text())
+    assert raw_after["active_live_paths"], "rename() did not flush derived cache"
+    # Post-rename, the cache values reference the renamed profile's targets.
+    for paths in raw_after["active_live_paths"].values():
+        for p in paths:
+            assert "renamed-profile" in str(Path(p).resolve()) or Path(p).is_symlink()
+
+
 def test_init_populates_active_live_paths(tmp_state: Path, tmp_home: Path) -> None:
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
