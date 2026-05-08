@@ -42,7 +42,7 @@ def test_rescan_dry_run_makes_no_changes(tmp_state: Path, tmp_home: Path) -> Non
     setup = runner.invoke(app, ["init"])
     assert setup.exit_code == 0, setup.stderr
     (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".config" / "github-copilot").mkdir()
+    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
     result = runner.invoke(app, ["rescan", "--dry-run"])
     assert result.exit_code == 0, result.stderr
     assert "would" in result.stderr
@@ -58,7 +58,7 @@ def test_rescan_default_captures_new_tool(tmp_state: Path, tmp_home: Path) -> No
     setup = runner.invoke(app, ["init"])
     assert setup.exit_code == 0, setup.stderr
     (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".config" / "github-copilot").mkdir()
+    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
     result = runner.invoke(app, ["rescan"])
     assert result.exit_code == 0, result.stderr
     assert "captured copilot" in result.stderr

@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from switcher.paths import PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
@@ -51,9 +49,7 @@ def test_legacy_state_derives_live_paths_via_strict_validation(
             assert Path(path_str).is_symlink() or Path(path_str).resolve().exists()
 
 
-def test_strict_validation_skips_drifted_entries(
-    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_strict_validation_skips_drifted_entries(tmp_state: Path, tmp_home: Path) -> None:
     """A registry entry whose live path doesn't resolve correctly stays absent."""
     service, store = _seed_initialized_state(tmp_state, tmp_home)
     _strip_active_live_paths(tmp_state)

@@ -935,22 +935,22 @@ class ProfileService:
     def _capture_tool_for_rescan(self, tool: Tool, target: str, *, into: bool) -> None:
         """Per-tool capture with metadata semantics from §4.4.
 
-        For `--into` mode: snapshot the existing profile's tools map BEFORE
-        mutation so rollback can restore it. The snapshot is held in a local
-        variable; on success it's discarded; on failure it's used to revert
-        metadata.json before propagating the exception.
+        For `--into` mode: defer the metadata update until AFTER the capture
+        loop succeeds. The previous order (mutate metadata first, revert on
+        failure) had a silent-inconsistency window — if the capture failed
+        AND the suppress'd revert also failed (e.g. transient FS error), the
+        on-disk metadata claimed the new tool was added even though no live
+        capture happened. Deferring eliminates the failure window entirely.
         """
         target_dir = self._store.profile_dir(target)
-        tools_snapshot: dict[str, bool] | None = None  # for --into rollback
+        updated_tools: dict[str, bool] | None = None  # for post-capture --into write
 
         if not into:
             self._store.create(target, {tool.id: True})
         else:
             existing = self._store.get(target)
-            tools_snapshot = dict(existing.tools)  # snapshot for rollback
-            updated_tools = dict(tools_snapshot)
+            updated_tools = dict(existing.tools)
             updated_tools[tool.id] = True
-            self._store.update_profile_tools(target, updated_tools)
 
         completed: list[tuple[Path, Path]] = []  # (live, target_subdir) for rollback
         try:
@@ -962,6 +962,7 @@ class ProfileService:
                 completed.append((live, tgt))
         except Exception:
             # In-loop rollback: undo each completed mapping in reverse.
+            # Metadata never mutated for --into (deferred), so no revert needed.
             for live, tgt in reversed(completed):
                 if self._resolver.is_link(live):
                     with contextlib.suppress(Exception):
@@ -969,11 +970,15 @@ class ProfileService:
                 if tgt.exists():
                     with contextlib.suppress(Exception):
                         move_or_seed_dir(tgt, live)
-            # `--into` metadata revert (best effort; outer rollback may catch state).
-            if into and tools_snapshot is not None:
-                with contextlib.suppress(Exception):
-                    self._store.update_profile_tools(target, tools_snapshot)
             raise
+
+        # Capture succeeded — commit the metadata update for --into. If this
+        # write fails after a successful capture, the live links exist but
+        # metadata doesn't reflect them; that's a narrower window than the
+        # original "mutate first, suppress revert" shape and is recoverable
+        # by re-running rescan (which is idempotent on already-linked tools).
+        if into and updated_tools is not None:
+            self._store.update_profile_tools(target, updated_tools)
 
     def _rollback_partial_rescan(self, tool: Tool, target: str, *, into: bool) -> None:
         """Outer-loop cleanup if `_capture_tool_for_rescan` raised.
@@ -982,11 +987,12 @@ class ProfileService:
         store.create just before the capture loop and contains only this
         tool's mappings).
 
-        For --into mode: the metadata snapshot was already restored by the
-        in-loop rollback; this outer cleanup must also restore captured live
-        dirs (move sub back to live) before removing leftover per-tool
-        subdirs — otherwise a swap_link failure between move_or_seed_dir
-        and completed.append silently destroys user data.
+        For --into mode: metadata is now deferred until after the capture
+        loop succeeds, so there's nothing to revert. This outer cleanup
+        must restore captured live dirs (move sub back to live) before
+        removing leftover per-tool subdirs — otherwise a swap_link failure
+        between move_or_seed_dir and completed.append silently destroys
+        user data.
         """
         target_dir = self._store.profile_dir(target)
         if not into:

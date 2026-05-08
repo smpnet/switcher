@@ -12,7 +12,8 @@ from switcher.cli import app
 
 def test_status_shows_ok_indicator_when_cache_present(tmp_state: Path, tmp_home: Path) -> None:
     runner = CliRunner()
-    runner.invoke(app, ["init"])
+    setup = runner.invoke(app, ["init"])
+    assert setup.exit_code == 0, setup.stderr
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
     # `[ok]` must render literally (not be eaten by Rich markup).
@@ -21,7 +22,8 @@ def test_status_shows_ok_indicator_when_cache_present(tmp_state: Path, tmp_home:
 
 def test_status_verbose_shows_cached_paths(tmp_state: Path, tmp_home: Path) -> None:
     runner = CliRunner()
-    runner.invoke(app, ["init"])
+    setup = runner.invoke(app, ["init"])
+    assert setup.exit_code == 0, setup.stderr
     result = runner.invoke(app, ["status", "-v"])
     assert result.exit_code == 0
     assert "/.claude" in result.output  # one of the cached live paths
@@ -35,7 +37,8 @@ def test_status_shows_dashes_when_active_populated_but_cache_missing(
     links still resolve), so by default we get [ok]. Assert the indicator
     infrastructure itself works: [ok] OR [--] is present per tool, never absent."""
     runner = CliRunner()
-    runner.invoke(app, ["init"])
+    setup = runner.invoke(app, ["init"])
+    assert setup.exit_code == 0, setup.stderr
     cfg = tmp_state / "config.json"
     raw = json.loads(cfg.read_text())
     raw["active_live_paths"] = {}
@@ -59,7 +62,8 @@ def test_status_shows_dashes_when_live_link_broken_and_cache_empty(
     """Force [--] by clearing cache AND breaking a live link target so
     migration can't derive (strict-validation fails)."""
     runner = CliRunner()
-    runner.invoke(app, ["init"])
+    setup = runner.invoke(app, ["init"])
+    assert setup.exit_code == 0, setup.stderr
     cfg = tmp_state / "config.json"
     raw = json.loads(cfg.read_text())
     raw["active_live_paths"] = {}
@@ -78,7 +82,8 @@ def test_status_shows_dashes_when_live_link_broken_and_cache_empty(
 def test_status_no_active_profiles(tmp_state: Path, tmp_home: Path) -> None:
     """After uninstall, active is empty: status reports the empty case."""
     runner = CliRunner()
-    runner.invoke(app, ["init"])
+    setup = runner.invoke(app, ["init"])
+    assert setup.exit_code == 0, setup.stderr
     runner.invoke(app, ["uninstall"])
     result = runner.invoke(app, ["status"])
     assert "no active profiles" in result.output
