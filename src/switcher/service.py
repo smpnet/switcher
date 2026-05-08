@@ -7,10 +7,14 @@ without reaching inside the service.
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
 
 from switcher.errors import (
     AlreadyLinkedError,
@@ -29,6 +33,28 @@ from switcher.models import Profile, Tool
 from switcher.paths import PathResolver
 from switcher.registry import find_tool
 from switcher.store import ProfileStore
+
+
+class _UninstallMappingState(Enum):
+    SYMLINK = "symlink"
+    ALREADY_RESTORED = "already_restored"
+    MISSING_LIVE_TEMP_PRESENT = "missing_live_temp_present"
+    CORRUPT = "corrupt"
+
+
+@dataclass(frozen=True)
+class _UninstallMapping:
+    tool_id: str
+    profile_subdir: str
+    live_path: Path
+    profile_dir_subdir: Path  # <state_dir>/profiles/<active>/<config_subdir>
+    state: _UninstallMappingState
+    corruption_reason: str = ""  # populated when state == CORRUPT
+
+
+def _temp_dir_for_uninstall(live_path: Path) -> Path:
+    """Sibling temp-dir name used by uninstall's copy step."""
+    return live_path.with_name(live_path.name + ".switcher-uninstall-tmp")
 
 
 def now() -> datetime:
@@ -170,6 +196,178 @@ class ProfileService:
             f"warning: could not derive live_paths for {tool_id!r}: {reason}",
             file=sys.stderr,
         )
+
+    def _classify_uninstall_mappings(self) -> list[_UninstallMapping]:
+        """Pure-read classifier feeding uninstall's pre-flight (spec §3.2).
+
+        Iterates active map → DirMapping list per tool, returns one
+        _UninstallMapping per DirMapping with its classified state. For
+        orphan tools (no registry entry) but cached live_paths, the subdir
+        for each cached path is derived by reading the link target — NOT
+        by zipping with sorted profile_dir contents (which would mis-pair
+        a multi-tool profile).
+        """
+        active = self._store.get_active()
+        live_paths_cache = self.get_active_live_paths()
+        result: list[_UninstallMapping] = []
+
+        for tool_id, profile_name in active.items():
+            tool = find_tool(self._registry, tool_id)
+            cached_paths = live_paths_cache.get(tool_id, [])
+            profile_dir = self._store.profile_dir(profile_name)
+
+            # Reconstruct the (subdir, live_path) pairs we need.
+            if tool is not None:
+                pairs = [
+                    (dm.profile_subdir, self._resolver.tool_dir(tool, i))
+                    for i, dm in enumerate(tool.config_dirs)
+                ]
+            elif cached_paths:
+                # Orphan tool with cache. Determine each cached path's subdir by
+                # following the symlink. For real-dir / missing live paths
+                # (resume cases), we cannot determine the subdir without
+                # content matching — those cases get a single CORRUPT entry
+                # per such mapping with a clear reason. v0.2.0 may add resume
+                # support for orphan tools; not in scope here.
+                pairs = []
+                for cached_str in cached_paths:
+                    live = Path(cached_str)
+                    if self._resolver.is_link(live):
+                        try:
+                            target = live.resolve()
+                            subdir = target.name
+                        except OSError:
+                            subdir = "<unresolvable>"
+                        pairs.append((subdir, live))
+                    else:
+                        # Resume case OR cache invalid — flag CORRUPT on the
+                        # subdir-derivation step, not the unwind step.
+                        result.append(
+                            _UninstallMapping(
+                                tool_id=tool_id,
+                                profile_subdir="<unknown>",
+                                live_path=live,
+                                profile_dir_subdir=profile_dir,
+                                state=_UninstallMappingState.CORRUPT,
+                                corruption_reason=(
+                                    f"orphan tool {tool_id!r}: cached live path {live} "
+                                    f"is not a link, cannot derive profile subdir without "
+                                    f"registry. Restore the registry TOML."
+                                ),
+                            )
+                        )
+                if not pairs:
+                    continue
+            else:
+                # No registry, no cache — flag a single CORRUPT entry per tool.
+                result.append(
+                    _UninstallMapping(
+                        tool_id=tool_id,
+                        profile_subdir="<unknown>",
+                        live_path=Path("<unknown>"),
+                        profile_dir_subdir=profile_dir,
+                        state=_UninstallMappingState.CORRUPT,
+                        corruption_reason="orphan tool: no registry entry and no cached live_paths",
+                    )
+                )
+                continue
+
+            for subdir, live in pairs:
+                target = profile_dir / subdir
+                state, reason = self._classify_one_mapping(live, target)
+                result.append(
+                    _UninstallMapping(
+                        tool_id=tool_id,
+                        profile_subdir=subdir,
+                        live_path=live,
+                        profile_dir_subdir=target,
+                        state=state,
+                        corruption_reason=reason,
+                    )
+                )
+        return result
+
+    def _classify_one_mapping(
+        self, live: Path, profile_target: Path
+    ) -> tuple[_UninstallMappingState, str]:
+        """Classify a single DirMapping. See spec §3.2."""
+        # SYMLINK? Verify link target matches expected profile subdir.
+        if self._resolver.is_link(live):
+            if not profile_target.exists():
+                return (
+                    _UninstallMappingState.CORRUPT,
+                    f"link target profile dir {profile_target} missing",
+                )
+            try:
+                actual = live.resolve()
+            except OSError as e:
+                return (
+                    _UninstallMappingState.CORRUPT,
+                    f"could not resolve link {live}: {e}",
+                )
+            if actual != profile_target.resolve():
+                return (
+                    _UninstallMappingState.CORRUPT,
+                    f"live link {live} points to {actual}, expected {profile_target}",
+                )
+            # Pre-flight collision check: a sibling temp dir at this point
+            # is dangerous because we'd overwrite it during the copy step.
+            # MISSING_LIVE_TEMP_PRESENT requires the live path to be missing,
+            # so any temp present alongside a live link is unrelated — refuse.
+            temp = _temp_dir_for_uninstall(live)
+            if temp.exists():
+                return (
+                    _UninstallMappingState.CORRUPT,
+                    f"sibling temp dir {temp} exists alongside live link "
+                    f"{live}; refusing to overwrite. Inspect/remove {temp} manually.",
+                )
+            return (_UninstallMappingState.SYMLINK, "")
+
+        # MISSING_LIVE_TEMP_PRESENT?
+        if not live.exists():
+            temp = _temp_dir_for_uninstall(live)
+            if temp.is_dir() and self._dirs_match(temp, profile_target):
+                return (_UninstallMappingState.MISSING_LIVE_TEMP_PRESENT, "")
+            return (
+                _UninstallMappingState.CORRUPT,
+                f"live path missing and no recoverable temp dir at {temp}",
+            )
+
+        # ALREADY_RESTORED?
+        if live.is_dir():
+            if self._dirs_match(live, profile_target):
+                return (_UninstallMappingState.ALREADY_RESTORED, "")
+            return (
+                _UninstallMappingState.CORRUPT,
+                f"real dir at {live} does not match profile contents at {profile_target}",
+            )
+
+        # Regular file or other — CORRUPT.
+        return (
+            _UninstallMappingState.CORRUPT,
+            f"unexpected non-link non-dir entry at {live}",
+        )
+
+    @staticmethod
+    def _dirs_match(a: Path, b: Path) -> bool:
+        """Shallow content match: same set of relative paths, same file sizes.
+
+        Spec §3.2 explicitly chose size-equality over byte-equality (too
+        expensive at MB scale).
+        """
+        if not a.is_dir() or not b.is_dir():
+            return False
+        a_entries: dict[str, int] = {}
+        b_entries: dict[str, int] = {}
+        for root, _, files in os.walk(a):
+            for f in files:
+                p = Path(root) / f
+                a_entries[str(p.relative_to(a))] = p.stat().st_size
+        for root, _, files in os.walk(b):
+            for f in files:
+                p = Path(root) / f
+                b_entries[str(p.relative_to(b))] = p.stat().st_size
+        return a_entries == b_entries
 
     # Operations ------------------------------------------------------------
 
