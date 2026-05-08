@@ -25,10 +25,11 @@ from switcher.errors import (
     StateNotInitializedError,
     ToolHasNoActiveProfileError,
     ToolNotInProfileError,
+    UninstallPreflightError,
     UnknownProfileError,
     UnknownToolError,
 )
-from switcher.links import move_or_seed_dir, swap_link
+from switcher.links import move_or_seed_dir, restore_real_dir, swap_link
 from switcher.models import Profile, Tool
 from switcher.paths import PathResolver
 from switcher.registry import find_tool
@@ -677,6 +678,143 @@ class ProfileService:
                 "Switch the active tools to a different profile before deleting."
             )
         self._store.delete(name)
+
+    def uninstall(
+        self,
+        *,
+        purge: bool = False,
+        yes: bool = False,
+        dry_run: bool = False,
+        force: bool = False,
+    ) -> UninstallReport:
+        """Inverse of init: every active symlink → real dir; optionally rm -rf state.
+
+        See spec §3 for full semantics. Dry-run bypasses non-TTY and skipped-tool
+        guards (§3.1: "shows both phases without mutating or prompting").
+        """
+        self._require_initialized()
+
+        # Pre-flight step 2: --purge non-TTY guard. Skipped during dry-run.
+        if purge and not dry_run and not yes and not sys.stdin.isatty():
+            raise UninstallPreflightError("refusing to purge without --yes in non-interactive mode")
+
+        # Pre-flight step 3: classify every DirMapping.
+        mappings = self._classify_uninstall_mappings()
+
+        # Pre-flight step 4: per-tool source-of-info check.
+        active = self._store.get_active()
+        live_paths_cache = self.get_active_live_paths()
+        skipped_tools: list[tuple[str, str]] = []
+        for tool_id in active:
+            has_cache = bool(live_paths_cache.get(tool_id))
+            has_registry = find_tool(self._registry, tool_id) is not None
+            if not has_cache and not has_registry:
+                if not force:
+                    raise UninstallPreflightError(
+                        f"orphan tool {tool_id!r}: no registry entry and no cached "
+                        f"live_paths. Restore the registry TOML, or pass --force "
+                        f"to skip this tool (its symlinks will remain in place)."
+                    )
+                skipped_tools.append((tool_id, "no registry entry and no cached live_paths"))
+
+        # Pre-flight step 5: --purge + skipped-tools refusal. Skipped during dry-run.
+        if purge and not dry_run and skipped_tools:
+            tids = ", ".join(t for t, _ in skipped_tools)
+            raise UninstallPreflightError(
+                f"--purge refused: tool(s) {tids} would be skipped, leaving symlinks "
+                f"dangling into a wiped state dir. Either restore registry TOML(s), "
+                f"or run uninstall (no purge) first, then prune separately."
+            )
+
+        # Pre-flight step 3 follow-up: reject any CORRUPT classification (not skippable
+        # via --force per §3.4) for tools that aren't in skipped_tools.
+        skipped_ids = {t for t, _ in skipped_tools}
+        for m in mappings:
+            if m.state == _UninstallMappingState.CORRUPT and m.tool_id not in skipped_ids:
+                raise UninstallPreflightError(
+                    f"tool {m.tool_id!r} mapping {m.profile_subdir!r}: {m.corruption_reason}"
+                )
+
+        report = UninstallReport(skipped=skipped_tools, mappings=[], purged=False)
+
+        if dry_run:
+            for m in mappings:
+                if m.tool_id in skipped_ids:
+                    continue
+                report.mappings.append(m)
+            return report
+
+        # Execute per-DirMapping unwind for every non-skipped mapping.
+        for m in mappings:
+            if m.tool_id in skipped_ids:
+                continue
+            self._execute_uninstall_mapping(m)
+            report.mappings.append(m)
+
+        # Compute the post-unwind state-clear: skipped tools keep their entries
+        # (their symlinks stayed in place), everything else is cleared.
+        kept_active = {tid: p for tid, p in active.items() if tid in skipped_ids}
+        kept_cache = {tid: paths for tid, paths in live_paths_cache.items() if tid in skipped_ids}
+
+        # Non-purge: clear + return.
+        if not purge:
+            self._store.set_active_state(kept_active, kept_cache)
+            return report
+
+        # Purge phase.
+        if not yes:
+            answer = (
+                input(
+                    f"This will permanently delete {self._store.state_dir()}. "
+                    f"Type 'yes' to confirm: "
+                )
+                .strip()
+                .lower()
+            )
+            if answer != "yes":
+                # User declined. Unwind is already done — clear active state
+                # so subsequent `status` correctly reports "no tools managed."
+                # Equivalent to a non-purge run that the user explicitly chose.
+                self._store.set_active_state(kept_active, kept_cache)
+                return report
+        shutil.rmtree(self._store.state_dir())
+        report.purged = True
+        return report
+
+    def _execute_uninstall_mapping(self, m: _UninstallMapping) -> None:
+        """Per-DirMapping execution, branching on classified state.
+
+        For SYMLINK: copy profile content to a sibling temp dir, then call
+        restore_real_dir. Pre-flight already rejected the case where the
+        sibling temp path collides with unrelated content; if we still see
+        a temp here it's a race condition, so fail loud (do NOT rmtree).
+        """
+        if m.state == _UninstallMappingState.SYMLINK:
+            temp = _temp_dir_for_uninstall(m.live_path)
+            if temp.exists():
+                raise UninstallPreflightError(
+                    f"sibling temp dir {temp} appeared during execution; refusing "
+                    f"to overwrite. Inspect/remove {temp} manually and re-run."
+                )
+            shutil.copytree(m.profile_dir_subdir, temp, symlinks=False, dirs_exist_ok=False)
+            restore_real_dir(temp, m.live_path)
+            return
+        if m.state == _UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
+            temp = _temp_dir_for_uninstall(m.live_path)
+            temp.rename(m.live_path)
+            return
+        if m.state == _UninstallMappingState.ALREADY_RESTORED:
+            # No-op; already done.
+            return
+        # CORRUPT shouldn't reach here — pre-flight rejected it.
+        raise AssertionError(f"unreachable: {m.state}")
+
+
+@dataclass
+class UninstallReport:
+    skipped: list[tuple[str, str]]
+    mappings: list[_UninstallMapping]
+    purged: bool = False
 
 
 class _MigrationValidationError(Exception):
