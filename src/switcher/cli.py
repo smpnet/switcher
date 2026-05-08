@@ -98,19 +98,32 @@ def list_cmd() -> None:
 
 @app.command()
 @handle_errors
-def status() -> None:
-    """Show active profile per tool."""
+def status(
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show cached live paths."),
+) -> None:
+    """Show currently-active profiles per tool, plus live-path cache state."""
     deps = get_deps()
     active = deps.store.get_active()
     if not active:
         console.print("no active profiles")
         return
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("Tool")
-    table.add_column("Active Profile")
-    for tool in deps.registry:
-        table.add_row(tool.id, active.get(tool.id, "-"))
-    console.print(table)
+    # `markup=False` is REQUIRED because `[ok]` / `[--]` would otherwise be
+    # interpreted as Rich markup tags. Spec §6.5.
+    cache = deps.service.get_active_live_paths()
+    for tool_id in sorted(active):
+        profile = active[tool_id]
+        cache_marker = "[ok]" if cache.get(tool_id) else "[--]"
+        console.print(f"{cache_marker} {tool_id:20} {profile}", markup=False)
+        if verbose:
+            paths = cache.get(tool_id, [])
+            if paths:
+                for p in paths:
+                    console.print(f"       {p}", markup=False)
+            else:
+                console.print(
+                    "       live_paths not cached (will fall back to registry on uninstall)",
+                    markup=False,
+                )
 
 
 # -- mutating commands ------------------------------------------------------
