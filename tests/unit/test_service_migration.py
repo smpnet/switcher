@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
-from switcher.paths import PathResolver
+from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
+
+
+def _is_link(p: Path) -> bool:
+    """Match the cross-platform link check used by the integration suite."""
+    return p.is_symlink() or (IS_WINDOWS and os.path.isjunction(p))
 
 
 def _seed_initialized_state(
@@ -41,12 +47,19 @@ def test_legacy_state_derives_live_paths_via_strict_validation(
 
     # Every active tool should have its live paths derived.
     active = store.get_active()
-    for tool_id in active:
+    for tool_id, profile in active.items():
         assert tool_id in derived
         assert len(derived[tool_id]) >= 1
-        # Every derived path resolves into the expected profile dir.
+        # Every derived path is a real link (not a regular dir that
+        # accidentally exists at the live location) AND resolves into
+        # the active profile dir for that tool.
+        expected_profile = store.profile_dir(profile).resolve()
         for path_str in derived[tool_id]:
-            assert Path(path_str).is_symlink() or Path(path_str).resolve().exists()
+            p = Path(path_str)
+            assert _is_link(p), f"{path_str} is not a symlink/junction"
+            assert expected_profile in p.resolve().parents, (
+                f"{path_str} resolves to {p.resolve()}, expected under {expected_profile}"
+            )
 
 
 def test_strict_validation_skips_drifted_entries(tmp_state: Path, tmp_home: Path) -> None:

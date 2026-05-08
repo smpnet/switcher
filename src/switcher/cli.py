@@ -303,12 +303,12 @@ def prune(
         if not sys.stdin.isatty():
             err_console.print("refusing to delete without --force in non-interactive mode")
             raise typer.Exit(code=1)
-        answer = input("Delete all? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
+        if not typer.confirm("Delete all?"):
             err_console.print("aborted; nothing deleted")
             return
 
-    deps.service.prune(force=True)
+    final = deps.service.prune(force=True)
+    err_console.print(f"deleted {len(final.deleted)} orphan profile(s)")
 
 
 def _print_orphan_list(sizes: dict[str, int]) -> None:
