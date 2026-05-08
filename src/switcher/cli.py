@@ -241,6 +241,25 @@ def uninstall(
         err_console.print(f"cleared active map; kept state at {deps.store.state_dir()}")
 
 
+@app.command()
+@handle_errors
+def rescan(
+    only: str | None = typer.Option(None, "--only", help="Comma-separated tool ids."),
+    into: str | None = typer.Option(None, "--into", help="Capture into an existing profile."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print plan; make no changes."),
+) -> None:
+    """Pick up tools installed after init."""
+    only_list = [s.strip() for s in only.split(",") if s.strip()] if only else None
+    deps = get_deps()
+    report = deps.service.rescan(only=only_list, into=into, dry_run=dry_run)
+    if not report.captured:
+        err_console.print("no new tools detected")
+        return
+    prefix = "would " if dry_run else ""
+    for tool_id, target in report.captured:
+        err_console.print(f"{prefix}captured {tool_id} into {target}")
+
+
 @tools_app.command(name="scaffold")
 @handle_errors
 def tools_scaffold(
