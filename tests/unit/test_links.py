@@ -11,7 +11,14 @@ from switcher.errors import (
     PathNotADirectoryError,
     ProfileTargetExistsError,
 )
-from switcher.links import IS_WINDOWS, link_dir, move_or_seed_dir, remove_link, swap_link
+from switcher.links import (
+    IS_WINDOWS,
+    link_dir,
+    move_or_seed_dir,
+    remove_link,
+    restore_real_dir,
+    swap_link,
+)
 
 
 def test_link_dir_creates_link_to_directory(tmp_path: Path) -> None:
@@ -381,3 +388,55 @@ def test_remove_link_falls_back_when_isjunction_unreliable(
     remove_link(link)
     with pytest.raises(FileNotFoundError):
         link.lstat()
+
+
+# --- restore_real_dir helper (v0.1.3) -----------------------------------------
+
+
+def test_restore_real_dir_replaces_a_symlink_with_the_temp_dir(tmp_path: Path) -> None:
+    target, link = _make_dir_link(tmp_path)
+    temp = tmp_path / "link.switcher-uninstall-tmp"
+    temp.mkdir()
+    (temp / "marker.txt").write_text("hi")
+
+    restore_real_dir(temp, link)
+
+    # link is now a real dir holding temp's content.
+    assert link.is_dir() and not link.is_symlink()
+    if IS_WINDOWS:
+        assert not os.path.isjunction(link)
+    assert (link / "marker.txt").read_text() == "hi"
+    # temp is gone (renamed away).
+    assert not temp.exists()
+    # The original symlink target is untouched (we copied, then swapped).
+    assert target.is_dir()
+
+
+def test_restore_real_dir_refuses_when_live_path_is_not_a_link(tmp_path: Path) -> None:
+    real_dir = tmp_path / "realdir"
+    real_dir.mkdir()
+    temp = tmp_path / "tmp"
+    temp.mkdir()
+    with pytest.raises(PathNotADirectoryError):
+        restore_real_dir(temp, real_dir)
+    # Both untouched.
+    assert real_dir.is_dir()
+    assert temp.is_dir()
+
+
+def test_restore_real_dir_refuses_when_temp_dir_missing(tmp_path: Path) -> None:
+    _target, link = _make_dir_link(tmp_path)
+    temp = tmp_path / "missing-tmp"
+    with pytest.raises(NotADirectoryError):
+        restore_real_dir(temp, link)
+    assert link.is_symlink() or (IS_WINDOWS and os.path.isjunction(link))
+
+
+def test_restore_real_dir_refuses_when_temp_path_is_a_regular_file(tmp_path: Path) -> None:
+    _target, link = _make_dir_link(tmp_path)
+    temp = tmp_path / "tmp-but-actually-file"
+    temp.write_text("not a dir")
+    with pytest.raises(NotADirectoryError):
+        restore_real_dir(temp, link)
+    assert link.is_symlink() or (IS_WINDOWS and os.path.isjunction(link))
+    assert temp.is_file()  # untouched
