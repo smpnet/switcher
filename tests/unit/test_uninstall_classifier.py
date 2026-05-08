@@ -160,6 +160,38 @@ def test_classify_corrupt_when_real_dir_missing_empty_subdir(
     assert "does not match" in re_classified.corruption_reason
 
 
+def test_classify_corrupt_when_temp_is_symlink_to_real_dir(tmp_state: Path, tmp_home: Path) -> None:
+    """A symlink/junction at the temp path must NOT classify as MISSING_LIVE_TEMP_PRESENT.
+
+    Without the link guard, `Path.is_dir()` would follow the link and the
+    execution step's `temp.rename()` would simply move the link itself
+    into live_path — leaving live as a link, exactly the state uninstall
+    promises to undo.
+    """
+    service = _build_initialized(tmp_state, tmp_home)
+    mappings = service._classify_uninstall_mappings()
+    m = mappings[0]
+    live = m.live_path
+    temp = _temp_dir_for_uninstall(live)
+
+    # Create a real directory elsewhere, then link the temp path to it.
+    real_dir = tmp_home / "decoy-real-dir"
+    shutil.copytree(m.profile_dir_subdir, real_dir)
+
+    _drop_link(live)
+    if IS_WINDOWS:
+        _create_junction(real_dir, temp)
+    else:
+        temp.symlink_to(real_dir)
+
+    re_classified = next(
+        c
+        for c in service._classify_uninstall_mappings()
+        if (c.tool_id, c.profile_subdir) == (m.tool_id, m.profile_subdir)
+    )
+    assert re_classified.state == State.CORRUPT
+
+
 def test_classify_orphan_tool_with_link_outside_profile_dir_is_corrupt(
     tmp_state: Path, tmp_home: Path
 ) -> None:
@@ -192,8 +224,6 @@ def test_classify_corrupt_when_temp_dir_collides_with_live_link(
     tmp_state: Path, tmp_home: Path
 ) -> None:
     """Pre-flight catches an unrelated temp-dir collision instead of overwriting it."""
-    from switcher.service import _temp_dir_for_uninstall
-
     service = _build_initialized(tmp_state, tmp_home)
     mappings = service._classify_uninstall_mappings()
     m = mappings[0]

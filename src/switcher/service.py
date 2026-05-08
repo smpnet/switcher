@@ -31,7 +31,7 @@ from switcher.errors import (
 )
 from switcher.links import move_or_seed_dir, restore_real_dir, swap_link
 from switcher.models import Profile, Tool
-from switcher.paths import PathResolver
+from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import find_tool
 from switcher.store import ProfileStore
 
@@ -349,7 +349,13 @@ class ProfileService:
         # MISSING_LIVE_TEMP_PRESENT?
         if not live.exists():
             temp = _temp_dir_for_uninstall(live)
-            if temp.is_dir() and self._dirs_match(temp, profile_target):
+            # `Path.is_dir()` follows symlinks/junctions, so a link at temp would
+            # otherwise pass and execute()'s temp.rename() would just rename the
+            # link itself into live_path — leaving live as a link instead of the
+            # real-dir restore the command promises. Mirror restore_real_dir's
+            # guard: real directory only.
+            temp_is_link = temp.is_symlink() or (IS_WINDOWS and os.path.isjunction(temp))
+            if temp.is_dir() and not temp_is_link and self._dirs_match(temp, profile_target):
                 return (_UninstallMappingState.MISSING_LIVE_TEMP_PRESENT, "")
             return (
                 _UninstallMappingState.CORRUPT,
@@ -382,26 +388,33 @@ class ProfileService:
         ALREADY_RESTORED, skipping the unwind on an incomplete restore.
         Sentinel values disambiguate the two entry kinds: a non-negative
         size for files (st_size), -1 for directories.
+
+        Any transient OSError (PermissionError, FileNotFoundError,
+        sharing-violation on Windows) during the walk is normalized to a
+        non-match. The caller (`_classify_one_mapping`) treats a non-match
+        as CORRUPT, which is the right surfacing for pre-flight: a tree
+        we can't fully read can't be confirmed as a clean restore.
         """
         if not a.is_dir() or not b.is_dir():
             return False
-        a_entries: dict[str, int] = {}
-        b_entries: dict[str, int] = {}
-        for root, dirs, files in os.walk(a):
-            for d in dirs:
-                p = Path(root) / d
-                a_entries[str(p.relative_to(a)) + "/"] = -1
-            for f in files:
-                p = Path(root) / f
-                a_entries[str(p.relative_to(a))] = p.stat().st_size
-        for root, dirs, files in os.walk(b):
-            for d in dirs:
-                p = Path(root) / d
-                b_entries[str(p.relative_to(b)) + "/"] = -1
-            for f in files:
-                p = Path(root) / f
-                b_entries[str(p.relative_to(b))] = p.stat().st_size
+        try:
+            a_entries = ProfileService._walk_for_match(a)
+            b_entries = ProfileService._walk_for_match(b)
+        except OSError:
+            return False
         return a_entries == b_entries
+
+    @staticmethod
+    def _walk_for_match(root_path: Path) -> dict[str, int]:
+        entries: dict[str, int] = {}
+        for root, dirs, files in os.walk(root_path):
+            for d in dirs:
+                p = Path(root) / d
+                entries[str(p.relative_to(root_path)) + "/"] = -1
+            for f in files:
+                p = Path(root) / f
+                entries[str(p.relative_to(root_path))] = p.stat().st_size
+        return entries
 
     # Operations ------------------------------------------------------------
 
