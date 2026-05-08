@@ -440,3 +440,27 @@ def test_restore_real_dir_refuses_when_temp_path_is_a_regular_file(tmp_path: Pat
         restore_real_dir(temp, link)
     assert link.is_symlink() or (IS_WINDOWS and os.path.isjunction(link))
     assert temp.is_file()  # untouched
+
+
+def test_restore_real_dir_refuses_when_temp_path_is_a_link(tmp_path: Path) -> None:
+    """The helper's contract is to restore a *real* directory at live_path.
+    `is_dir()` follows symlinks/junctions, so without an explicit link
+    rejection a linked temp_dir would survive the precondition and the
+    rename would relink live_path instead of installing real contents."""
+    _target, link = _make_dir_link(tmp_path)
+    # Build a separate link to act as the bogus "temp_dir": real backing
+    # directory, but the path the caller hands us is a link to it.
+    backing = tmp_path / "backing"
+    backing.mkdir()
+    (backing / "marker").write_text("x")
+    temp_link = tmp_path / "temp-as-link"
+    link_dir(backing, temp_link)
+
+    with pytest.raises(NotADirectoryError):
+        restore_real_dir(temp_link, link)
+
+    # Both untouched: live link is still a link, temp_link is still a link.
+    assert link.is_symlink() or (IS_WINDOWS and os.path.isjunction(link))
+    assert temp_link.is_symlink() or (IS_WINDOWS and os.path.isjunction(temp_link))
+    # Backing dir intact (we didn't rename through the link).
+    assert (backing / "marker").read_text() == "x"

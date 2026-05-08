@@ -280,11 +280,13 @@ class FileProfileStore:
 
         Used by `rescan --into` to add a new tool to an existing profile's
         metadata (and by `rescan` rollback to revert that change). The
-        write is atomic via _atomic_write; the in-memory Profile is rebuilt
-        via model_copy so existing validation runs.
+        write is atomic via _atomic_write; the new Profile is built through
+        the constructor so field validators (`name`, `created_at`) actually
+        re-run — `model_copy(update=...)` would skip them in pydantic v2.
         """
         prof = self.get(name)
-        new_prof = prof.model_copy(update={"tools": dict(tools)})
-        meta_path = self.profile_dir(name) / "metadata.json"
-        text = new_prof.model_dump_json(by_alias=True)
-        self._atomic_write(meta_path, text)
+        new_prof = Profile(name=prof.name, created_at=prof.created_at, tools=dict(tools))
+        self._atomic_write(
+            self._metadata_path(name),
+            new_prof.model_dump_json(by_alias=True),
+        )

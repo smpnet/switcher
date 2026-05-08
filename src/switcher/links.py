@@ -264,9 +264,16 @@ def restore_real_dir(temp_dir: Path, live_path: Path) -> None:
     detectable and recoverable by the caller's pre-flight (see uninstall
     `MISSING_LIVE_TEMP_PRESENT` classification).
 
-    Refuses to mutate if `temp_dir` is not an existing directory — a
-    regular file at that path must NOT be renamed over the live path.
+    Refuses to mutate if `temp_dir` is not a *real* directory. `is_dir()`
+    follows links, so a symlink/junction at `temp_dir` would silently pass
+    that check and rename the link itself into `live_path` — leaving a
+    relinked live path instead of the real-dir restore the helper promises.
+    A regular file at that path must also NOT be renamed over the live path.
     """
+    if temp_dir.is_symlink() or (IS_WINDOWS and os.path.isjunction(temp_dir)):
+        raise NotADirectoryError(
+            f"temp dir {temp_dir} is a symlink/junction; restore_real_dir requires a real directory"
+        )
     if not temp_dir.is_dir():
         raise NotADirectoryError(
             f"temp dir {temp_dir} is not a directory; copy step must precede restore"
