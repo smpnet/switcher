@@ -8,7 +8,8 @@ without reaching inside the service.
 from __future__ import annotations
 
 import shutil
-from collections.abc import Sequence
+import sys
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 
 from switcher.errors import (
@@ -90,6 +91,77 @@ class ProfileService:
             target = self._store.profile_dir(profile) / dm.profile_subdir
             move_or_seed_dir(live, target)
             swap_link(target, live)
+
+    def get_active_live_paths(self) -> dict[str, list[str]]:
+        """Public accessor — for CLI/status (§2.6 layer ownership).
+
+        Returns the post-migration view: cached entries from the store, plus
+        any entries derivable via strict validation against the CURRENT
+        on-disk active map. Does NOT write back; flushing is the caller's
+        responsibility (use `_derive_cache_for_active(active)` and pass to
+        `store.set_active_state(active, cache)` in one atomic write).
+        """
+        return self._derive_cache_for_active(self._store.get_active())
+
+    def _derive_cache_for_active(self, active: Mapping[str, str]) -> dict[str, list[str]]:
+        """Compute the live_paths cache for a hypothetical active map.
+
+        Used internally during state-mutating operations (`use`, `rename`,
+        `init`, `uninstall`, `rescan`) where `active` is being changed in
+        the same transaction. Validation is performed against the proposed
+        active map (which determines the expected profile_subdir target),
+        not the on-disk one.
+        """
+        cached_on_disk = self._store.get_active_live_paths()
+        result: dict[str, list[str]] = {}
+        for tool_id, profile_name in active.items():
+            existing = cached_on_disk.get(tool_id)
+            if existing:
+                # Trust an already-validated cache entry.
+                result[tool_id] = existing
+                continue
+            tool = find_tool(self._registry, tool_id)
+            if tool is None:
+                continue  # orphan tool — no derivation possible
+            try:
+                result[tool_id] = self._derive_live_paths_strict(tool, profile_name)
+            except _MigrationValidationError as e:
+                self._warn_migration(tool_id, str(e))
+        return result
+
+    def _derive_live_paths_strict(self, tool: Tool, profile_name: str) -> list[str]:
+        """Derive a tool's live paths and verify each one points where expected.
+
+        Three checks per DirMapping (spec §2.3): exists, is a link, resolves
+        into the expected `<profile>/<config_subdir>/`. Any failure raises
+        and the caller treats the whole tool as unmigrated.
+        """
+        derived: list[str] = []
+        for i, dm in enumerate(tool.config_dirs):
+            live = self._resolver.tool_dir(tool, i)
+            if not self._resolver.exists(live):
+                raise _MigrationValidationError(f"live path {live} does not exist")
+            if not self._resolver.is_link(live):
+                raise _MigrationValidationError(f"live path {live} is not a link")
+            expected_target = self._store.profile_dir(profile_name) / dm.profile_subdir
+            # Use Path.resolve() uniformly for both POSIX symlinks and Windows
+            # junctions — cross-platform, no os.readlink() branch needed since
+            # is_link() above already covers junction-vs-symlink dispatch.
+            actual_target = live.resolve()
+            if actual_target != expected_target.resolve():
+                raise _MigrationValidationError(
+                    f"live path {live} points to {actual_target}, expected {expected_target}"
+                )
+            derived.append(str(live))
+        return derived
+
+    @staticmethod
+    def _warn_migration(tool_id: str, reason: str) -> None:
+        """One-line stderr warning when migration can't derive a tool's cache entry."""
+        print(
+            f"warning: could not derive live_paths for {tool_id!r}: {reason}",
+            file=sys.stderr,
+        )
 
     # Operations ------------------------------------------------------------
 
@@ -380,3 +452,7 @@ class ProfileService:
                 "Switch the active tools to a different profile before deleting."
             )
         self._store.delete(name)
+
+
+class _MigrationValidationError(Exception):
+    """Internal: a strict-validation check failed during migration."""
