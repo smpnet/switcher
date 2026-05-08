@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -258,6 +259,52 @@ def rescan(
     prefix = "would " if dry_run else ""
     for tool_id, target in report.captured:
         err_console.print(f"{prefix}captured {tool_id} into {target}")
+
+
+@app.command()
+@handle_errors
+def prune(
+    force: bool = typer.Option(False, "--force", help="Skip the confirmation prompt."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="List orphans; make no changes."),
+) -> None:
+    """Delete orphan profiles."""
+    deps = get_deps()
+
+    # First call is always a dry-run to enumerate orphans + sizes.
+    preview = deps.service.prune(dry_run=True)
+    if not preview.sizes_bytes:
+        err_console.print("no orphan profiles")
+        return
+
+    _print_orphan_list(preview.sizes_bytes)
+    if dry_run:
+        err_console.print("Run without --dry-run to delete.")
+        return
+
+    if not force:
+        if not sys.stdin.isatty():
+            err_console.print("refusing to delete without --force in non-interactive mode")
+            raise typer.Exit(code=1)
+        answer = input("Delete all? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            err_console.print("aborted; nothing deleted")
+            return
+
+    deps.service.prune(force=True)
+
+
+def _print_orphan_list(sizes: dict[str, int]) -> None:
+    err_console.print(f"{len(sizes)} orphan profile(s):")
+    for name, sz in sizes.items():
+        err_console.print(f"  {name}  {_fmt_size(sz)}")
+
+
+def _fmt_size(n: int) -> str:
+    if n < 1024:
+        return "<1 KB"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
 
 
 @tools_app.command(name="scaffold")
