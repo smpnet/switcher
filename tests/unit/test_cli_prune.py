@@ -17,6 +17,8 @@ def test_prune_force_deletes_all_orphans(tmp_state: Path, tmp_home: Path) -> Non
     assert create.exit_code == 0, create.stderr
     result = runner.invoke(app, ["prune", "--force"])
     assert result.exit_code == 0, result.stderr
+    # Orphan profile is removed from disk.
+    assert not (tmp_state / "profiles" / "orphan-a").exists()
 
 
 def test_prune_dry_run_lists_with_sizes(tmp_state: Path, tmp_home: Path) -> None:

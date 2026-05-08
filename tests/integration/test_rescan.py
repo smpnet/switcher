@@ -248,6 +248,40 @@ def test_rescan_into_rollback_restores_metadata(
     assert "copilot" not in tools_after
 
 
+def test_rescan_into_rollback_restores_live_dir_contents(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §4.4: --into rollback must restore live dir contents, not just
+    metadata. Without the link-aware restore in `_rollback_partial_rescan`,
+    a swap_link failure mid-capture would silently delete the user's data."""
+    s = _service(tmp_state, tmp_home)
+    _remove_path(tmp_home / ".copilot")
+    _remove_path(tmp_home / ".config" / "github-copilot")
+    s.init()  # claude only
+    init_profile = next(iter(s._store.get_active().values()))
+
+    (tmp_home / ".copilot").mkdir()
+    (tmp_home / ".copilot" / "sentinel.txt").write_text("user-data")
+    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
+    (tmp_home / ".config" / "github-copilot" / "config").write_text("settings")
+
+    from switcher import service as svc_mod
+
+    def failing_swap(target: Path, link: Path) -> None:
+        raise RuntimeError("simulated FS error")
+
+    monkeypatch.setattr(svc_mod, "swap_link", failing_swap)
+
+    with pytest.raises(RescanCaptureError):
+        s.rescan(into=init_profile, only=["copilot"])
+
+    # Live dirs and contents must be restored — NOT silently deleted.
+    assert (tmp_home / ".copilot").is_dir()
+    assert (tmp_home / ".copilot" / "sentinel.txt").read_text() == "user-data"
+    assert (tmp_home / ".config" / "github-copilot").is_dir()
+    assert (tmp_home / ".config" / "github-copilot" / "config").read_text() == "settings"
+
+
 def test_rescan_already_linked_raises(tmp_state: Path, tmp_home: Path) -> None:
     """Spec §4.3: live path already a link (e.g. user-managed symlink) → AlreadyLinkedError.
 

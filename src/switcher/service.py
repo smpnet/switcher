@@ -983,8 +983,10 @@ class ProfileService:
         tool's mappings).
 
         For --into mode: the metadata snapshot was already restored by the
-        in-loop rollback; this outer cleanup just ensures any leftover
-        per-tool subdirs in the target profile are removed.
+        in-loop rollback; this outer cleanup must also restore captured live
+        dirs (move sub back to live) before removing leftover per-tool
+        subdirs — otherwise a swap_link failure between move_or_seed_dir
+        and completed.append silently destroys user data.
         """
         target_dir = self._store.profile_dir(target)
         if not into:
@@ -1002,12 +1004,26 @@ class ProfileService:
             shutil.rmtree(target_dir, ignore_errors=True)
             return
 
-        # --into mode: leave existing profile content intact; just remove any
-        # of THIS tool's subdirs that weren't undone by the in-loop rollback.
-        for dm in tool.config_dirs:
+        # --into mode: same link-aware restore as default mode for THIS
+        # tool's subdirs; leave the rest of the existing profile alone.
+        for i, dm in enumerate(tool.config_dirs):
+            live = self._resolver.tool_dir(tool, i)
+            if self._resolver.is_link(live):
+                with contextlib.suppress(Exception):
+                    remove_link(live)
             sub = target_dir / dm.profile_subdir
             if sub.is_dir():
-                shutil.rmtree(sub, ignore_errors=True)
+                if live.exists() or self._resolver.is_link(live):
+                    # Live already restored (e.g. by in-loop rollback) —
+                    # just drop the leftover sub.
+                    shutil.rmtree(sub, ignore_errors=True)
+                else:
+                    with contextlib.suppress(Exception):
+                        move_or_seed_dir(sub, live)
+                    # If move failed for any reason, surface the leftover
+                    # for manual cleanup rather than silent rmtree.
+                    if sub.exists():
+                        shutil.rmtree(sub, ignore_errors=True)
 
     # Prune ------------------------------------------------------------------
 
