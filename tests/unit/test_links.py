@@ -353,3 +353,31 @@ def test_remove_link_drops_a_broken_link(tmp_path: Path) -> None:
     # too, so the lstat check subsumes them.)
     with pytest.raises(FileNotFoundError):
         link.lstat()
+
+
+@pytest.mark.skipif(
+    not IS_WINDOWS,
+    reason="Windows-only: the unreliable-isjunction fallback only triggers when "
+    "IS_WINDOWS is True, isjunction returns False, and is_symlink is False — "
+    "a combination only reachable with a real Windows junction.",
+)
+def test_remove_link_falls_back_when_isjunction_unreliable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the affected Windows hosts (per `_swap_link_windows`'s comment),
+    `os.path.isjunction()` returns False for a broken junction even though
+    `rmdir()` would still succeed. Simulate the unreliable-host condition
+    by patching `os.path.isjunction` to always return False, and verify
+    the defensive fallback branch in `remove_link` still cleans up."""
+    target, link = _make_dir_link(tmp_path)
+    target.rmdir()  # break the junction
+    # Patch the symbol that `remove_link` actually consults.
+    import switcher.links as links_module
+
+    def _isjunction_unreliable(_p: object) -> bool:
+        return False
+
+    monkeypatch.setattr(links_module.os.path, "isjunction", _isjunction_unreliable)
+    remove_link(link)
+    with pytest.raises(FileNotFoundError):
+        link.lstat()
