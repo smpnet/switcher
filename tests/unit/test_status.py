@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from switcher.cli import app
+from switcher.paths import IS_WINDOWS
 
 
 def test_status_shows_ok_indicator_when_cache_present(tmp_state: Path, tmp_home: Path) -> None:
@@ -67,9 +69,13 @@ def test_status_shows_dashes_when_live_link_broken_and_cache_empty(
     bogus = tmp_home / "bogus-target"
     bogus.mkdir()
     claude = tmp_home / ".claude"
-    if claude.is_symlink():
-        claude.unlink()
-        claude.symlink_to(bogus)
+    is_junction = IS_WINDOWS and os.path.isjunction(claude)
+    if claude.is_symlink() or is_junction:
+        if is_junction:
+            claude.rmdir()
+        else:
+            claude.unlink()
+        claude.symlink_to(bogus, target_is_directory=True)
 
     result = runner.invoke(app, ["status"])
     assert "[--]" in result.output
@@ -80,6 +86,7 @@ def test_status_no_active_profiles(tmp_state: Path, tmp_home: Path) -> None:
     runner = CliRunner()
     setup = runner.invoke(app, ["init"])
     assert setup.exit_code == 0, setup.stderr
-    runner.invoke(app, ["uninstall"])
+    uninstall = runner.invoke(app, ["uninstall"])
+    assert uninstall.exit_code == 0, uninstall.stderr
     result = runner.invoke(app, ["status"])
     assert "no active profiles" in result.output

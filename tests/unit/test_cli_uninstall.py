@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 from typer.testing import CliRunner
 
 from switcher.cli import app
@@ -37,10 +36,10 @@ def test_uninstall_dry_run_makes_no_changes(tmp_state: Path, tmp_home: Path) -> 
     assert (tmp_state / "config.json").exists()
 
 
-def test_uninstall_purge_in_ci_without_yes_errors(
-    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+def test_uninstall_purge_in_ci_without_yes_errors(tmp_state: Path, tmp_home: Path) -> None:
+    # CliRunner.invoke replaces sys.stdin with an in-memory StringIO whose
+    # isatty() returns False, so the production `not sys.stdin.isatty()` guard
+    # naturally fires here without any monkeypatching.
     runner = CliRunner()
     setup = runner.invoke(app, ["init"])
     assert setup.exit_code == 0, setup.stderr

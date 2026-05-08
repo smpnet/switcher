@@ -857,7 +857,7 @@ class ProfileService:
 
         if only is not None:
             if not only:
-                raise ValueError("--only requires at least one tool id")
+                raise RescanCaptureError("--only requires at least one tool id")
             allow = set(only)
             unknown = allow - {t.id for t in self._registry}
             if unknown:

@@ -162,4 +162,4 @@ def test_init_populates_active_live_paths(tmp_state: Path, tmp_home: Path) -> No
         assert tool is not None
         assert len(paths) == len(tool.config_dirs)
         for p in paths:
-            assert Path(p).is_symlink() or (IS_WINDOWS and os.path.isjunction(Path(p)))
+            assert _is_link(Path(p))
