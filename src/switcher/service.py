@@ -22,6 +22,7 @@ from switcher.errors import (
     PathNotADirectoryError,
     ProfileExistsError,
     ProfileIsActiveError,
+    PruneError,
     RescanCaptureError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
@@ -1008,6 +1009,49 @@ class ProfileService:
             if sub.is_dir():
                 shutil.rmtree(sub, ignore_errors=True)
 
+    # Prune ------------------------------------------------------------------
+
+    def prune(self, *, force: bool = False, dry_run: bool = False) -> PruneReport:
+        """Delete orphan profiles (spec §5). Calls ProfileService.delete for each."""
+        self._require_initialized()
+        orphans = self._compute_orphans()
+        sizes = {name: self._profile_size_bytes(name) for name in orphans}
+
+        report = PruneReport(deleted=[], sizes_bytes=sizes)
+        if not orphans:
+            return report
+        if dry_run:
+            return report
+
+        if not force:
+            if not sys.stdin.isatty():
+                raise PruneError("refusing to delete without --force in non-interactive mode")
+            # Prompt is the CLI's responsibility; service trusts force=True if
+            # CLI confirmed. Service-only callers must pass force=True themselves.
+            raise PruneError("service-level prune called without --force; CLI must confirm")
+
+        for name in orphans:
+            self.delete(name)  # service-layer guard for defense-in-depth
+            report.deleted.append(name)
+        return report
+
+    def _compute_orphans(self) -> list[str]:
+        active_set = set(self._store.get_active().values())
+        profiles_root = self._store.state_dir() / "profiles"
+        if not profiles_root.is_dir():
+            return []
+        disk_set = {p.name for p in profiles_root.iterdir() if p.is_dir()}
+        return sorted(disk_set - active_set)
+
+    def _profile_size_bytes(self, name: str) -> int:
+        """Sum every file size under <state_dir>/profiles/<name>/. KB-MB scale."""
+        total = 0
+        prof_dir = self._store.profile_dir(name)
+        for root, _, files in os.walk(prof_dir):
+            for f in files:
+                total += (Path(root) / f).stat().st_size
+        return total
+
     # Uninstall execution ---------------------------------------------------
 
     def _execute_uninstall_mapping(self, m: _UninstallMapping) -> None:
@@ -1058,6 +1102,12 @@ class UninstallReport:
 @dataclass
 class RescanReport:
     captured: list[tuple[str, str]]  # (tool_id, target_profile)
+
+
+@dataclass
+class PruneReport:
+    deleted: list[str]
+    sizes_bytes: dict[str, int]
 
 
 class _MigrationValidationError(Exception):
