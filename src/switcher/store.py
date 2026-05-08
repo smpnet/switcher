@@ -302,11 +302,21 @@ class FileProfileStore:
             raise StorageError(f"error reading {meta_path}: {e}") from e
         if not isinstance(raw, dict):
             raise StorageError(f"malformed metadata.json: {meta_path}")
-        # Re-validate by routing the existing typed fields through the
-        # Profile constructor; this surfaces drift in the on-disk values
-        # even when the caller is only changing tools.
-        prof = self.get(name)
-        new_prof = Profile(name=prof.name, created_at=prof.created_at, tools=dict(tools))
+        # Validate the existing typed fields directly from the raw payload we
+        # just loaded — re-reading via self.get(name) would open a TOCTOU
+        # window where the unknown-keys snapshot and the typed fields could
+        # come from different on-disk versions of the file. Reconcile the
+        # name against the directory (canonical identifier) the same way
+        # `get` does, so a partial-failure rename is healed on rewrite.
+        try:
+            existing = Profile.model_validate(raw)
+        except Exception as e:
+            raise StorageError(f"error reading {meta_path}: {e}") from e
+        new_prof = Profile(
+            name=name,
+            created_at=existing.created_at,
+            tools=dict(tools),
+        )
         typed = json.loads(new_prof.model_dump_json(by_alias=True))
         # Drop both alias variants so a manually-edited file with the
         # snake_case `created_at` doesn't end up alongside the camelCase
