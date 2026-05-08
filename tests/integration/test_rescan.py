@@ -48,11 +48,11 @@ def _remove_path(p: Path) -> None:
     helper instead. It dispatches to `links.remove_link` for links and
     `shutil.rmtree` for real dirs.
     """
-    if not p.exists() and not p.is_symlink():
+    if not p.exists() and not _is_link(p):
         return
     from switcher.links import remove_link
 
-    if p.is_symlink() or (IS_WINDOWS and os.path.isjunction(p)):
+    if _is_link(p):
         remove_link(p)
     elif p.is_dir():
         shutil.rmtree(p)

@@ -1014,8 +1014,14 @@ class ProfileService:
     def prune(self, *, force: bool = False, dry_run: bool = False) -> PruneReport:
         """Delete orphan profiles (spec §5). Calls ProfileService.delete for each."""
         self._require_initialized()
-        orphans = self._compute_orphans()
-        sizes = {name: self._profile_size_bytes(name) for name in orphans}
+        # Surface filesystem failures (permission denied, transient ENOENT,
+        # broken entries) as PruneError rather than leaking raw OSError —
+        # mirrors the StorageError / UninstallPreflightError contract.
+        try:
+            orphans = self._compute_orphans()
+            sizes = {name: self._profile_size_bytes(name) for name in orphans}
+        except OSError as e:
+            raise PruneError(f"prune failed during orphan walk: {e}") from e
 
         report = PruneReport(deleted=[], sizes_bytes=sizes)
         if not orphans:
@@ -1031,7 +1037,10 @@ class ProfileService:
             raise PruneError("service-level prune called without --force; CLI must confirm")
 
         for name in orphans:
-            self.delete(name)  # service-layer guard for defense-in-depth
+            try:
+                self.delete(name)  # service-layer guard for defense-in-depth
+            except OSError as e:
+                raise PruneError(f"prune failed deleting {name!r}: {e}") from e
             report.deleted.append(name)
         return report
 
@@ -1083,6 +1092,13 @@ class ProfileService:
             return
         if m.state == _UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
             temp = _temp_dir_for_uninstall(m.live_path)
+            # Re-check live_path before rename: classification was made from an
+            # earlier read; if the live path reappeared (concurrent process,
+            # interrupted retry), refuse to clobber it.
+            if m.live_path.is_symlink() or m.live_path.exists():
+                raise UninstallPreflightError(
+                    f"live path {m.live_path} reappeared during execution; refusing to overwrite"
+                )
             temp.rename(m.live_path)
             return
         if m.state == _UninstallMappingState.ALREADY_RESTORED:

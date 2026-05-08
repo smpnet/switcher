@@ -124,3 +124,23 @@ def test_prune_without_force_in_tty_still_refuses_at_service_layer(
     with pytest.raises(PruneError, match="CLI must confirm"):
         s.prune(force=False)
     assert (tmp_state / "profiles" / "orphan-a").exists()
+
+
+def test_prune_wraps_filesystem_oserror_as_prune_error(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Filesystem failures during orphan-walk surface as PruneError, not raw OSError.
+    Mirrors the StorageError / UninstallPreflightError contract."""
+    s = _service(tmp_state, tmp_home)
+    s.init()
+    s.create("orphan-a")
+
+    # Force size computation to fail mid-walk (e.g. permission denied on a
+    # profile subdir). Must surface as PruneError — not raw OSError.
+    def _boom(self: ProfileService, name: str) -> int:
+        raise PermissionError(f"denied: {name}")
+
+    monkeypatch.setattr(ProfileService, "_profile_size_bytes", _boom)
+
+    with pytest.raises(PruneError, match="orphan walk"):
+        s.prune(force=True)

@@ -44,8 +44,13 @@ def test_status_shows_dashes_when_active_populated_but_cache_missing(
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
     active = json.loads(cfg.read_text())["active"]
-    for _ in active:
-        assert "[ok]" in result.output or "[--]" in result.output
+    # Each active tool gets exactly one indicator line — total count of
+    # `[ok]` + `[--]` must equal the number of active tools.
+    ok_count = result.output.count("[ok]")
+    dash_count = result.output.count("[--]")
+    assert ok_count + dash_count == len(active), (
+        f"Expected {len(active)} indicators, got {ok_count} [ok] + {dash_count} [--]"
+    )
 
 
 def test_status_shows_dashes_when_live_link_broken_and_cache_empty(
