@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from switcher.paths import IS_WINDOWS, PathResolver
-from switcher.registry import build_registry
+from switcher.registry import build_registry, find_tool
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
@@ -90,3 +90,23 @@ def test_full_lifecycle(tmp_home: Path, tmp_state: Path) -> None:
     # --- rename experiment while it's active --------------------------------
     service.rename("experiment", "client-A")
     assert_active_profile("client-A")
+
+
+def test_init_populates_active_live_paths(tmp_state: Path, tmp_home: Path) -> None:
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    registry = build_registry(tmp_state / "registry.d")
+    service = ProfileService(store, resolver, registry)
+
+    service.init()
+
+    cache = store.get_active_live_paths()
+    active = store.get_active()
+    assert set(cache) == set(active)
+    for tool_id, paths in cache.items():
+        # Copilot has 2 DirMappings, claude has 1 — both shapes work.
+        tool = find_tool(registry, tool_id)
+        assert tool is not None
+        assert len(paths) == len(tool.config_dirs)
+        for p in paths:
+            assert Path(p).is_symlink() or (IS_WINDOWS and os.path.isjunction(Path(p)))

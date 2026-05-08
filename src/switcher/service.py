@@ -84,13 +84,20 @@ class ProfileService:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
 
-    def _capture_tool(self, profile: str, tool: Tool) -> None:
-        """Move every live dir for `tool` into `profile`, then link back."""
+    def _capture_tool(self, profile: str, tool: Tool) -> list[str]:
+        """Move every live dir for `tool` into `profile`, then link back.
+
+        Returns the list of resolved live-path strings (one per DirMapping)
+        for the v0.1.3 active_live_paths cache.
+        """
+        paths: list[str] = []
         for i, dm in enumerate(tool.config_dirs):
             live = self._resolver.tool_dir(tool, i)
             target = self._store.profile_dir(profile) / dm.profile_subdir
             move_or_seed_dir(live, target)
             swap_link(target, live)
+            paths.append(str(live))
+        return paths
 
     def get_active_live_paths(self) -> dict[str, list[str]]:
         """Public accessor — for CLI/status (§2.6 layer ownership).
@@ -189,12 +196,16 @@ class ProfileService:
                     )
         current_name = now().strftime("%Y-%m-%d") + "-current"
         self._store.create(current_name, {t.id: True for t in installed})
+        live_paths_cache: dict[str, list[str]] = {}
         for tool in installed:
-            self._capture_tool(current_name, tool)
+            live_paths_cache[tool.id] = self._capture_tool(current_name, tool)
         self._store.create("vanilla", {t.id: True for t in installed})
         for tool in installed:
             self._seed_credentials(current_name, "vanilla", tool)
-        self._store.set_active({t.id: current_name for t in installed})
+        # Single atomic write of both keys — never set_active then
+        # set_active_live_paths separately (crash window).
+        active = {t.id: current_name for t in installed}
+        self._store.set_active_state(active, live_paths_cache)
         return current_name
 
     def use(self, profile_name: str, only: list[str] | None = None) -> None:
