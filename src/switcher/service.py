@@ -354,17 +354,28 @@ class ProfileService:
         """Shallow content match: same set of relative paths, same file sizes.
 
         Spec §3.2 explicitly chose size-equality over byte-equality (too
-        expensive at MB scale).
+        expensive at MB scale). Empty directories also have to match — a
+        files-only comparison would falsely accept a profile with an empty
+        subdir against a live tree that's missing it (or vice versa) as
+        ALREADY_RESTORED, skipping the unwind on an incomplete restore.
+        Sentinel values disambiguate the two entry kinds: a non-negative
+        size for files (st_size), -1 for directories.
         """
         if not a.is_dir() or not b.is_dir():
             return False
         a_entries: dict[str, int] = {}
         b_entries: dict[str, int] = {}
-        for root, _, files in os.walk(a):
+        for root, dirs, files in os.walk(a):
+            for d in dirs:
+                p = Path(root) / d
+                a_entries[str(p.relative_to(a)) + "/"] = -1
             for f in files:
                 p = Path(root) / f
                 a_entries[str(p.relative_to(a))] = p.stat().st_size
-        for root, _, files in os.walk(b):
+        for root, dirs, files in os.walk(b):
+            for d in dirs:
+                p = Path(root) / d
+                b_entries[str(p.relative_to(b)) + "/"] = -1
             for f in files:
                 p = Path(root) / f
                 b_entries[str(p.relative_to(b))] = p.stat().st_size

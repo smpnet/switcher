@@ -217,7 +217,8 @@ def uninstall(
         if m.state.value == "already_restored":
             err_console.print(f"already restored {m.live_path}")
         elif m.state.value == "missing_live_temp_present":
-            err_console.print(f"recovered {m.live_path} from interrupted uninstall")
+            verb = "would recover" if dry_run else "recovered"
+            err_console.print(f"{verb} {m.live_path} from interrupted uninstall")
         else:
             err_console.print(
                 f"{prefix}unlink {m.live_path} (was symlink to "

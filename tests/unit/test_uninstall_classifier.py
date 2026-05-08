@@ -136,6 +136,33 @@ def test_classify_corrupt_when_symlink_target_does_not_match_profile(
     assert "points to" in re_classified.corruption_reason
 
 
+def test_classify_corrupt_when_real_dir_missing_empty_subdir(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """Files-only equality would falsely accept this; empty dir presence must differ.
+
+    A profile that contains an empty subdir but the live tree doesn't
+    must NOT classify as ALREADY_RESTORED — that would skip the unwind
+    on an incomplete restore.
+    """
+    service = _build_initialized(tmp_state, tmp_home)
+    mappings = service._classify_uninstall_mappings()
+    m = mappings[0]
+    # Add an empty subdir to the profile side only.
+    (m.profile_dir_subdir / "extra-empty-dir").mkdir()
+    # Replace the live link with a real dir that has no empty subdir.
+    _drop_link(m.live_path)
+    m.live_path.mkdir()
+
+    re_classified = next(
+        c
+        for c in service._classify_uninstall_mappings()
+        if (c.tool_id, c.profile_subdir) == (m.tool_id, m.profile_subdir)
+    )
+    assert re_classified.state == State.CORRUPT
+    assert "does not match" in re_classified.corruption_reason
+
+
 def test_classify_corrupt_when_temp_dir_collides_with_live_link(
     tmp_state: Path, tmp_home: Path
 ) -> None:
