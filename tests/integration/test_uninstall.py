@@ -68,9 +68,7 @@ def test_uninstall_default_restores_real_dirs_and_clears_active(
     assert (tmp_state / "profiles").is_dir()
 
 
-def test_uninstall_purge_removes_state_dir(
-    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_uninstall_purge_removes_state_dir(tmp_state: Path, tmp_home: Path) -> None:
     s = _service(tmp_state, tmp_home)
     s.init()
 

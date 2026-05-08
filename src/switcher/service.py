@@ -234,11 +234,33 @@ class ProfileService:
                 for cached_str in cached_paths:
                     live = Path(cached_str)
                     if self._resolver.is_link(live):
+                        # Derive the subdir relative to the profile dir, not via
+                        # `target.name`. The current data model validates
+                        # profile_subdir as a single safe-name segment, so the
+                        # two are equivalent today — but `relative_to` (a) is
+                        # forward-compatible if v0.2+ relaxes the constraint and
+                        # (b) explicitly fails when the resolved target is
+                        # outside the profile dir (a corrupt-cache symptom we
+                        # otherwise silently masked into a basename).
                         try:
                             target = live.resolve()
-                            subdir = target.name
-                        except OSError:
-                            subdir = "<unresolvable>"
+                            subdir = str(target.relative_to(profile_dir.resolve()))
+                        except (OSError, ValueError) as e:
+                            result.append(
+                                _UninstallMapping(
+                                    tool_id=tool_id,
+                                    profile_subdir="<unresolvable>",
+                                    live_path=live,
+                                    profile_dir_subdir=profile_dir,
+                                    state=_UninstallMappingState.CORRUPT,
+                                    corruption_reason=(
+                                        f"orphan tool {tool_id!r}: cached live path {live} "
+                                        f"resolves outside the profile dir or cannot be "
+                                        f"resolved: {e}"
+                                    ),
+                                )
+                            )
+                            continue
                         pairs.append((subdir, live))
                     else:
                         # Resume case OR cache invalid — flag CORRUPT on the
@@ -807,7 +829,16 @@ class ProfileService:
                     f"sibling temp dir {temp} appeared during execution; refusing "
                     f"to overwrite. Inspect/remove {temp} manually and re-run."
                 )
-            shutil.copytree(m.profile_dir_subdir, temp, symlinks=False, dirs_exist_ok=False)
+            # On copytree failure we'd otherwise leave a partial temp behind,
+            # which the next retry's pre-flight collision check would refuse —
+            # wedging recovery until manual cleanup. ignore_errors is fine
+            # because the temp is wholly within our control (sibling of live)
+            # and the original error is what we want to surface.
+            try:
+                shutil.copytree(m.profile_dir_subdir, temp, symlinks=False, dirs_exist_ok=False)
+            except Exception:
+                shutil.rmtree(temp, ignore_errors=True)
+                raise
             restore_real_dir(temp, m.live_path)
             return
         if m.state == _UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:

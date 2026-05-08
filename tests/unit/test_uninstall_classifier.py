@@ -12,9 +12,10 @@ import os
 import shutil
 from pathlib import Path
 
+from switcher.links import _create_junction
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry
-from switcher.service import ProfileService
+from switcher.service import ProfileService, _temp_dir_for_uninstall
 from switcher.service import _UninstallMappingState as State
 from switcher.store import FileProfileStore
 
@@ -85,8 +86,6 @@ def test_classify_corrupt_when_real_dir_does_not_match_profile(
 
 def test_classify_missing_live_temp_present(tmp_state: Path, tmp_home: Path) -> None:
     """Simulate a crash between unlink and rename — live path missing, sibling temp exists."""
-    from switcher.service import _temp_dir_for_uninstall
-
     service = _build_initialized(tmp_state, tmp_home)
     mappings = service._classify_uninstall_mappings()
     m = mappings[0]
@@ -120,8 +119,6 @@ def test_classify_corrupt_when_symlink_target_does_not_match_profile(
     if m.live_path.is_symlink() or (IS_WINDOWS and os.path.isjunction(m.live_path)):
         if IS_WINDOWS and os.path.isjunction(m.live_path):
             m.live_path.rmdir()
-            from switcher.links import _create_junction
-
             _create_junction(bogus, m.live_path)
         else:
             m.live_path.unlink()
@@ -161,6 +158,34 @@ def test_classify_corrupt_when_real_dir_missing_empty_subdir(
     )
     assert re_classified.state == State.CORRUPT
     assert "does not match" in re_classified.corruption_reason
+
+
+def test_classify_orphan_tool_with_link_outside_profile_dir_is_corrupt(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """Orphan tool path: a cached symlink resolving outside its profile dir
+    must classify as CORRUPT, not silently record the basename."""
+    service = _build_initialized(tmp_state, tmp_home)
+    # Pick a real tool, then strip its registry presence by injecting a fake
+    # tool id into active + cache so the classifier follows the orphan branch.
+    active = service._store.get_active()
+    cache = service.get_active_live_paths()
+    # Reuse claude's live path for the orphan tool, pointing at a junk dir
+    # outside any profile directory.
+    bogus = tmp_home / "outside-tree"
+    bogus.mkdir()
+    orphan_live = tmp_home / "orphan-link"
+    orphan_live.symlink_to(bogus)
+    profile = next(iter(active.values()))
+    active["orphan_tool"] = profile
+    cache["orphan_tool"] = [str(orphan_live)]
+    service._store.set_active_state(active, cache)
+
+    re_classified = next(
+        c for c in service._classify_uninstall_mappings() if c.tool_id == "orphan_tool"
+    )
+    assert re_classified.state == State.CORRUPT
+    assert "outside the profile dir" in re_classified.corruption_reason
 
 
 def test_classify_corrupt_when_temp_dir_collides_with_live_link(
