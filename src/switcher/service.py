@@ -1085,8 +1085,12 @@ class ProfileService:
             if not sys.stdin.isatty():
                 raise PruneError("refusing to delete without --force in non-interactive mode")
             # Prompt is the CLI's responsibility; service trusts force=True if
-            # CLI confirmed. Service-only callers must pass force=True themselves.
-            raise PruneError("service-level prune called without --force; CLI must confirm")
+            # CLI confirmed. Programmatic callers must confirm and pass
+            # force=True themselves.
+            raise PruneError(
+                "prune requires force=True from caller; "
+                "interactive confirmation is the CLI's responsibility"
+            )
 
         for name in orphans:
             try:

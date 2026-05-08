@@ -121,7 +121,7 @@ def test_prune_without_force_in_tty_still_refuses_at_service_layer(
 
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
-    with pytest.raises(PruneError, match="CLI must confirm"):
+    with pytest.raises(PruneError, match="requires force=True"):
         s.prune(force=False)
     assert (tmp_state / "profiles" / "orphan-a").exists()
 
