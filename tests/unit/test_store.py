@@ -277,7 +277,7 @@ def _bare_state(tmp_path: Path) -> Path:
 
 def test_get_active_live_paths_returns_empty_dict_when_missing(tmp_path: Path) -> None:
     state_dir = _bare_state(tmp_path)
-    (state_dir / "config.json").write_text(json.dumps({"active": {}}))
+    (state_dir / "config.json").write_text(json.dumps({"active": {}}), encoding="utf-8")
     s = FileProfileStore(state_dir)
     assert s.get_active_live_paths() == {}
 
@@ -285,7 +285,9 @@ def test_get_active_live_paths_returns_empty_dict_when_missing(tmp_path: Path) -
 def test_get_active_live_paths_treats_null_top_level_as_empty(tmp_path: Path) -> None:
     """Spec §2.3: top-level active_live_paths null defaults to empty."""
     state_dir = _bare_state(tmp_path)
-    (state_dir / "config.json").write_text(json.dumps({"active": {}, "active_live_paths": None}))
+    (state_dir / "config.json").write_text(
+        json.dumps({"active": {}, "active_live_paths": None}), encoding="utf-8"
+    )
     s = FileProfileStore(state_dir)
     assert s.get_active_live_paths() == {}
 
@@ -302,7 +304,8 @@ def test_get_active_live_paths_normalizes_null_per_tool_entries(tmp_path: Path) 
                     "claude": None,  # null entry → treated as missing
                 },
             }
-        )
+        ),
+        encoding="utf-8",
     )
     s = FileProfileStore(state_dir)
     result = s.get_active_live_paths()
@@ -317,7 +320,8 @@ def test_get_active_live_paths_normalizes_empty_list_per_tool_entries(tmp_path: 
                 "active": {"claude": "A"},
                 "active_live_paths": {"claude": []},  # empty list → treated as missing
             }
-        )
+        ),
+        encoding="utf-8",
     )
     s = FileProfileStore(state_dir)
     assert s.get_active_live_paths() == {}
@@ -344,7 +348,7 @@ def test_set_active_state_writes_empty_dicts_explicitly(tmp_path: Path) -> None:
     s.set_active_state({"copilot": "A"}, {"copilot": ["/p"]})
     s.set_active_state({}, {})
 
-    raw = json.loads((state_dir / "config.json").read_text())
+    raw = json.loads((state_dir / "config.json").read_text(encoding="utf-8"))
     assert raw["active"] == {}
     assert raw["active_live_paths"] == {}  # explicit empty, NOT omitted
 
@@ -366,6 +370,41 @@ def test_set_active_live_paths_alone_preserves_existing_active(tmp_path: Path) -
     assert s.get_active() == {"copilot": "A"}
 
 
+def test_update_profile_tools_round_trips(store: FileProfileStore) -> None:
+    """Happy path: rescan --into reuses this to add a new tool."""
+    store.create("work", {"claude": True})
+    store.update_profile_tools("work", {"claude": True, "copilot": False})
+    assert store.get("work").tools == {"claude": True, "copilot": False}
+
+
+def test_update_profile_tools_unknown_profile_raises(store: FileProfileStore) -> None:
+    with pytest.raises(UnknownProfileError):
+        store.update_profile_tools("missing", {"claude": True})
+
+
+def test_update_profile_tools_preserves_unknown_metadata_keys(store: FileProfileStore) -> None:
+    """Symmetric with config.json's unknown-key preservation: a forward-compat
+    metadata field written by a newer version must survive a v0.1.3
+    rescan/rollback rewrite, otherwise update_profile_tools silently
+    truncates downgrade-incompatible state."""
+    store.create("work", {"claude": True})
+    meta_path = store.profile_dir("work") / "metadata.json"
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw["future_field"] = {"nested": True}
+    raw["managed_tools"] = ["claude"]
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    store.update_profile_tools("work", {"claude": True, "copilot": True})
+
+    written = json.loads(meta_path.read_text(encoding="utf-8"))
+    # Typed fields updated via the constructor (validators re-ran).
+    assert written["tools"] == {"claude": True, "copilot": True}
+    assert written["name"] == "work"
+    # Unknown keys round-tripped.
+    assert written["future_field"] == {"nested": True}
+    assert written["managed_tools"] == ["claude"]
+
+
 def test_unknown_top_level_keys_are_preserved_on_round_trip(tmp_path: Path) -> None:
     state_dir = _bare_state(tmp_path)
     (state_dir / "config.json").write_text(
@@ -376,13 +415,14 @@ def test_unknown_top_level_keys_are_preserved_on_round_trip(tmp_path: Path) -> N
                 "managed_tools": ["copilot"],  # synthetic future v0.1.4 key
                 "future_thing": {"nested": True},
             }
-        )
+        ),
+        encoding="utf-8",
     )
     s = FileProfileStore(state_dir)
 
     s.set_active_state({"copilot": "B"}, {"copilot": ["/p"]})
 
-    raw = json.loads((state_dir / "config.json").read_text())
+    raw = json.loads((state_dir / "config.json").read_text(encoding="utf-8"))
     assert raw["active"] == {"copilot": "B"}
     assert raw["active_live_paths"] == {"copilot": ["/p"]}
     # Unknown keys preserved.

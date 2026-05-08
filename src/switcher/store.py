@@ -279,14 +279,39 @@ class FileProfileStore:
         """Re-write a profile's metadata.json with an updated tools map.
 
         Used by `rescan --into` to add a new tool to an existing profile's
-        metadata (and by `rescan` rollback to revert that change). The
-        write is atomic via _atomic_write; the new Profile is built through
-        the constructor so field validators (`name`, `created_at`) actually
-        re-run — `model_copy(update=...)` would skip them in pydantic v2.
+        metadata (and by `rescan` rollback to revert that change).
+
+        The new Profile is built through the constructor so field validators
+        (`name`, `created_at`) actually re-run — `model_copy(update=...)`
+        would skip them in pydantic v2. Unknown top-level keys in the
+        existing metadata.json are preserved (parallel to the config.json
+        discipline in `set_active_state`), so a forward-compat metadata
+        field written by a newer version isn't silently dropped on a v0.1.3
+        rescan/rollback. The write is atomic via _atomic_write.
         """
+        meta_path = self._metadata_path(name)
+        if not meta_path.exists():
+            raise UnknownProfileError(f"profile {name!r} not found")
+        try:
+            raw = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise StorageError(f"error reading {meta_path}: {e}") from e
+        if not isinstance(raw, dict):
+            raise StorageError(f"malformed metadata.json: {meta_path}")
+        # Re-validate by routing the existing typed fields through the
+        # Profile constructor; this surfaces drift in the on-disk values
+        # even when the caller is only changing tools.
         prof = self.get(name)
         new_prof = Profile(name=prof.name, created_at=prof.created_at, tools=dict(tools))
-        self._atomic_write(
-            self._metadata_path(name),
-            new_prof.model_dump_json(by_alias=True),
-        )
+        typed = json.loads(new_prof.model_dump_json(by_alias=True))
+        # Drop both alias variants so a manually-edited file with the
+        # snake_case `created_at` doesn't end up alongside the camelCase
+        # `createdAt` we re-emit. `tools` and `name` are dropped likewise
+        # so the typed values win cleanly.
+        unknown = {
+            k: v
+            for k, v in cast("dict[str, object]", raw).items()
+            if k not in {"name", "createdAt", "created_at", "tools"}
+        }
+        merged = {**unknown, **typed}
+        self._atomic_write(meta_path, json.dumps(merged, sort_keys=True))
