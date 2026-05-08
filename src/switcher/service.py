@@ -952,24 +952,38 @@ class ProfileService:
             updated_tools = dict(existing.tools)
             updated_tools[tool.id] = True
 
-        completed: list[tuple[Path, Path]] = []  # (live, target_subdir) for rollback
+        # Track per-mapping whether capture seeded an originally-missing live
+        # path (mkdir'd an empty target) vs moved a real live dir into the
+        # target. Rollback for "seeded" mappings must NOT recreate live, or
+        # we corrupt the user's pre-rescan filesystem state (empty dir at a
+        # path that was originally missing → next rescan's detection sees a
+        # stale "tool installed" signal).
+        completed: list[tuple[Path, Path, bool]] = []  # (live, tgt, was_seeded)
         try:
             for i, dm in enumerate(tool.config_dirs):
                 live = self._resolver.tool_dir(tool, i)
                 tgt = target_dir / dm.profile_subdir
+                live_is_link = live.is_symlink() or (IS_WINDOWS and os.path.isjunction(live))
+                was_seeded = not live.exists() and not live_is_link
                 move_or_seed_dir(live, tgt)
                 swap_link(tgt, live)
-                completed.append((live, tgt))
+                completed.append((live, tgt, was_seeded))
         except Exception:
             # In-loop rollback: undo each completed mapping in reverse.
             # Metadata never mutated for --into (deferred), so no revert needed.
-            for live, tgt in reversed(completed):
+            for live, tgt, was_seeded in reversed(completed):
                 if self._resolver.is_link(live):
                     with contextlib.suppress(Exception):
                         remove_link(live)
                 if tgt.exists():
-                    with contextlib.suppress(Exception):
-                        move_or_seed_dir(tgt, live)
+                    if was_seeded:
+                        # Original state: live missing. Drop the empty seeded
+                        # tgt; do NOT recreate live.
+                        with contextlib.suppress(Exception):
+                            shutil.rmtree(tgt)
+                    else:
+                        with contextlib.suppress(Exception):
+                            move_or_seed_dir(tgt, live)
             raise
 
         # Capture succeeded — commit the metadata update for --into. If this
@@ -995,6 +1009,17 @@ class ProfileService:
         user data.
         """
         target_dir = self._store.profile_dir(target)
+
+        def _is_empty_dir(p: Path) -> bool:
+            """An empty sub means the inner phase seeded it (live was missing)
+            rather than moved real content into it. Restoring an empty seed
+            back to live would mkdir at a path that was originally missing —
+            corrupting detection on the next rescan run."""
+            try:
+                return not any(p.iterdir())
+            except OSError:
+                return False
+
         if not into:
             # Drop any leftover live symlinks (defensive — in-loop rollback
             # should have handled these already).
@@ -1004,7 +1029,7 @@ class ProfileService:
                     with contextlib.suppress(Exception):
                         remove_link(live)
                 sub = target_dir / dm.profile_subdir
-                if sub.exists():
+                if sub.is_dir() and not _is_empty_dir(sub):
                     with contextlib.suppress(Exception):
                         move_or_seed_dir(sub, live)
             shutil.rmtree(target_dir, ignore_errors=True)
@@ -1018,18 +1043,23 @@ class ProfileService:
                 with contextlib.suppress(Exception):
                     remove_link(live)
             sub = target_dir / dm.profile_subdir
-            if sub.is_dir():
-                if live.exists() or self._resolver.is_link(live):
-                    # Live already restored (e.g. by in-loop rollback) —
-                    # just drop the leftover sub.
-                    shutil.rmtree(sub, ignore_errors=True)
-                else:
-                    with contextlib.suppress(Exception):
-                        move_or_seed_dir(sub, live)
-                    # If move failed for any reason, surface the leftover
-                    # for manual cleanup rather than silent rmtree.
-                    if sub.exists():
-                        shutil.rmtree(sub, ignore_errors=True)
+            if not sub.is_dir():
+                continue
+            if live.exists() or self._resolver.is_link(live):
+                # Live already restored (e.g. by in-loop rollback) —
+                # just drop the leftover sub.
+                shutil.rmtree(sub, ignore_errors=True)
+                continue
+            if _is_empty_dir(sub):
+                # Seed leftover; live was originally missing. Don't recreate.
+                shutil.rmtree(sub, ignore_errors=True)
+                continue
+            with contextlib.suppress(Exception):
+                move_or_seed_dir(sub, live)
+            # If move failed for any reason, surface the leftover
+            # for manual cleanup rather than silent rmtree.
+            if sub.exists():
+                shutil.rmtree(sub, ignore_errors=True)
 
     # Prune ------------------------------------------------------------------
 

@@ -282,6 +282,49 @@ def test_rescan_into_rollback_restores_live_dir_contents(
     assert (tmp_home / ".config" / "github-copilot" / "config").read_text() == "settings"
 
 
+def test_rescan_rollback_does_not_create_empty_live_dir_for_seeded_mapping(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (abby-review): when a secondary live path is missing, the
+    capture loop "seeds" an empty subdir at the profile target. If a later
+    swap_link fails and rollback runs, the seeded mapping must NOT mkdir
+    the live path back into existence — the original state was "missing",
+    not "empty dir present"."""
+    s = _service(tmp_state, tmp_home)
+    _remove_path(tmp_home / ".copilot")
+    _remove_path(tmp_home / ".config" / "github-copilot")
+    s.init()  # claude only
+
+    # Set up: first config dir present, second missing → second is seeded.
+    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
+    (tmp_home / ".config" / "github-copilot" / "config").write_text("settings")
+    # `.copilot` deliberately NOT created — this is the seeded mapping.
+
+    from switcher import service as svc_mod
+
+    # Fail on the second swap_link (after the seed mapping has been seeded
+    # and after the move mapping has been moved+linked).
+    real_swap = svc_mod.swap_link
+    call_count = {"n": 0}
+
+    def maybe_failing_swap(target: Path, link: Path) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated FS error on second swap_link")
+        real_swap(target, link)
+
+    monkeypatch.setattr(svc_mod, "swap_link", maybe_failing_swap)
+
+    with pytest.raises(RescanCaptureError):
+        s.rescan(only=["copilot"])
+
+    # Critical assertion: `.copilot` was missing originally and must STAY
+    # missing after rollback. Creating an empty dir here would corrupt
+    # detection on the next rescan run.
+    assert not (tmp_home / ".copilot").exists()
+    assert not (tmp_home / ".copilot").is_symlink()
+
+
 def test_rescan_already_linked_raises(tmp_state: Path, tmp_home: Path) -> None:
     """Spec §4.3: live path already a link (e.g. user-managed symlink) → AlreadyLinkedError.
 
