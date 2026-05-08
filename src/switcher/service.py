@@ -87,8 +87,9 @@ class ProfileService:
     def _capture_tool(self, profile: str, tool: Tool) -> list[str]:
         """Move every live dir for `tool` into `profile`, then link back.
 
-        Returns the list of resolved live-path strings (one per DirMapping)
-        for the v0.1.3 active_live_paths cache.
+        Returns the list of live-path strings (one per DirMapping) — the
+        symlink locations themselves, not their resolved targets — for the
+        v0.1.3 active_live_paths cache.
         """
         paths: list[str] = []
         for i, dm in enumerate(tool.config_dirs):

@@ -134,10 +134,15 @@ def test_rename_flushes_derived_active_live_paths(tmp_state: Path, tmp_home: Pat
 
     raw_after = json.loads(cfg_path.read_text())
     assert raw_after["active_live_paths"], "rename() did not flush derived cache"
-    # Post-rename, the cache values reference the renamed profile's targets.
+    # Post-rename, every cache value must resolve into the renamed profile dir.
+    # Falling back to `or is_symlink()` would pass even for stale symlinks
+    # still pointing at the old profile name, hiding a relink regression.
     for paths in raw_after["active_live_paths"].values():
         for p in paths:
-            assert "renamed-profile" in str(Path(p).resolve()) or Path(p).is_symlink()
+            resolved = str(Path(p).resolve())
+            assert "renamed-profile" in resolved, (
+                f"{p} does not resolve into renamed-profile: {resolved}"
+            )
 
 
 def test_init_populates_active_live_paths(tmp_state: Path, tmp_home: Path) -> None:
