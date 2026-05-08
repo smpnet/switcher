@@ -34,8 +34,25 @@ class ProfileStore(Protocol):
     def list(self) -> list[Profile]: ...
     def delete(self, name: str) -> None: ...
     def rename(self, old: str, new: str) -> None: ...
+
+    # v0.1.3: combined writer is the canonical path. set_active /
+    # set_active_live_paths remain as thin wrappers — they exist so callers
+    # that only know about one map don't accidentally drop the other on
+    # disk (the wrappers read the unmodified key from disk and round-trip it
+    # through set_active_state).
+    def set_active_state(
+        self,
+        active: Mapping[str, str],
+        active_live_paths: Mapping[str, list[str]],
+    ) -> None: ...
+
     def set_active(self, mapping: Mapping[str, str]) -> None: ...
     def get_active(self) -> dict[str, str]: ...
+    def set_active_live_paths(self, mapping: Mapping[str, list[str]]) -> None: ...
+    def get_active_live_paths(self) -> dict[str, list[str]]: ...
+
+    def update_profile_tools(self, name: str, tools: Mapping[str, bool]) -> None: ...
+
     def profile_dir(self, name: str) -> Path: ...
     def state_dir(self) -> Path: ...
 
@@ -157,13 +174,10 @@ class FileProfileStore:
         new_dir.parent.mkdir(parents=True, exist_ok=True)
         old_dir.replace(new_dir)
 
-    # -- active map ---------------------------------------------------------
+    # -- config.json layer (active + active_live_paths + unknown keys) ------
 
-    def set_active(self, mapping: Mapping[str, str]) -> None:
-        data = json.dumps({"active": dict(mapping)}, sort_keys=True)
-        self._atomic_write(self._config_path(), data)
-
-    def get_active(self) -> dict[str, str]:
+    def _load_config(self) -> dict[str, object]:
+        """Load full config.json as a top-level dict, including unknown keys."""
         path = self._config_path()
         if not path.exists():
             return {}
@@ -173,7 +187,34 @@ class FileProfileStore:
             raise StorageError(f"error reading config.json: {e}") from e
         if not isinstance(data, dict):
             raise StorageError(f"malformed config.json: {path}")
-        active = cast("dict[object, object]", data).get("active", {})
+        return cast("dict[str, object]", data)
+
+    def _write_config(self, data: Mapping[str, object]) -> None:
+        """Write the full top-level dict atomically. Caller is responsible for
+        having merged any unknown keys back in via _load_config first."""
+        text = json.dumps(dict(data), sort_keys=True)
+        self._atomic_write(self._config_path(), text)
+
+    def set_active_state(
+        self,
+        active: Mapping[str, str],
+        active_live_paths: Mapping[str, list[str]],
+    ) -> None:
+        """Canonical write: both maps in one atomic config.json write.
+        Always writes both keys, even when empty (spec §2.4 / §3.7)."""
+        data = self._load_config()
+        data["active"] = dict(active)
+        data["active_live_paths"] = {k: list(v) for k, v in active_live_paths.items()}
+        self._write_config(data)
+
+    def set_active(self, mapping: Mapping[str, str]) -> None:
+        """Convenience wrapper. Preserves the existing on-disk active_live_paths."""
+        self.set_active_state(mapping, self.get_active_live_paths())
+
+    def get_active(self) -> dict[str, str]:
+        path = self._config_path()
+        data = self._load_config()
+        active = data.get("active", {})
         if not isinstance(active, dict):
             raise StorageError(f"malformed config.json: {path}")
         active_typed = cast("dict[object, object]", active)
@@ -186,3 +227,64 @@ class FileProfileStore:
                 raise StorageError(f"malformed config.json: {path}")
             result[k] = v
         return result
+
+    def set_active_live_paths(self, mapping: Mapping[str, list[str]]) -> None:
+        """Convenience wrapper. Preserves the existing on-disk active map."""
+        self.set_active_state(self.get_active(), mapping)
+
+    def get_active_live_paths(self) -> dict[str, list[str]]:
+        """Read the cache, normalizing null/empty per spec §2.3.
+
+        Tolerated shapes (treated as absence):
+          - top-level active_live_paths missing or null → {}
+          - per-tool entry null or [] → tool absent from result
+
+        Rejected shapes (raise StorageError):
+          - top-level active_live_paths is a non-dict, non-null type
+          - per-tool entry is non-null, non-list
+          - per-tool entry contains non-string elements
+          - per-tool key is not a string
+        """
+        data = self._load_config()
+        raw = data.get("active_live_paths")
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise StorageError(
+                f"config.json: 'active_live_paths' must be an object or null, "
+                f"got {type(raw).__name__}"
+            )
+        result: dict[str, list[str]] = {}
+        for k, v in cast("dict[object, object]", raw).items():
+            if not isinstance(k, str):
+                raise StorageError("config.json: 'active_live_paths' keys must be strings")
+            if v is None or v == []:
+                continue  # normalize to absence; eligible for derivation
+            if not isinstance(v, list):
+                raise StorageError(
+                    f"config.json: 'active_live_paths[{k}]' must be a list, null, "
+                    f"or empty array; got {type(v).__name__}"
+                )
+            paths: list[str] = []
+            for p in cast("list[object]", v):
+                if not isinstance(p, str):
+                    raise StorageError(
+                        f"config.json: 'active_live_paths[{k}]' must contain strings"
+                    )
+                paths.append(p)
+            result[k] = paths
+        return result
+
+    def update_profile_tools(self, name: str, tools: Mapping[str, bool]) -> None:
+        """Re-write a profile's metadata.json with an updated tools map.
+
+        Used by `rescan --into` to add a new tool to an existing profile's
+        metadata (and by `rescan` rollback to revert that change). The
+        write is atomic via _atomic_write; the in-memory Profile is rebuilt
+        via model_copy so existing validation runs.
+        """
+        prof = self.get(name)
+        new_prof = prof.model_copy(update={"tools": dict(tools)})
+        meta_path = self.profile_dir(name) / "metadata.json"
+        text = new_prof.model_dump_json(by_alias=True)
+        self._atomic_write(meta_path, text)

@@ -1,5 +1,6 @@
 """File-backed profile store with atomic JSON writes."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -262,3 +263,128 @@ def test_profile_methods_reject_unsafe_names(store: FileProfileStore, bad_name: 
         store.rename(bad_name, "new")
     with pytest.raises(ValueError):
         store.rename("old", bad_name)
+
+
+# --- active_live_paths cache (v0.1.3) -----------------------------------------
+
+
+def _bare_state(tmp_path: Path) -> Path:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "profiles").mkdir()
+    return state_dir
+
+
+def test_get_active_live_paths_returns_empty_dict_when_missing(tmp_path: Path) -> None:
+    state_dir = _bare_state(tmp_path)
+    (state_dir / "config.json").write_text(json.dumps({"active": {}}))
+    s = FileProfileStore(state_dir)
+    assert s.get_active_live_paths() == {}
+
+
+def test_get_active_live_paths_treats_null_top_level_as_empty(tmp_path: Path) -> None:
+    """Spec §2.3: top-level active_live_paths null defaults to empty."""
+    state_dir = _bare_state(tmp_path)
+    (state_dir / "config.json").write_text(json.dumps({"active": {}, "active_live_paths": None}))
+    s = FileProfileStore(state_dir)
+    assert s.get_active_live_paths() == {}
+
+
+def test_get_active_live_paths_normalizes_null_per_tool_entries(tmp_path: Path) -> None:
+    """Spec §2.3: per-tool null/[] entries are treated as missing (eligible for derivation)."""
+    state_dir = _bare_state(tmp_path)
+    (state_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "active": {"copilot": "A", "claude": "A"},
+                "active_live_paths": {
+                    "copilot": ["/home/u/.copilot"],
+                    "claude": None,  # null entry → treated as missing
+                },
+            }
+        )
+    )
+    s = FileProfileStore(state_dir)
+    result = s.get_active_live_paths()
+    assert result == {"copilot": ["/home/u/.copilot"]}  # claude absent, not raised
+
+
+def test_get_active_live_paths_normalizes_empty_list_per_tool_entries(tmp_path: Path) -> None:
+    state_dir = _bare_state(tmp_path)
+    (state_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "active": {"claude": "A"},
+                "active_live_paths": {"claude": []},  # empty list → treated as missing
+            }
+        )
+    )
+    s = FileProfileStore(state_dir)
+    assert s.get_active_live_paths() == {}
+
+
+def test_set_active_state_writes_both_maps_atomically(tmp_path: Path) -> None:
+    state_dir = _bare_state(tmp_path)
+    s = FileProfileStore(state_dir)
+    s.set_active_state(
+        {"copilot": "client-A"},
+        {"copilot": ["/home/u/.config/github-copilot", "/home/u/.copilot"]},
+    )
+
+    assert s.get_active() == {"copilot": "client-A"}
+    assert s.get_active_live_paths() == {
+        "copilot": ["/home/u/.config/github-copilot", "/home/u/.copilot"],
+    }
+
+
+def test_set_active_state_writes_empty_dicts_explicitly(tmp_path: Path) -> None:
+    """Spec §3.7: post-uninstall, both maps are written as empty dicts."""
+    state_dir = _bare_state(tmp_path)
+    s = FileProfileStore(state_dir)
+    s.set_active_state({"copilot": "A"}, {"copilot": ["/p"]})
+    s.set_active_state({}, {})
+
+    raw = json.loads((state_dir / "config.json").read_text())
+    assert raw["active"] == {}
+    assert raw["active_live_paths"] == {}  # explicit empty, NOT omitted
+
+
+def test_set_active_alone_preserves_existing_active_live_paths(tmp_path: Path) -> None:
+    """Wrapper safety: `set_active(...)` must not silently drop the cache."""
+    state_dir = _bare_state(tmp_path)
+    s = FileProfileStore(state_dir)
+    s.set_active_state({"copilot": "A"}, {"copilot": ["/p"]})
+    s.set_active({"copilot": "B"})  # wrapper — should preserve cache
+    assert s.get_active_live_paths() == {"copilot": ["/p"]}
+
+
+def test_set_active_live_paths_alone_preserves_existing_active(tmp_path: Path) -> None:
+    state_dir = _bare_state(tmp_path)
+    s = FileProfileStore(state_dir)
+    s.set_active_state({"copilot": "A"}, {})
+    s.set_active_live_paths({"copilot": ["/p"]})  # wrapper — preserve active
+    assert s.get_active() == {"copilot": "A"}
+
+
+def test_unknown_top_level_keys_are_preserved_on_round_trip(tmp_path: Path) -> None:
+    state_dir = _bare_state(tmp_path)
+    (state_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "active": {"copilot": "A"},
+                "active_live_paths": {"copilot": ["/p"]},
+                "managed_tools": ["copilot"],  # synthetic future v0.1.4 key
+                "future_thing": {"nested": True},
+            }
+        )
+    )
+    s = FileProfileStore(state_dir)
+
+    s.set_active_state({"copilot": "B"}, {"copilot": ["/p"]})
+
+    raw = json.loads((state_dir / "config.json").read_text())
+    assert raw["active"] == {"copilot": "B"}
+    assert raw["active_live_paths"] == {"copilot": ["/p"]}
+    # Unknown keys preserved.
+    assert raw["managed_tools"] == ["copilot"]
+    assert raw["future_thing"] == {"nested": True}
