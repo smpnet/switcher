@@ -7,6 +7,7 @@ without reaching inside the service.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import sys
@@ -21,6 +22,7 @@ from switcher.errors import (
     PathNotADirectoryError,
     ProfileExistsError,
     ProfileIsActiveError,
+    RescanCaptureError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
     ToolHasNoActiveProfileError,
@@ -29,7 +31,7 @@ from switcher.errors import (
     UnknownProfileError,
     UnknownToolError,
 )
-from switcher.links import move_or_seed_dir, restore_real_dir, swap_link
+from switcher.links import move_or_seed_dir, remove_link, restore_real_dir, swap_link
 from switcher.models import Profile, Tool
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import find_tool
@@ -827,6 +829,187 @@ class ProfileService:
         report.purged = True
         return report
 
+    # Rescan -----------------------------------------------------------------
+
+    def rescan(
+        self,
+        *,
+        only: list[str] | None = None,
+        into: str | None = None,
+        dry_run: bool = False,
+    ) -> RescanReport:
+        """Capture newly-installed tools (spec §4)."""
+        self._require_initialized()
+        active = self._store.get_active()
+
+        # Detection: tool in registry, not in active, first config dir exists at live.
+        candidates: list[Tool] = []
+        for tool in self._registry:
+            if tool.id in active:
+                continue
+            if not tool.config_dirs:
+                continue
+            first_live = self._resolver.tool_dir(tool, 0)
+            if not self._resolver.exists(first_live):
+                continue
+            candidates.append(tool)
+
+        if only is not None:
+            if not only:
+                raise ValueError("--only requires at least one tool id")
+            allow = set(only)
+            unknown = allow - {t.id for t in self._registry}
+            if unknown:
+                raise UnknownToolError(f"unknown tool(s): {sorted(unknown)}")
+            already_managed = allow & set(active)
+            if already_managed:
+                raise RescanCaptureError(f"already managed: {sorted(already_managed)}")
+            not_detected = allow - {t.id for t in candidates} - already_managed
+            if not_detected:
+                raise RescanCaptureError(f"not detected at expected path: {sorted(not_detected)}")
+            candidates = [t for t in candidates if t.id in allow]
+
+        if not candidates:
+            return RescanReport(captured=[])
+
+        # Pre-flight per discovered tool — AlreadyLinkedError vs
+        # PathNotADirectoryError per spec §4.3. Missing secondary dirs are
+        # ALLOWED (will be seeded by move_or_seed_dir at capture time).
+        for tool in candidates:
+            for i in range(len(tool.config_dirs)):
+                live = self._resolver.tool_dir(tool, i)
+                if self._resolver.is_link(live):
+                    raise AlreadyLinkedError(f"{live} is already a link")
+                if live.exists() and not live.is_dir():
+                    raise PathNotADirectoryError(f"{live} exists but is not a directory")
+
+        # Resolve target profile name(s).
+        if into is not None:
+            if not self._store.profile_dir(into).exists():
+                raise UnknownProfileError(f"profile {into!r} not found")
+            for tool in candidates:
+                for dm in tool.config_dirs:
+                    if (self._store.profile_dir(into) / dm.profile_subdir).exists():
+                        raise RescanCaptureError(
+                            f"profile {into!r} already has {dm.profile_subdir!r} (would overwrite)"
+                        )
+            targets = {tool.id: into for tool in candidates}
+        else:
+            today = now().strftime("%Y-%m-%d")
+            n = 1
+            targets = {}
+            for tool in candidates:
+                while self._store.profile_dir(f"{today}-rescan-{n}").exists():
+                    n += 1
+                targets[tool.id] = f"{today}-rescan-{n}"
+                n += 1
+
+        if dry_run:
+            return RescanReport(captured=[(t.id, targets[t.id]) for t in candidates])
+
+        # Capture per tool, with rollback on partial failure. Single combined
+        # write per tool (active + cache atomic per spec §4.4).
+        report = RescanReport(captured=[])
+        live_paths_cache = self.get_active_live_paths()
+        for tool in candidates:
+            target = targets[tool.id]
+            try:
+                self._capture_tool_for_rescan(tool, target, into=into is not None)
+            except Exception as e:
+                # The per-tool capture method already attempted in-loop rollback;
+                # this catch is the outer safety net for the post-loop cleanup
+                # (profile dir / metadata revert) that an in-loop rollback might
+                # not cover.
+                self._rollback_partial_rescan(tool, target, into=into is not None)
+                raise RescanCaptureError(f"capture failed for {tool.id!r}: {e}") from e
+            # Both keys in one atomic write.
+            active[tool.id] = target
+            live_paths_cache[tool.id] = [
+                str(self._resolver.tool_dir(tool, i)) for i in range(len(tool.config_dirs))
+            ]
+            self._store.set_active_state(active, live_paths_cache)
+            report.captured.append((tool.id, target))
+        return report
+
+    def _capture_tool_for_rescan(self, tool: Tool, target: str, *, into: bool) -> None:
+        """Per-tool capture with metadata semantics from §4.4.
+
+        For `--into` mode: snapshot the existing profile's tools map BEFORE
+        mutation so rollback can restore it. The snapshot is held in a local
+        variable; on success it's discarded; on failure it's used to revert
+        metadata.json before propagating the exception.
+        """
+        target_dir = self._store.profile_dir(target)
+        tools_snapshot: dict[str, bool] | None = None  # for --into rollback
+
+        if not into:
+            self._store.create(target, {tool.id: True})
+        else:
+            existing = self._store.get(target)
+            tools_snapshot = dict(existing.tools)  # snapshot for rollback
+            updated_tools = dict(tools_snapshot)
+            updated_tools[tool.id] = True
+            self._store.update_profile_tools(target, updated_tools)
+
+        completed: list[tuple[Path, Path]] = []  # (live, target_subdir) for rollback
+        try:
+            for i, dm in enumerate(tool.config_dirs):
+                live = self._resolver.tool_dir(tool, i)
+                tgt = target_dir / dm.profile_subdir
+                move_or_seed_dir(live, tgt)
+                swap_link(tgt, live)
+                completed.append((live, tgt))
+        except Exception:
+            # In-loop rollback: undo each completed mapping in reverse.
+            for live, tgt in reversed(completed):
+                if self._resolver.is_link(live):
+                    with contextlib.suppress(Exception):
+                        remove_link(live)
+                if tgt.exists():
+                    with contextlib.suppress(Exception):
+                        move_or_seed_dir(tgt, live)
+            # `--into` metadata revert (best effort; outer rollback may catch state).
+            if into and tools_snapshot is not None:
+                with contextlib.suppress(Exception):
+                    self._store.update_profile_tools(target, tools_snapshot)
+            raise
+
+    def _rollback_partial_rescan(self, tool: Tool, target: str, *, into: bool) -> None:
+        """Outer-loop cleanup if `_capture_tool_for_rescan` raised.
+
+        For default mode: rmtree the partial profile dir (it was created by
+        store.create just before the capture loop and contains only this
+        tool's mappings).
+
+        For --into mode: the metadata snapshot was already restored by the
+        in-loop rollback; this outer cleanup just ensures any leftover
+        per-tool subdirs in the target profile are removed.
+        """
+        target_dir = self._store.profile_dir(target)
+        if not into:
+            # Drop any leftover live symlinks (defensive — in-loop rollback
+            # should have handled these already).
+            for i, dm in enumerate(tool.config_dirs):
+                live = self._resolver.tool_dir(tool, i)
+                if self._resolver.is_link(live):
+                    with contextlib.suppress(Exception):
+                        remove_link(live)
+                sub = target_dir / dm.profile_subdir
+                if sub.exists():
+                    with contextlib.suppress(Exception):
+                        move_or_seed_dir(sub, live)
+            shutil.rmtree(target_dir, ignore_errors=True)
+            return
+
+        # --into mode: leave existing profile content intact; just remove any
+        # of THIS tool's subdirs that weren't undone by the in-loop rollback.
+        for dm in tool.config_dirs:
+            sub = target_dir / dm.profile_subdir
+            if sub.is_dir():
+                shutil.rmtree(sub, ignore_errors=True)
+
+    # Uninstall execution ---------------------------------------------------
+
     def _execute_uninstall_mapping(self, m: _UninstallMapping) -> None:
         """Per-DirMapping execution, branching on classified state.
 
@@ -870,6 +1053,11 @@ class UninstallReport:
     skipped: list[tuple[str, str]]
     mappings: list[_UninstallMapping]
     purged: bool = False
+
+
+@dataclass
+class RescanReport:
+    captured: list[tuple[str, str]]  # (tool_id, target_profile)
 
 
 class _MigrationValidationError(Exception):
