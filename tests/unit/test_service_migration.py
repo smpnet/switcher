@@ -32,9 +32,9 @@ def _seed_initialized_state(
 def _strip_active_live_paths(tmp_state: Path) -> None:
     """Simulate a v0.1.0/v0.1.2 state file shape by removing the new key."""
     cfg = tmp_state / "config.json"
-    data = json.loads(cfg.read_text())
+    data = json.loads(cfg.read_text(encoding="utf-8"))
     data.pop("active_live_paths", None)
-    cfg.write_text(json.dumps(data, sort_keys=True))
+    cfg.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
 
 
 def test_legacy_state_derives_live_paths_via_strict_validation(

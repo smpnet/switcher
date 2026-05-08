@@ -103,16 +103,16 @@ def test_use_flushes_derived_active_live_paths(tmp_state: Path, tmp_home: Path) 
     service.init()
     # Strip active_live_paths to simulate v0.1.0/v0.1.2 state.
     cfg_path = tmp_state / "config.json"
-    raw = json.loads(cfg_path.read_text())
+    raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     raw["active_live_paths"] = {}
-    cfg_path.write_text(json.dumps(raw, sort_keys=True))
+    cfg_path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
 
     # Run use against the existing initialized profile (no-op switch).
     active_profile = next(iter(store.get_active().values()))
     service.use(active_profile)
 
     # active_live_paths is populated post-flush.
-    raw_after = json.loads(cfg_path.read_text())
+    raw_after = json.loads(cfg_path.read_text(encoding="utf-8"))
     assert raw_after["active_live_paths"], "use() did not flush derived cache"
 
 
@@ -125,14 +125,14 @@ def test_rename_flushes_derived_active_live_paths(tmp_state: Path, tmp_home: Pat
     service = ProfileService(store, resolver, registry)
     service.init()
     cfg_path = tmp_state / "config.json"
-    raw = json.loads(cfg_path.read_text())
+    raw = json.loads(cfg_path.read_text(encoding="utf-8"))
     raw["active_live_paths"] = {}
-    cfg_path.write_text(json.dumps(raw, sort_keys=True))
+    cfg_path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
 
     active_profile = next(iter(store.get_active().values()))
     service.rename(active_profile, "renamed-profile")
 
-    raw_after = json.loads(cfg_path.read_text())
+    raw_after = json.loads(cfg_path.read_text(encoding="utf-8"))
     assert raw_after["active_live_paths"], "rename() did not flush derived cache"
     # Post-rename, every cache value must resolve into the renamed profile dir.
     # Falling back to `or is_symlink()` would pass even for stale symlinks

@@ -137,6 +137,8 @@ def remove_link(link_path: Path) -> None:
     if link_path.is_symlink():
         link_path.unlink(missing_ok=True)
         return
+    if not link_path.exists():
+        raise PathNotADirectoryError(f"{link_path} does not exist; nothing to remove")
     raise PathNotADirectoryError(f"{link_path} is not a symlink or junction; refusing to remove")
 
 
