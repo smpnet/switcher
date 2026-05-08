@@ -192,6 +192,54 @@ def which(tool: str) -> None:
     console.print(name)
 
 
+@app.command()
+@handle_errors
+def uninstall(
+    purge: bool = typer.Option(
+        False, "--purge", help="Also remove the state directory after restoring real dirs."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the --purge confirmation prompt."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print plan; make no changes."),
+    force: bool = typer.Option(
+        False, "--force", help="Skip orphan tools (registry-and-cache-missing)."
+    ),
+) -> None:
+    """Inverse of init: replace every active symlink with a real directory."""
+    deps = get_deps()
+    report = deps.service.uninstall(
+        purge=purge,
+        yes=yes,
+        dry_run=dry_run,
+        force=force,
+    )
+    prefix = "would " if dry_run else ""
+    for m in report.mappings:
+        if m.state.value == "already_restored":
+            err_console.print(f"already restored {m.live_path}")
+        elif m.state.value == "missing_live_temp_present":
+            err_console.print(f"recovered {m.live_path} from interrupted uninstall")
+        else:
+            err_console.print(
+                f"{prefix}unlink {m.live_path} (was symlink to "
+                f"{m.profile_dir_subdir.parent.name}/{m.profile_subdir})"
+            )
+    for tool_id, reason in report.skipped:
+        err_console.print(f"skipped {tool_id}: {reason}")
+    # Footer: consult report.purged (NOT the purge flag) — service may have
+    # returned without purging if the user declined the prompt.
+    if dry_run:
+        if purge:
+            err_console.print(f"would purge {deps.store.state_dir()}")
+        else:
+            err_console.print(
+                f"would clear active map; would keep state at {deps.store.state_dir()}"
+            )
+    elif report.purged:
+        err_console.print(f"purged {deps.store.state_dir()}")
+    else:
+        err_console.print(f"cleared active map; kept state at {deps.store.state_dir()}")
+
+
 @tools_app.command(name="scaffold")
 @handle_errors
 def tools_scaffold(
