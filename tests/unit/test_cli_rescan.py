@@ -41,7 +41,11 @@ def test_rescan_no_new_tools_exits_zero(tmp_state: Path, tmp_home: Path) -> None
 def test_rescan_dry_run_makes_no_changes(tmp_state: Path, tmp_home: Path) -> None:
     runner = CliRunner()
     # Suppress copilot from init by removing its config dirs first.
-    for sub in [".copilot", ".config/github-copilot"]:
+    # Remove copilot's live dirs across BOTH platforms (POSIX
+    # `.config/github-copilot`, Windows `AppData/Local/github-copilot`)
+    # so init can't capture copilot via the platform's first config dir.
+    # The not-applicable path on each platform is a no-op.
+    for sub in [".copilot", ".config/github-copilot", "AppData/Local/github-copilot"]:
         _remove_path(tmp_home / sub)
     setup = runner.invoke(app, ["init"])
     assert setup.exit_code == 0, setup.stderr
@@ -57,7 +61,11 @@ def test_rescan_dry_run_makes_no_changes(tmp_state: Path, tmp_home: Path) -> Non
 
 def test_rescan_default_captures_new_tool(tmp_state: Path, tmp_home: Path) -> None:
     runner = CliRunner()
-    for sub in [".copilot", ".config/github-copilot"]:
+    # Remove copilot's live dirs across BOTH platforms (POSIX
+    # `.config/github-copilot`, Windows `AppData/Local/github-copilot`)
+    # so init can't capture copilot via the platform's first config dir.
+    # The not-applicable path on each platform is a no-op.
+    for sub in [".copilot", ".config/github-copilot", "AppData/Local/github-copilot"]:
         _remove_path(tmp_home / sub)
     setup = runner.invoke(app, ["init"])
     assert setup.exit_code == 0, setup.stderr

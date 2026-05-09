@@ -28,7 +28,10 @@ def test_status_verbose_shows_cached_paths(tmp_state: Path, tmp_home: Path) -> N
     assert setup.exit_code == 0, setup.stderr
     result = runner.invoke(app, ["status", "-v"])
     assert result.exit_code == 0
-    assert "/.claude" in result.output  # one of the cached live paths
+    # Use os.sep so the assertion holds on Windows (`\.claude`) too. The
+    # status output must also not wrap the path mid-string under narrow CI
+    # terminals — guarded by `soft_wrap=True` in the CLI.
+    assert f"{os.sep}.claude" in result.output  # one of the cached live paths
 
 
 def test_status_shows_dashes_when_active_populated_but_cache_missing(

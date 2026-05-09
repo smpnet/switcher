@@ -60,12 +60,18 @@ def _remove_path(p: Path) -> None:
         p.unlink()
 
 
+def _suppress_copilot(tmp_home: Path) -> None:
+    """Remove copilot's live dirs across both platforms so init won't capture
+    it. The POSIX paths are no-ops on Windows and vice versa."""
+    for sub in [".copilot", ".config/github-copilot", "AppData/Local/github-copilot"]:
+        _remove_path(tmp_home / sub)
+
+
 def test_rescan_default_creates_fresh_profile_per_new_tool(tmp_state: Path, tmp_home: Path) -> None:
     """Init claude only, then drop a copilot dir, then rescan → fresh profile for copilot."""
     s = _service(tmp_state, tmp_home)
     # Pretend copilot wasn't installed at init time.
-    _remove_path(tmp_home / ".copilot")
-    _remove_path(tmp_home / ".config" / "github-copilot")
+    _suppress_copilot(tmp_home)
     s.init()  # captures only claude
 
     # Now "install" copilot post-init.
@@ -91,8 +97,7 @@ def test_rescan_no_new_tools(tmp_state: Path, tmp_home: Path) -> None:
 
 def test_rescan_into_existing_profile(tmp_state: Path, tmp_home: Path) -> None:
     s = _service(tmp_state, tmp_home)
-    _remove_path(tmp_home / ".copilot")
-    _remove_path(tmp_home / ".config" / "github-copilot")
+    _suppress_copilot(tmp_home)
     s.init()
     (tmp_home / ".copilot").mkdir()
     (tmp_home / ".config" / "github-copilot").mkdir()
@@ -114,11 +119,8 @@ def test_rescan_into_collision_refused(tmp_state: Path, tmp_home: Path) -> None:
     collision check we're trying to test).
     """
     s = _service(tmp_state, tmp_home)
-    # Suppress copilot at init: remove its live dirs.
-    for sub in [".copilot", ".config/github-copilot"]:
-        path = tmp_home / sub
-        if path.exists():
-            _remove_path(path)  # link-aware; see test helper above
+    # Suppress copilot at init: remove its live dirs (cross-platform).
+    _suppress_copilot(tmp_home)
     s.init()  # claude only
 
     # Recreate copilot live dirs (eligible for rescan).
@@ -136,8 +138,7 @@ def test_rescan_into_collision_refused(tmp_state: Path, tmp_home: Path) -> None:
 def test_rescan_seeds_missing_secondary_config_dir(tmp_state: Path, tmp_home: Path) -> None:
     """Mirror init's move_or_seed_dir behavior for missing secondary dirs."""
     s = _service(tmp_state, tmp_home)
-    _remove_path(tmp_home / ".copilot")
-    _remove_path(tmp_home / ".config" / "github-copilot")
+    _suppress_copilot(tmp_home)
     s.init()  # claude only
 
     # First config dir present (~/.config/github-copilot), second absent.
@@ -159,8 +160,7 @@ def test_rescan_real_file_at_live_path_raises_path_not_a_directory(
     a regular file at the second (so pre-flight rejects it).
     """
     s = _service(tmp_state, tmp_home)
-    _remove_path(tmp_home / ".copilot")
-    _remove_path(tmp_home / ".config" / "github-copilot")
+    _suppress_copilot(tmp_home)
     s.init()  # claude only
     (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
     (tmp_home / ".copilot").write_text("not a dir")
@@ -174,8 +174,7 @@ def test_rescan_rolls_back_on_partial_capture_failure(
     """Spec §4.4 / §6.4: if mapping N+1 fails after 0..N captured, undo 0..N."""
     s = _service(tmp_state, tmp_home)
     # Suppress copilot at init so it ends up as the rescan target.
-    _remove_path(tmp_home / ".copilot")
-    _remove_path(tmp_home / ".config" / "github-copilot")
+    _suppress_copilot(tmp_home)
     s.init()  # claude only
 
     # Recreate copilot dirs with content.
@@ -223,8 +222,7 @@ def test_rescan_into_rollback_restores_metadata(
 ) -> None:
     """Spec §4.4: --into rollback restores the previous metadata.tools map."""
     s = _service(tmp_state, tmp_home)
-    _remove_path(tmp_home / ".copilot")
-    _remove_path(tmp_home / ".config" / "github-copilot")
+    _suppress_copilot(tmp_home)
     s.init()  # claude only
     init_profile = next(iter(s._store.get_active().values()))
     tools_before = dict(s._store.get(init_profile).tools)
@@ -255,8 +253,7 @@ def test_rescan_into_rollback_restores_live_dir_contents(
     metadata. Without the link-aware restore in `_rollback_partial_rescan`,
     a swap_link failure mid-capture would silently delete the user's data."""
     s = _service(tmp_state, tmp_home)
-    _remove_path(tmp_home / ".copilot")
-    _remove_path(tmp_home / ".config" / "github-copilot")
+    _suppress_copilot(tmp_home)
     s.init()  # claude only
     init_profile = next(iter(s._store.get_active().values()))
 
@@ -291,8 +288,7 @@ def test_rescan_rollback_does_not_create_empty_live_dir_for_seeded_mapping(
     the live path back into existence — the original state was "missing",
     not "empty dir present"."""
     s = _service(tmp_state, tmp_home)
-    _remove_path(tmp_home / ".copilot")
-    _remove_path(tmp_home / ".config" / "github-copilot")
+    _suppress_copilot(tmp_home)
     s.init()  # claude only
 
     # Set up: first config dir present, second missing → second is seeded.
@@ -325,6 +321,115 @@ def test_rescan_rollback_does_not_create_empty_live_dir_for_seeded_mapping(
     assert not (tmp_home / ".copilot").is_symlink()
 
 
+def test_rescan_default_rollback_fails_closed_when_restore_fails(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §4.4: when rollback's `move_or_seed_dir(sub, live)` fails, leave
+    captured data on disk and surface a RescanCaptureError mentioning the
+    leftover paths. Do NOT silently rmtree the partial profile dir.
+
+    Repro shape (Hermes review): swap_link fails on the second mapping AND
+    the rollback's restore call also fails. Without fail-closed semantics
+    the user's only copy of the live dir gets rmtree'd via the partial
+    profile dir.
+    """
+    s = _service(tmp_state, tmp_home)
+    _suppress_copilot(tmp_home)
+    s.init()  # claude only
+
+    (tmp_home / ".copilot").mkdir()
+    (tmp_home / ".copilot" / "sentinel.txt").write_text("user-config")
+    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
+    (tmp_home / ".config" / "github-copilot" / "apps.json").write_text("user-auth")
+
+    from switcher import service as svc_mod
+
+    real_swap = svc_mod.swap_link
+    real_move = svc_mod.move_or_seed_dir
+    phase = {"rollback": False}
+    swap_count = {"n": 0}
+
+    def flaky_swap(target: Path, link: Path) -> None:
+        swap_count["n"] += 1
+        if swap_count["n"] == 2:
+            phase["rollback"] = True
+            raise RuntimeError("simulated FS error on second swap_link")
+        return real_swap(target, link)
+
+    def flaky_move(src: Path, dst: Path) -> None:
+        if phase["rollback"]:
+            raise RuntimeError("simulated FS error during rollback restore")
+        return real_move(src, dst)
+
+    monkeypatch.setattr(svc_mod, "swap_link", flaky_swap)
+    monkeypatch.setattr(svc_mod, "move_or_seed_dir", flaky_move)
+
+    with pytest.raises(RescanCaptureError, match="user data left at"):
+        s.rescan(only=["copilot"])
+
+    # Captured user data still on disk in the partial profile dir — NOT
+    # silently rmtree'd. The user can recover it manually.
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    profile_dir = tmp_state / "profiles" / f"{today}-rescan-1"
+    assert profile_dir.exists()
+    config_sentinel = profile_dir / "copilot-config" / "sentinel.txt"
+    auth_sentinel = profile_dir / "copilot-auth" / "apps.json"
+    assert config_sentinel.exists() and config_sentinel.read_text() == "user-config"
+    assert auth_sentinel.exists() and auth_sentinel.read_text() == "user-auth"
+    # Active map unchanged.
+    assert "copilot" not in s._store.get_active()
+
+
+def test_rescan_into_rollback_fails_closed_when_restore_fails(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §4.4: `--into` rollback must also fail closed if the restore
+    call fails — leave the captured sub on disk rather than silent rmtree."""
+    s = _service(tmp_state, tmp_home)
+    _suppress_copilot(tmp_home)
+    s.init()  # claude only
+    init_profile = next(iter(s._store.get_active().values()))
+
+    (tmp_home / ".copilot").mkdir()
+    (tmp_home / ".copilot" / "sentinel.txt").write_text("user-config")
+    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
+    (tmp_home / ".config" / "github-copilot" / "apps.json").write_text("user-auth")
+
+    from switcher import service as svc_mod
+
+    real_swap = svc_mod.swap_link
+    real_move = svc_mod.move_or_seed_dir
+    phase = {"rollback": False}
+    swap_count = {"n": 0}
+
+    def flaky_swap(target: Path, link: Path) -> None:
+        swap_count["n"] += 1
+        if swap_count["n"] == 2:
+            phase["rollback"] = True
+            raise RuntimeError("simulated FS error on second swap_link")
+        return real_swap(target, link)
+
+    def flaky_move(src: Path, dst: Path) -> None:
+        if phase["rollback"]:
+            raise RuntimeError("simulated FS error during rollback restore")
+        return real_move(src, dst)
+
+    monkeypatch.setattr(svc_mod, "swap_link", flaky_swap)
+    monkeypatch.setattr(svc_mod, "move_or_seed_dir", flaky_move)
+
+    with pytest.raises(RescanCaptureError, match="user data left at"):
+        s.rescan(into=init_profile, only=["copilot"])
+
+    # User data still on disk under the existing profile's per-tool subdirs.
+    profile_dir = tmp_state / "profiles" / init_profile
+    config_sentinel = profile_dir / "copilot-config" / "sentinel.txt"
+    auth_sentinel = profile_dir / "copilot-auth" / "apps.json"
+    assert config_sentinel.exists() and config_sentinel.read_text() == "user-config"
+    assert auth_sentinel.exists() and auth_sentinel.read_text() == "user-auth"
+    # Metadata never recorded copilot under --into.
+    assert "copilot" not in s._store.get(init_profile).tools
+
+
 def test_rescan_already_linked_raises(tmp_state: Path, tmp_home: Path) -> None:
     """Spec §4.3: live path already a link (e.g. user-managed symlink) → AlreadyLinkedError.
 
@@ -333,8 +438,7 @@ def test_rescan_already_linked_raises(tmp_state: Path, tmp_home: Path) -> None:
     second as a foreign symlink (so pre-flight rejects).
     """
     s = _service(tmp_state, tmp_home)
-    _remove_path(tmp_home / ".copilot")
-    _remove_path(tmp_home / ".config" / "github-copilot")
+    _suppress_copilot(tmp_home)
     s.init()  # claude only
     (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
     foreign = tmp_home / "foreign-copilot"

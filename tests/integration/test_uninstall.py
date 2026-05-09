@@ -188,6 +188,45 @@ def test_uninstall_purge_succeeded_sets_purged_flag(tmp_state: Path, tmp_home: P
     assert not tmp_state.exists()
 
 
+def test_uninstall_purge_clears_active_state_before_destructive_delete(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §3.5: --purge must clear active/active_live_paths in config.json
+    BEFORE the destructive rmtree so that a partial rmtree failure can't
+    leave persisted state lying about tools whose symlinks are already gone.
+
+    Repro shape (Hermes review): rmtree of state_dir fails after the live
+    dirs have been restored to real directories. Without the pre-rmtree
+    clear, `status` would still show the tools as active even though their
+    symlinks no longer exist.
+    """
+    import switcher.service as svc_mod
+
+    s = _service(tmp_state, tmp_home)
+    s.init()
+
+    # The only `shutil.rmtree` call in the uninstall purge path is the
+    # state-dir wipe, so an unconditional raise simulates that single
+    # failure point without affecting other code paths.
+    def failing_rmtree(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated FS error during state-dir rmtree")
+
+    monkeypatch.setattr(svc_mod.shutil, "rmtree", failing_rmtree)
+
+    with pytest.raises(RuntimeError, match="simulated FS error"):
+        s.uninstall(purge=True, yes=True)
+
+    # Live dirs already restored before the rmtree failure.
+    assert (tmp_home / ".claude").is_dir() and not _is_link(tmp_home / ".claude")
+
+    # Config persisted "no tools managed" before the destructive delete,
+    # so a re-instantiated store sees an empty active map — matching the
+    # restored live dirs — instead of lying about a stale active entry.
+    fresh = _service(tmp_state, tmp_home)
+    assert fresh._store.get_active() == {}
+    assert fresh._store.get_active_live_paths() == {}
+
+
 def test_uninstall_dry_run_purge_bypasses_non_tty_guard(
     tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

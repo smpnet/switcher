@@ -118,16 +118,20 @@ def status(
     for tool_id in sorted(active):
         profile = active[tool_id]
         cache_marker = "[ok]" if cache.get(tool_id) else "[--]"
-        console.print(f"{cache_marker} {tool_id:20} {profile}", markup=False)
+        # `soft_wrap=True` so paths/profile names are never broken across lines
+        # by Rich's terminal-width wrap. Status output has to remain stable
+        # (and substring-greppable) under narrow CI terminals.
+        console.print(f"{cache_marker} {tool_id:20} {profile}", markup=False, soft_wrap=True)
         if verbose:
             paths = cache.get(tool_id, [])
             if paths:
                 for p in paths:
-                    console.print(f"       {p}", markup=False)
+                    console.print(f"       {p}", markup=False, soft_wrap=True)
             else:
                 console.print(
                     "       live_paths not cached (will fall back to registry on uninstall)",
                     markup=False,
+                    soft_wrap=True,
                 )
 
 

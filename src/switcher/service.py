@@ -826,6 +826,13 @@ class ProfileService:
                 # Equivalent to a non-purge run that the user explicitly chose.
                 self._store.set_active_state(kept_active, kept_cache)
                 return report
+        # Clear active state BEFORE the destructive rmtree. Pre-flight step 5
+        # already refused purge if any tools would be skipped, so kept_active
+        # and kept_cache are guaranteed empty here. If rmtree subsequently
+        # fails partway, the on-disk config still reads "no tools managed" —
+        # matching the already-restored live dirs — rather than lying about
+        # active entries whose symlinks no longer exist.
+        self._store.set_active_state(kept_active, kept_cache)
         shutil.rmtree(self._store.state_dir())
         report.purged = True
         return report
@@ -921,8 +928,14 @@ class ProfileService:
                 # this catch is the outer safety net for the post-loop cleanup
                 # (profile dir / metadata revert) that an in-loop rollback might
                 # not cover.
-                self._rollback_partial_rescan(tool, target, into=into is not None)
-                raise RescanCaptureError(f"capture failed for {tool.id!r}: {e}") from e
+                leftovers = self._rollback_partial_rescan(tool, target, into=into is not None)
+                msg = f"capture failed for {tool.id!r}: {e}"
+                if leftovers:
+                    msg += (
+                        f"; rollback could not restore captured data — "
+                        f"user data left at: {', '.join(leftovers)}"
+                    )
+                raise RescanCaptureError(msg) from e
             # Both keys in one atomic write.
             active[tool.id] = target
             live_paths_cache[tool.id] = [
@@ -994,7 +1007,7 @@ class ProfileService:
         if into and updated_tools is not None:
             self._store.update_profile_tools(target, updated_tools)
 
-    def _rollback_partial_rescan(self, tool: Tool, target: str, *, into: bool) -> None:
+    def _rollback_partial_rescan(self, tool: Tool, target: str, *, into: bool) -> list[str]:
         """Outer-loop cleanup if `_capture_tool_for_rescan` raised.
 
         For default mode: rmtree the partial profile dir (it was created by
@@ -1007,8 +1020,16 @@ class ProfileService:
         removing leftover per-tool subdirs — otherwise a swap_link failure
         between move_or_seed_dir and completed.append silently destroys
         user data.
+
+        Fail-closed: if `move_or_seed_dir(sub, live)` raises, leave `sub` on
+        disk and record its path. The rmtree of the partial profile dir (or
+        of leftover subs in --into mode) only runs if every sub was either
+        restored or never had real content. The returned list is the set of
+        sub paths that still hold user data and need manual recovery; the
+        caller surfaces it in the RescanCaptureError message.
         """
         target_dir = self._store.profile_dir(target)
+        leftovers: list[str] = []
 
         def _is_empty_dir(p: Path) -> bool:
             """An empty sub means the inner phase seeded it (live was missing)
@@ -1030,10 +1051,16 @@ class ProfileService:
                         remove_link(live)
                 sub = target_dir / dm.profile_subdir
                 if sub.is_dir() and not _is_empty_dir(sub):
-                    with contextlib.suppress(Exception):
+                    try:
                         move_or_seed_dir(sub, live)
-            shutil.rmtree(target_dir, ignore_errors=True)
-            return
+                    except Exception:
+                        leftovers.append(str(sub))
+            # Only wipe the partial profile dir if every sub is either
+            # already restored to live or was an empty seed. Any leftover
+            # with real user data must stay on disk.
+            if not leftovers:
+                shutil.rmtree(target_dir, ignore_errors=True)
+            return leftovers
 
         # --into mode: same link-aware restore as default mode for THIS
         # tool's subdirs; leave the rest of the existing profile alone.
@@ -1054,12 +1081,15 @@ class ProfileService:
                 # Seed leftover; live was originally missing. Don't recreate.
                 shutil.rmtree(sub, ignore_errors=True)
                 continue
-            with contextlib.suppress(Exception):
+            try:
                 move_or_seed_dir(sub, live)
-            # If move failed for any reason, surface the leftover
-            # for manual cleanup rather than silent rmtree.
+            except Exception:
+                # Leave sub on disk with user data; surface for manual cleanup.
+                leftovers.append(str(sub))
+                continue
             if sub.exists():
                 shutil.rmtree(sub, ignore_errors=True)
+        return leftovers
 
     # Prune ------------------------------------------------------------------
 
