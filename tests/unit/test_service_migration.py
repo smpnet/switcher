@@ -67,18 +67,22 @@ def test_strict_validation_skips_drifted_entries(tmp_state: Path, tmp_home: Path
     service, store = _seed_initialized_state(tmp_state, tmp_home)
     _strip_active_live_paths(tmp_state)
 
-    # Break the symlink for `claude` by replacing it with a real dir.
+    # Break the link for `claude` by replacing it with a real dir.
+    # Symlink on POSIX, junction on Windows — both via _is_link.
     claude_link = tmp_home / ".claude"
-    if claude_link.is_symlink():
+    assert _is_link(claude_link), "fixture should set claude up as a link"
+    if IS_WINDOWS and os.path.isjunction(claude_link):
+        claude_link.rmdir()
+    else:
         claude_link.unlink()
-        claude_link.mkdir()
-        # Don't bother copying content — the validation only checks shape.
+    claude_link.mkdir()
+    # Don't bother copying content — the validation only checks shape.
 
     derived = service.get_active_live_paths()
-    # claude should be absent; copilot (still a symlink) should be present.
+    # claude should be absent; copilot (still a link) should be present.
     assert "claude" not in derived
-    if "copilot" in store.get_active():
-        assert "copilot" in derived
+    assert "copilot" in store.get_active(), "fixture should include copilot"
+    assert "copilot" in derived
 
 
 def test_derive_cache_for_active_validates_against_proposed_map(

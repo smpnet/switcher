@@ -207,7 +207,12 @@ def test_classify_orphan_tool_with_link_outside_profile_dir_is_corrupt(
     bogus = tmp_home / "outside-tree"
     bogus.mkdir()
     orphan_live = tmp_home / "orphan-link"
-    orphan_live.symlink_to(bogus)
+    if IS_WINDOWS:
+        # symlink_to on Windows requires Developer Mode or elevation;
+        # use the same junction helper init/use rely on.
+        _create_junction(bogus, orphan_live)
+    else:
+        orphan_live.symlink_to(bogus)
     profile = next(iter(active.values()))
     active["orphan_tool"] = profile
     cache["orphan_tool"] = [str(orphan_live)]

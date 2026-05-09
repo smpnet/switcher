@@ -13,11 +13,15 @@ from switcher.links import remove_link
 from switcher.paths import IS_WINDOWS
 
 
+def _is_link(p: Path) -> bool:
+    return p.is_symlink() or (IS_WINDOWS and os.path.isjunction(p))
+
+
 def _remove_path(p: Path) -> None:
     """Link-aware removal helper (mirrors test_rescan.py)."""
     if not p.exists() and not p.is_symlink():
         return
-    if p.is_symlink() or (IS_WINDOWS and os.path.isjunction(p)):
+    if _is_link(p):
         remove_link(p)
     elif p.is_dir():
         shutil.rmtree(p)
@@ -46,9 +50,9 @@ def test_rescan_dry_run_makes_no_changes(tmp_state: Path, tmp_home: Path) -> Non
     result = runner.invoke(app, ["rescan", "--dry-run"])
     assert result.exit_code == 0, result.stderr
     assert "would" in result.stderr
-    # Live dirs untouched (dry run).
-    assert not (tmp_home / ".copilot").is_symlink()
-    assert not (tmp_home / ".config" / "github-copilot").is_symlink()
+    # Live dirs untouched (dry run): not a symlink/junction.
+    assert not _is_link(tmp_home / ".copilot")
+    assert not _is_link(tmp_home / ".config" / "github-copilot")
 
 
 def test_rescan_default_captures_new_tool(tmp_state: Path, tmp_home: Path) -> None:
