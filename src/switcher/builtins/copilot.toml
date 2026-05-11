@@ -2,16 +2,6 @@ id = "copilot"
 name = "GitHub Copilot CLI"
 
 [[config_dirs]]
-posix_path = "~/.config/github-copilot"
-windows_path = "%LOCALAPPDATA%\\github-copilot"
-profile_subdir = "copilot-auth"
-
-[[config_dirs]]
 posix_path = "~/.copilot"
 windows_path = "%USERPROFILE%\\.copilot"
 profile_subdir = "copilot-config"
-
-# explicit credential entry pointing at the auth dir
-[[credentials]]
-config_dir = "copilot-auth"
-path = "apps.json"

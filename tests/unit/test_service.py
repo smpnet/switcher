@@ -396,10 +396,9 @@ def test_create_includes_uninstalled_active_tools(
     # a symbolic link" because os.path.islink returns True for both classic
     # symlinks and (per Python 3.13's ntpath) Windows junctions. Use the
     # link-aware removal path on each platform.
-    if IS_WINDOWS:
-        copilot_live = tmp_home / "AppData" / "Local" / "github-copilot"
-    else:
-        copilot_live = tmp_home / ".copilot"
+    # Single-dir copilot builtin: `~/.copilot` on POSIX, `%USERPROFILE%\.copilot`
+    # on Windows (expands to `~/.copilot` under tmp_home).
+    copilot_live = tmp_home / ".copilot"
 
     # Pre-assert: the simulated "uninstall" must actually have something to
     # remove, otherwise the test stops proving the "uninstalled active tool"
