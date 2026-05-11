@@ -195,14 +195,19 @@ def test_discover_skips_broken_symlinks(tmp_state: Path, tmp_home: Path) -> None
     assert str(broken) not in discovered
 
 
-def test_discover_skips_regular_files_in_candidate_parents(tmp_state: Path, tmp_home: Path) -> None:
+def test_discover_skips_non_link_at_canonical_basename(tmp_state: Path, tmp_home: Path) -> None:
+    """A real directory at the canonical live-path basename (the conftest
+    seed for ~/.copilot) must not be discovered as managed — only true
+    links count. Using the canonical basename so the basename filter
+    doesn't short-circuit before the is_link check."""
     service = _make_service(tmp_state, tmp_home)
     profile_name = "files"
     profile_dir = service._store.profile_dir(profile_name)
     (profile_dir / "copilot-config").mkdir(parents=True)
-    # A regular file at ~/.copilot-real — not a symlink, must not be discovered.
-    real = tmp_home / ".copilot-real"
-    real.write_text("regular file")
+    # Conftest already seeds ~/.copilot as a real dir; leave it alone.
+    real = tmp_home / ".copilot"
+    assert real.is_dir() and not real.is_symlink()
+
     discovered = service._discover_live_paths_for_active("copilot", profile_name)
     assert str(real) not in discovered
 
