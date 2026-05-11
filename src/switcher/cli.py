@@ -404,6 +404,36 @@ def uninstall(
 
 @app.command()
 @handle_errors
+def unmanage(
+    tool: str = typer.Argument(..., help="Tool ID to unmanage."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview only; no changes."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Skip orphan tools with no registry entry and no cache. "
+        "Does NOT bypass corrupt mappings.",
+    ),
+) -> None:
+    """Restore a single tool's live path and remove it from the active map."""
+    deps = get_deps()
+    report = deps.service.unmanage(tool, dry_run=dry_run, force=force)
+    if dry_run:
+        console.print(f"Would unmanage {report.tool_id!r}:")
+        for m in report.mappings:
+            verb = "would restore" if m.state == UninstallMappingState.SYMLINK else "no-op"
+            console.print(f"  {m.live_path}  ({m.state.name} -> {verb})")
+        console.print("(dry-run; no changes made)")
+    elif report.skipped_orphan:
+        console.print(
+            f"Skipped orphan tool {report.tool_id!r}: removed from active map; "
+            f"symlinks left in place"
+        )
+    else:
+        console.print(f"Unmanaged {report.tool_id!r}")
+
+
+@app.command()
+@handle_errors
 def rescan(
     only: str | None = typer.Option(None, "--only", help="Comma-separated tool ids."),
     into: str | None = typer.Option(None, "--into", help="Capture into an existing profile."),

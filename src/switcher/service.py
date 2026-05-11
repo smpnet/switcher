@@ -1154,6 +1154,76 @@ class ProfileService:
         report.purged = True
         return report
 
+    # Unmanage ---------------------------------------------------------------
+
+    def unmanage(
+        self,
+        tool_id: str,
+        *,
+        dry_run: bool = False,
+        force: bool = False,
+    ) -> UnmanageReport:
+        """Single-tool uninstall. Spec §2.2.
+
+        Restores the tool's live path(s) and removes it from active +
+        active_live_paths. Mirrors v0.1.3 uninstall's per-DirMapping
+        atomicity (classification + automatic resume via
+        _execute_uninstall_mapping). CORRUPT mappings always refuse
+        regardless of --force; --force handles only the orphan-no-cache
+        case (matches uninstall --force at service.py's pre-flight).
+        """
+        self._require_initialized()
+        self._require_managed()
+        active = self._store.get_active()
+        if tool_id not in active:
+            raise ToolNotManagedError(
+                f"tool {tool_id!r} is not managed; nothing to unmanage. "
+                f"To add it: switcher rescan --only {tool_id}"
+            )
+
+        # Orphan-no-cache check (mirrors uninstall pre-flight).
+        live_paths_cache = self.get_active_live_paths()
+        has_cache = bool(live_paths_cache.get(tool_id))
+        has_registry = find_tool(self._registry, tool_id) is not None
+        skipped_orphan = False
+        if not has_cache and not has_registry:
+            if not force:
+                raise UninstallPreflightError(
+                    f"orphan tool {tool_id!r}: no registry entry and no cached "
+                    f"live_paths. Restore the registry TOML, or pass --force "
+                    f"to skip this tool (its symlinks will remain in place)."
+                )
+            skipped_orphan = True
+
+        # Classify mappings; filter to just this tool.
+        all_mappings = self._classify_uninstall_mappings()
+        mappings = [m for m in all_mappings if m.tool_id == tool_id]
+
+        # CORRUPT mappings always refuse, even with --force.
+        # (Matches uninstall behavior at service.py's pre-flight step 5.)
+        if not skipped_orphan:
+            for m in mappings:
+                if m.state == UninstallMappingState.CORRUPT:
+                    raise UninstallPreflightError(
+                        f"tool {tool_id!r} mapping {m.profile_subdir!r}: {m.corruption_reason}"
+                    )
+
+        if dry_run:
+            return UnmanageReport(tool_id=tool_id, mappings=mappings, skipped_orphan=skipped_orphan)
+
+        # Execute per-DirMapping unwind, unless skipping orphan.
+        if not skipped_orphan:
+            for m in mappings:
+                self._execute_uninstall_mapping(m)
+
+        # Atomic state mutation: drop tool_id from active + cache in a
+        # single set_active_state call.
+        new_active = {k: v for k, v in active.items() if k != tool_id}
+        new_cache = {k: v for k, v in live_paths_cache.items() if k != tool_id}
+        self._store.set_active_state(new_active, new_cache)
+
+        return UnmanageReport(tool_id=tool_id, mappings=mappings, skipped_orphan=skipped_orphan)
+
     # Rescan -----------------------------------------------------------------
 
     def rescan(
@@ -1622,6 +1692,24 @@ class UninstallReport:
     skipped: list[tuple[str, str]]
     mappings: list[_UninstallMapping]
     purged: bool = False
+
+
+@dataclass
+class UnmanageReport:
+    """Return shape of ProfileService.unmanage() — v0.1.4.
+
+    tool_id: which tool was unmanaged.
+    mappings: per-DirMapping classifications + execution outcomes.
+        Uses the (still-private) _UninstallMapping dataclass — same
+        shape as UninstallReport.mappings. CLI accesses only the
+        attribute surface (state, live_path, profile_subdir).
+    skipped_orphan: True when the tool was orphan-no-cache AND
+        --force was passed; symlinks were left in place.
+    """
+
+    tool_id: str
+    mappings: list[_UninstallMapping]
+    skipped_orphan: bool = False
 
 
 @dataclass
