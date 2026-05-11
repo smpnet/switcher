@@ -65,9 +65,10 @@ def test_candidate_parents_for_copilot_includes_legacy_config(
     parents = service._candidate_parents_for("copilot")
     # The legacy POSIX set adds '~/.config' (= tmp_home/.config); the
     # current registry adds tmp_home (parent of ~/.copilot). Both must
-    # be present.
+    # be present so the legacy github-copilot orphan can be rescued.
     resolved = {p.resolve() for p in parents}
     assert tmp_home.resolve() in resolved
+    assert (tmp_home / ".config").resolve() in resolved
 
 
 def test_candidate_parents_for_unknown_tool_uses_legacy_only(
