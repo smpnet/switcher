@@ -48,7 +48,7 @@ def test_full_lifecycle(tmp_home: Path, tmp_state: Path) -> None:
                 assert live.resolve() == target, f"{live} -> {live.resolve()}, expected {target}"
 
     # --- init ----------------------------------------------------------------
-    current = service.init()
+    current = service.init().profile_name
     assert sorted(p.name for p in store.list()) == sorted([current, "vanilla"])
     # init creates a profile_subdir under both profiles for every tool
     for profile in (current, "vanilla"):

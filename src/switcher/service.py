@@ -19,6 +19,7 @@ from pathlib import Path
 
 from switcher.errors import (
     AlreadyLinkedError,
+    NothingToInitializeError,
     NoToolsManagedError,
     PathNotADirectoryError,
     ProfileExistsError,
@@ -634,10 +635,45 @@ class ProfileService:
 
     # Operations ------------------------------------------------------------
 
-    def init(self) -> str:
+    def init(
+        self,
+        target_ids: Sequence[str] | None = None,
+        *,
+        requested_but_not_installed: Sequence[str] = (),
+        skipped_via_skip_flag: Sequence[str] = (),
+        skipped_via_interactive: Sequence[str] = (),
+    ) -> InitReport:
+        """v0.1.4: target_ids filters which detected tools to capture.
+
+        target_ids:
+          None — capture every detected tool (v0.1.3 default-path behavior,
+            including the empty-detect-warn case).
+          Non-empty list — capture only the intersection of target_ids and
+            detect_installed(). If intersection is empty AND the caller
+            asked for a specific filter, raise NothingToInitializeError.
+
+        The three keyword-only diff lists are pass-through informational
+        fields populated by the CLI (which knows user intent). The service
+        layer doesn't compute them; it echoes them back in the report.
+        """
         if self._store.list():
             raise StateAlreadyInitializedError("switcher is already initialized")
         installed = self.detect_installed()
+        if target_ids is not None:
+            requested = set(target_ids)
+            installed = [t for t in installed if t.id in requested]
+            if not installed:
+                raise NothingToInitializeError(
+                    "no requested tools are installed; nothing to initialize"
+                )
+        elif not installed:
+            # Bare init with empty detect: preserve v0.1.3 warn-and-empty.
+            print(
+                "warning: no installed tools detected; switcher initialized "
+                "with empty profiles. Run 'switcher rescan' after installing "
+                "a managed tool.",
+                file=sys.stderr,
+            )
         # Pre-flight: every detected live path must be a (real) directory or a
         # plain non-existent path. Two pathological shapes need to fail BEFORE
         # the first _store.create() call — otherwise the dated profile gets
@@ -668,7 +704,13 @@ class ProfileService:
         # set_active_live_paths separately (crash window).
         active = {t.id: current_name for t in installed}
         self._store.set_active_state(active, live_paths_cache)
-        return current_name
+        return InitReport(
+            profile_name=current_name,
+            captured=[t.id for t in installed],
+            requested_but_not_installed=list(requested_but_not_installed),
+            skipped_via_skip_flag=list(skipped_via_skip_flag),
+            skipped_via_interactive=list(skipped_via_interactive),
+        )
 
     def use(self, profile_name: str, only: list[str] | None = None) -> None:
         self._require_initialized()
@@ -1552,6 +1594,27 @@ class ProfileService:
             return
         # CORRUPT shouldn't reach here — pre-flight rejected it.
         raise AssertionError(f"unreachable: {m.state}")
+
+
+@dataclass(frozen=True)
+class InitReport:
+    """Return shape of ProfileService.init() — v0.1.4.
+
+    profile_name: the dated-current profile created.
+    captured: tool ids actually captured into the new profile.
+    requested_but_not_installed: ids the user passed via --only that
+        aren't installed locally (informational; not an error when SOME
+        tools in the --only list were captured).
+    skipped_via_skip_flag: ids excluded via --skip (informational).
+    skipped_via_interactive: ids the user answered No to in
+        --interactive mode (informational).
+    """
+
+    profile_name: str
+    captured: list[str]
+    requested_but_not_installed: list[str]
+    skipped_via_skip_flag: list[str]
+    skipped_via_interactive: list[str]
 
 
 @dataclass

@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
+import difflib
 import functools
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from switcher.errors import SwitcherError
+from switcher.errors import SwitcherError, UnknownToolError
 from switcher.models import Tool
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
-from switcher.service import ProfileService, UninstallMappingState
+from switcher.service import InitReport, ProfileService, UninstallMappingState
 from switcher.store import FileProfileStore, ProfileStore
 
 app = typer.Typer(
@@ -137,12 +138,98 @@ def status(
 # -- mutating commands ------------------------------------------------------
 
 
+def _resolve_init_targets(
+    registry: Sequence[Tool],
+    user_ids: list[str],
+    mode: Literal["only", "skip"],
+) -> list[str]:
+    """Validate user_ids against the registry; resolve to a target_ids list.
+
+    Hard-errors on unknown ids with a did-you-mean suggestion.
+    `only`: returns user_ids unchanged (the service layer intersects with
+        detect_installed). Unknown ids raise here.
+    `skip`: returns [t.id for t in registry if t.id not in user_ids].
+    """
+    registered_ids = [t.id for t in registry]
+    for uid in user_ids:
+        if uid not in registered_ids:
+            matches = difflib.get_close_matches(uid, registered_ids, n=1, cutoff=0.6)
+            suggestion = f" Did you mean {matches[0]!r}?" if matches else ""
+            raise UnknownToolError(f"tool {uid!r} is not registered.{suggestion}")
+    if mode == "only":
+        return user_ids
+    return [tid for tid in registered_ids if tid not in user_ids]
+
+
+def _print_init_report(report: InitReport) -> None:
+    """Render an InitReport to the console with captured / skipped /
+    requested-but-not-installed sections and re-add hints."""
+    console.print(f"Initialized profile {report.profile_name!r}")
+    if report.captured:
+        console.print(f"  Captured: {', '.join(report.captured)}")
+    if report.requested_but_not_installed:
+        console.print(
+            f"  Requested but not detected: {', '.join(report.requested_but_not_installed)}"
+        )
+        for tid in report.requested_but_not_installed:
+            console.print(f"    To add it later: switcher rescan --only {tid}")
+    if report.skipped_via_skip_flag:
+        console.print(f"  Skipped: {', '.join(report.skipped_via_skip_flag)}")
+        for tid in report.skipped_via_skip_flag:
+            console.print(f"    To add it later: switcher rescan --only {tid}")
+    if report.skipped_via_interactive:
+        console.print(f"  Skipped (via interactive): {', '.join(report.skipped_via_interactive)}")
+        for tid in report.skipped_via_interactive:
+            console.print(f"    To add it later: switcher rescan --only {tid}")
+
+
 @app.command()
 @handle_errors
-def init() -> None:
-    """One-time setup: detect tools, snapshot current config, create vanilla."""
-    name = get_deps().service.init()
-    console.print(f"Initialized profile {name!r}")
+def init(
+    only: str | None = typer.Option(
+        None,
+        "--only",
+        help="Comma-separated tool IDs to manage. Mutually exclusive with --skip.",
+    ),
+    skip: str | None = typer.Option(
+        None,
+        "--skip",
+        help="Comma-separated tool IDs to exclude. Mutually exclusive with --only.",
+    ),
+) -> None:
+    """Initialize switcher; optionally restrict to a subset of detected tools."""
+    if only is not None and skip is not None:
+        raise typer.BadParameter("--only and --skip are mutually exclusive")
+
+    deps = get_deps()
+    requested_but_not_installed: list[str] = []
+    skipped_via_skip_flag: list[str] = []
+    skipped_via_interactive: list[str] = []
+    target_ids: list[str] | None
+
+    if only is not None:
+        ids = [t.strip() for t in only.split(",") if t.strip()]
+        if not ids:
+            raise typer.BadParameter("--only must contain at least one tool id")
+        target_ids = _resolve_init_targets(deps.registry, ids, mode="only")
+        detected_ids = {t.id for t in deps.service.detect_installed()}
+        requested_but_not_installed = [uid for uid in ids if uid not in detected_ids]
+    elif skip is not None:
+        ids = [t.strip() for t in skip.split(",") if t.strip()]
+        if not ids:
+            raise typer.BadParameter("--skip must contain at least one tool id")
+        target_ids = _resolve_init_targets(deps.registry, ids, mode="skip")
+        skipped_via_skip_flag = ids
+    else:
+        target_ids = None
+
+    report = deps.service.init(
+        target_ids,
+        requested_but_not_installed=requested_but_not_installed,
+        skipped_via_skip_flag=skipped_via_skip_flag,
+        skipped_via_interactive=skipped_via_interactive,
+    )
+    _print_init_report(report)
 
 
 @app.command()

@@ -70,7 +70,7 @@ def test_detect_installed_skips_missing(
 def test_init_creates_dated_current_and_vanilla(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     assert name.endswith("-current")
     profiles = sorted(p.name for p in service.list_profiles())
     assert "vanilla" in profiles
@@ -86,7 +86,7 @@ def test_init_replaces_live_dirs_with_links(service: ProfileService, tmp_home: P
 def test_init_active_map_uses_dated_name(
     service: ProfileService, tmp_state: Path, tmp_home: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     store = FileProfileStore(tmp_state)
     active = store.get_active()
     assert active  # not empty
@@ -160,7 +160,7 @@ def test_use_switches_active_to_target(service: ProfileService, tmp_state: Path)
 def test_use_with_only_targets_subset(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     service.use("vanilla", only=["claude"])
     active = FileProfileStore(tmp_state).get_active()
     assert active["claude"] == "vanilla"
@@ -355,7 +355,7 @@ def test_save_rejects_dangling_symlink_live_path(
 def test_create_makes_profile_with_credentials_seeded(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     store = FileProfileStore(tmp_state)
     cred_src = store.profile_dir(name) / "claude" / ".credentials.json"
     cred_src.write_text('{"token": "abc"}')
@@ -490,7 +490,7 @@ def test_create_before_init_raises(service: ProfileService) -> None:
 
 
 def test_which_returns_active_profile(service: ProfileService) -> None:
-    name = service.init()
+    name = service.init().profile_name
     assert service.which("claude") == name
 
 
@@ -531,7 +531,7 @@ def test_which_before_init_raises(service: ProfileService) -> None:
 def test_rename_active_profile_relinks(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     service.rename(name, "client-A")
     store = FileProfileStore(tmp_state)
     active = store.get_active()
@@ -565,7 +565,7 @@ def test_rename_repoints_orphan_active_entries(service: ProfileService, tmp_stat
     reference to the renamed-away ``old``, which no longer exists in the
     store — a silent inconsistency that surfaces on the next use()/which().
     """
-    name = service.init()
+    name = service.init().profile_name
     store = FileProfileStore(tmp_state)
     active = store.get_active()
     active["ghost"] = name  # orphan: not in the registry
@@ -590,7 +590,7 @@ def test_rename_remains_recoverable_when_swap_link_fails(
     ``rename(old, new)`` would raise UnknownProfileError, leaving the user
     with no programmatic recovery.
     """
-    name = service.init()
+    name = service.init().profile_name
 
     call_count = {"n": 0}
 
@@ -637,7 +637,7 @@ def test_rename_pre_validates_live_paths_are_links(
     refuse with IsADirectoryError on the first affected tool, leaving the
     rename half-applied (profile dir moved, live links stale).
     """
-    name = service.init()
+    name = service.init().profile_name
     # Replace the claude symlink with a real directory
     claude = tmp_home / ".claude"
     if claude.is_symlink() or (IS_WINDOWS and os.path.isjunction(claude)):
@@ -655,14 +655,14 @@ def test_rename_pre_validates_live_paths_are_links(
 
 
 def test_delete_inactive_profile_succeeds(service: ProfileService) -> None:
-    name = service.init()
+    name = service.init().profile_name
     service.use("vanilla")  # switch off `name`, freeing it for delete
     service.delete(name)
     assert name not in [p.name for p in service.list_profiles()]
 
 
 def test_delete_active_profile_refuses(service: ProfileService) -> None:
-    name = service.init()  # name is active for everything
+    name = service.init().profile_name  # name is active for everything
     with pytest.raises(ProfileIsActiveError):
         service.delete(name)
 
@@ -670,7 +670,7 @@ def test_delete_active_profile_refuses(service: ProfileService) -> None:
 def test_delete_active_profile_error_wording_locked_in(service: ProfileService) -> None:
     """Spec §7.3 audit: lock in the delete error wording so it stays
     consistent with prune's vocabulary across future changes."""
-    name = service.init()
+    name = service.init().profile_name
     with pytest.raises(ProfileIsActiveError) as exc:
         service.delete(name)
     msg = str(exc.value)
