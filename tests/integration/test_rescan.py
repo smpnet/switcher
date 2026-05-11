@@ -375,6 +375,51 @@ def test_rescan_state_write_failure_rolls_back_capture(
     assert not (tmp_state / "profiles" / f"{today}-rescan-1").exists()
 
 
+def test_rescan_into_state_write_failure_reverts_metadata(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §4.4 / Hermes review: `--into` rollback must revert the target
+    profile's `metadata.json` if a later step (set_active_state) fails
+    after the metadata update already landed. Without this, the profile
+    keeps claiming the new tool was added even though the active map was
+    never updated and the live dir was restored.
+    """
+    s = _service(tmp_state, tmp_home)
+    _suppress_copilot(tmp_home)
+    s.init()  # claude only
+    init_profile = next(iter(s._store.get_active().values()))
+    tools_before = dict(s._store.get(init_profile).tools)
+    assert "copilot" not in tools_before  # baseline
+
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_SECOND_DIR / "settings.json").write_text("user-config")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
+    (tmp_home / COPILOT_FIRST_DIR / "apps.json").write_text("user-auth")
+
+    real_set_active_state = s._store.set_active_state
+
+    def failing_set_active_state(active: object, live_paths: object) -> None:
+        if "copilot" in active:  # type: ignore[operator]
+            raise RuntimeError("simulated state-write failure")
+        return real_set_active_state(active, live_paths)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(s._store, "set_active_state", failing_set_active_state)
+
+    with pytest.raises(RescanCaptureError, match="simulated state-write failure"):
+        s.rescan(into=init_profile, only=["copilot"])
+
+    # metadata.json reverted to the pre-rescan tools map — does NOT claim
+    # copilot was added even though set_active_state never landed.
+    tools_after = dict(s._store.get(init_profile).tools)
+    assert tools_after == tools_before
+    assert "copilot" not in tools_after
+    # Live dirs restored — not left as symlinks into the target profile.
+    assert (tmp_home / COPILOT_SECOND_DIR).is_dir()
+    assert not _is_link(tmp_home / COPILOT_SECOND_DIR)
+    # Active map unchanged.
+    assert "copilot" not in s._store.get_active()
+
+
 def test_rescan_default_rollback_fails_closed_when_restore_fails(
     tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

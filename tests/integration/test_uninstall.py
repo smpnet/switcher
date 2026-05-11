@@ -188,6 +188,85 @@ def test_uninstall_purge_succeeded_sets_purged_flag(tmp_state: Path, tmp_home: P
     assert not tmp_state.exists()
 
 
+def test_uninstall_processes_all_cached_paths_when_registry_shrinks(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """Spec §3.4 / Hermes review: if a TOML edit removes a config_dir after
+    init, the cache still has both live paths but the registry only has
+    one. Uninstall must process ALL cached paths (driving from the cache),
+    not silently drop the extras and leave a dangling symlink behind.
+    """
+    s = _service(tmp_state, tmp_home)
+    s.init()
+    # Pre-condition: copilot's cache has 2 entries (its two builtin config_dirs).
+    assert len(s._store.get_active_live_paths()["copilot"]) == 2
+
+    # Simulate registry drift: shrink copilot to a single config_dir via a
+    # user TOML override. The cached entries are unchanged (cache writes
+    # only on capture/rescan).
+    registry_d = tmp_state / "registry.d"
+    registry_d.mkdir(parents=True, exist_ok=True)
+    (registry_d / "copilot.toml").write_text(
+        'id = "copilot"\n'
+        'name = "GitHub Copilot CLI (shrunk)"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.copilot"\n'
+        'windows_path = "%USERPROFILE%\\\\.copilot"\n'
+        'profile_subdir = "copilot-config"\n'
+    )
+
+    # Re-instantiate so the new registry takes effect.
+    shrunk = _service(tmp_state, tmp_home)
+
+    # Dry-run should plan BOTH cached restores, not just the registry's one.
+    report = shrunk.uninstall(dry_run=True)
+    copilot_mappings = [m for m in report.mappings if m.tool_id == "copilot"]
+    assert len(copilot_mappings) == 2, [m.live_path for m in copilot_mappings]
+    # No CORRUPT classifications — both cached paths are still symlinks.
+    assert all(m.state.value != "corrupt" for m in copilot_mappings)
+
+    # Real uninstall restores both live dirs to real directories — no
+    # dangling symlink left behind.
+    shrunk.uninstall()
+    assert (tmp_home / ".copilot").is_dir() and not _is_link(tmp_home / ".copilot")
+    posix_first = tmp_home / ".config" / "github-copilot"
+    windows_first = tmp_home / "AppData" / "Local" / "github-copilot"
+    first_live = windows_first if IS_WINDOWS else posix_first
+    assert first_live.is_dir() and not _is_link(first_live)
+
+
+def test_uninstall_purge_aborted_input_clears_active_before_propagating(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hermes review: if `input()` raises (stdin closed, Ctrl-C) during the
+    --purge confirmation, the unwind has already restored live dirs. The
+    abort must still clear active/active_live_paths so config.json doesn't
+    claim tools are managed when their symlinks are already gone.
+    """
+    s = _service(tmp_state, tmp_home)
+    s.init()
+
+    def raising_input(_prompt: str) -> str:
+        raise EOFError("simulated stdin close during confirmation")
+
+    # Bypass the non-TTY pre-flight guard so the code reaches the input()
+    # prompt that we're actually testing. The repro models a TTY session
+    # whose stdin dies AFTER the unwind, not a non-interactive invocation.
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", raising_input)
+
+    with pytest.raises(EOFError, match="simulated stdin close"):
+        s.uninstall(purge=True, yes=False)
+
+    # Live dirs already restored before the prompt fired.
+    assert (tmp_home / ".claude").is_dir() and not _is_link(tmp_home / ".claude")
+    # On-disk active state was cleared before EOFError propagated, so a
+    # fresh store sees "no tools managed" (matching the live dirs).
+    fresh = _service(tmp_state, tmp_home)
+    assert fresh._store.get_active() == {}
+    assert fresh._store.get_active_live_paths() == {}
+
+
 def test_uninstall_uses_cached_live_paths_after_registry_drift(
     tmp_state: Path, tmp_home: Path
 ) -> None:

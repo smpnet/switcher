@@ -221,34 +221,26 @@ class ProfileService:
             profile_dir = self._store.profile_dir(profile_name)
 
             # Reconstruct the (subdir, live_path) pairs we need.
-            if tool is not None:
-                # Drift-resilience (spec §3.4 / Hermes review): when the
-                # cache is populated and matches the registry's config_dirs
-                # count, prefer cached live_paths over resolver-derived
-                # paths. The cache holds the paths as they existed at
-                # init/rescan time, so a TOML edit that moves a config_dir
-                # to a different filesystem location after init still has
-                # an existing on-disk symlink at the old (cached) path.
-                # Without this, uninstall reconstructs from the *new*
-                # registry paths and fails with "live path missing" —
-                # exactly the recovery case the cache was added for.
-                if cached_paths and len(cached_paths) == len(tool.config_dirs):
-                    pairs = [
-                        (dm.profile_subdir, Path(cached_paths[i]))
-                        for i, dm in enumerate(tool.config_dirs)
-                    ]
-                else:
-                    pairs = [
-                        (dm.profile_subdir, self._resolver.tool_dir(tool, i))
-                        for i, dm in enumerate(tool.config_dirs)
-                    ]
+            if tool is not None and cached_paths and len(cached_paths) == len(tool.config_dirs):
+                # Count-match drift-resilience: pair the cached paths
+                # (authoritative for "what's on disk") with the registry's
+                # subdirs by index. Lets _classify_one_mapping still detect
+                # profile_subdir drift via its symlink-target check.
+                pairs = [
+                    (dm.profile_subdir, Path(cached_paths[i]))
+                    for i, dm in enumerate(tool.config_dirs)
+                ]
             elif cached_paths:
-                # Orphan tool with cache. Determine each cached path's subdir by
-                # following the symlink. For real-dir / missing live paths
-                # (resume cases), we cannot determine the subdir without
-                # content matching — those cases get a single CORRUPT entry
-                # per such mapping with a clear reason. v0.2.0 may add resume
-                # support for orphan tools; not in scope here.
+                # Cache is populated but either there's no registry entry
+                # (orphan tool) or the count differs from the registry
+                # (TOML added/removed a config_dir post-init). In both
+                # cases the cache is the authoritative record of what's
+                # actually managed on disk; derive each mapping's subdir
+                # from its symlink target (works regardless of TOML
+                # drift). Hermes review: previously the count-mismatch
+                # branch fell back to resolver-derived paths, silently
+                # dropping extras in the cache and leaving symlinks
+                # dangling after uninstall.
                 pairs = []
                 for cached_str in cached_paths:
                     live = Path(cached_str)
@@ -273,33 +265,53 @@ class ProfileService:
                                     profile_dir_subdir=profile_dir,
                                     state=_UninstallMappingState.CORRUPT,
                                     corruption_reason=(
-                                        f"orphan tool {tool_id!r}: cached live path {live} "
-                                        f"resolves outside the profile dir or cannot be "
-                                        f"resolved: {e}"
+                                        f"cached live path {live} resolves outside "
+                                        f"the profile dir or cannot be resolved: {e}"
                                     ),
                                 )
                             )
                             continue
                         pairs.append((subdir, live))
                     else:
-                        # Resume case OR cache invalid — flag CORRUPT on the
-                        # subdir-derivation step, not the unwind step.
-                        result.append(
-                            _UninstallMapping(
-                                tool_id=tool_id,
-                                profile_subdir="<unknown>",
-                                live_path=live,
-                                profile_dir_subdir=profile_dir,
-                                state=_UninstallMappingState.CORRUPT,
-                                corruption_reason=(
-                                    f"orphan tool {tool_id!r}: cached live path {live} "
-                                    f"is not a link, cannot derive profile subdir without "
-                                    f"registry. Restore the registry TOML."
-                                ),
+                        # Resume case: live is missing or a real dir.
+                        # Match the cached path against a current registry
+                        # config_dir by exact path — works for in-registry
+                        # resume even when other config_dirs in the same tool
+                        # drifted. Falls through to CORRUPT for orphan resume
+                        # OR registry-drifted resume on this specific mapping.
+                        matched_subdir: str | None = None
+                        if tool is not None:
+                            for i, dm in enumerate(tool.config_dirs):
+                                if self._resolver.tool_dir(tool, i) == live:
+                                    matched_subdir = dm.profile_subdir
+                                    break
+                        if matched_subdir is None:
+                            result.append(
+                                _UninstallMapping(
+                                    tool_id=tool_id,
+                                    profile_subdir="<unknown>",
+                                    live_path=live,
+                                    profile_dir_subdir=profile_dir,
+                                    state=_UninstallMappingState.CORRUPT,
+                                    corruption_reason=(
+                                        f"cached live path {live} is not a link "
+                                        f"and no matching registry config_dir was "
+                                        f"found; cannot derive profile subdir. "
+                                        f"Restore the registry TOML or clear the "
+                                        f"stale cache entry."
+                                    ),
+                                )
                             )
-                        )
+                            continue
+                        pairs.append((matched_subdir, live))
                 if not pairs:
                     continue
+            elif tool is not None:
+                # No cache (legacy v0.1.0/v0.1.1 state): rebuild from registry.
+                pairs = [
+                    (dm.profile_subdir, self._resolver.tool_dir(tool, i))
+                    for i, dm in enumerate(tool.config_dirs)
+                ]
             else:
                 # No registry, no cache — flag a single CORRUPT entry per tool.
                 result.append(
@@ -828,14 +840,24 @@ class ProfileService:
 
         # Purge phase.
         if not yes:
-            answer = (
-                input(
-                    f"This will permanently delete {self._store.state_dir()}. "
-                    f"Type 'yes' to confirm: "
+            try:
+                answer = (
+                    input(
+                        f"This will permanently delete {self._store.state_dir()}. "
+                        f"Type 'yes' to confirm: "
+                    )
+                    .strip()
+                    .lower()
                 )
-                .strip()
-                .lower()
-            )
+            except (EOFError, KeyboardInterrupt):
+                # Aborted prompt (stdin closed, Ctrl-C, etc.) — the unwind
+                # already ran, so clear the active state before propagating
+                # the abort. Otherwise config.json would still claim tools
+                # are managed even though their live dirs are real again.
+                # Hermes review: previously the raw input() exception
+                # bypassed the cleanup that the "declined" branch runs.
+                self._store.set_active_state(kept_active, kept_cache)
+                raise
             if answer != "yes":
                 # User declined. Unwind is already done — clear active state
                 # so subsequent `status` correctly reports "no tools managed."
@@ -944,8 +966,9 @@ class ProfileService:
             new_paths = [
                 str(self._resolver.tool_dir(tool, i)) for i in range(len(tool.config_dirs))
             ]
+            previous_tools: dict[str, bool] | None = None
             try:
-                self._capture_tool_for_rescan(tool, target, into=into is not None)
+                previous_tools = self._capture_tool_for_rescan(tool, target, into=into is not None)
                 active[tool.id] = target
                 live_paths_cache[tool.id] = new_paths
                 self._store.set_active_state(active, live_paths_cache)
@@ -958,8 +981,13 @@ class ProfileService:
                 # The per-tool capture method already attempted in-loop rollback;
                 # this catch is the outer safety net for the post-loop cleanup
                 # (profile dir / metadata revert) that an in-loop rollback might
-                # not cover.
-                leftovers = self._rollback_partial_rescan(tool, target, into=into is not None)
+                # not cover. `previous_tools` is the snapshot from
+                # `_capture_tool_for_rescan` — populated only if the capture
+                # already committed the metadata update — so the rollback can
+                # revert metadata.json on --into state-write failure.
+                leftovers = self._rollback_partial_rescan(
+                    tool, target, into=into is not None, previous_tools=previous_tools
+                )
                 msg = f"capture failed for {tool.id!r}: {e}"
                 if leftovers:
                     msg += (
@@ -970,7 +998,9 @@ class ProfileService:
             report.captured.append((tool.id, target))
         return report
 
-    def _capture_tool_for_rescan(self, tool: Tool, target: str, *, into: bool) -> None:
+    def _capture_tool_for_rescan(
+        self, tool: Tool, target: str, *, into: bool
+    ) -> dict[str, bool] | None:
         """Per-tool capture with metadata semantics from §4.4.
 
         For `--into` mode: defer the metadata update until AFTER the capture
@@ -979,15 +1009,23 @@ class ProfileService:
         AND the suppress'd revert also failed (e.g. transient FS error), the
         on-disk metadata claimed the new tool was added even though no live
         capture happened. Deferring eliminates the failure window entirely.
+
+        Returns the previous metadata.tools snapshot (for --into mode) so the
+        caller can hand it to `_rollback_partial_rescan` if a later step
+        (e.g. `set_active_state`) fails after this method already updated
+        metadata.json. Default mode returns None because its rollback
+        rmtree's the whole partial profile dir.
         """
         target_dir = self._store.profile_dir(target)
+        previous_tools: dict[str, bool] | None = None
         updated_tools: dict[str, bool] | None = None  # for post-capture --into write
 
         if not into:
             self._store.create(target, {tool.id: True})
         else:
             existing = self._store.get(target)
-            updated_tools = dict(existing.tools)
+            previous_tools = dict(existing.tools)
+            updated_tools = dict(previous_tools)
             updated_tools[tool.id] = True
 
         # Track per-mapping whether capture seeded an originally-missing live
@@ -1031,8 +1069,16 @@ class ProfileService:
         # by re-running rescan (which is idempotent on already-linked tools).
         if into and updated_tools is not None:
             self._store.update_profile_tools(target, updated_tools)
+        return previous_tools
 
-    def _rollback_partial_rescan(self, tool: Tool, target: str, *, into: bool) -> list[str]:
+    def _rollback_partial_rescan(
+        self,
+        tool: Tool,
+        target: str,
+        *,
+        into: bool,
+        previous_tools: dict[str, bool] | None = None,
+    ) -> list[str]:
         """Outer-loop cleanup if `_capture_tool_for_rescan` raised.
 
         For default mode: rmtree the partial profile dir (it was created by
@@ -1089,6 +1135,19 @@ class ProfileService:
 
         # --into mode: same link-aware restore as default mode for THIS
         # tool's subdirs; leave the rest of the existing profile alone.
+        # If `_capture_tool_for_rescan` already committed the metadata
+        # update for this tool (cache populated → `previous_tools` set)
+        # and a LATER step failed (e.g. `set_active_state`), revert
+        # `metadata.json` so it doesn't keep claiming the tool was added.
+        # Best-effort: suppressed because the filesystem restore below is
+        # the more important guarantee — if the metadata revert fails,
+        # drift is bounded to "extra tool listed under this profile but
+        # not in active map", recoverable by re-running rescan. Hermes
+        # review: previously the --into rollback explicitly said "nothing
+        # to revert" and left stale metadata after a state-write failure.
+        if previous_tools is not None:
+            with contextlib.suppress(Exception):
+                self._store.update_profile_tools(target, previous_tools)
         for i, dm in enumerate(tool.config_dirs):
             live = self._resolver.tool_dir(tool, i)
             if self._resolver.is_link(live):
