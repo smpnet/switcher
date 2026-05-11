@@ -66,6 +66,32 @@ def now() -> datetime:
     return datetime.now(UTC)
 
 
+# v0.1.4 FS-truth migration constants. See spec §4.2.
+#
+# Parents to scan for symlinks during legacy migration, in addition to the
+# current registry's config-dir parents. Hardcoded because a registry-only
+# derivation can't recover live paths whose parent isn't mentioned by the
+# post-rewrite registry (e.g., ~/.config/github-copilot after the v0.1.4
+# Copilot builtin rewrite).
+_LEGACY_PARENT_DIRS_POSIX: tuple[str, ...] = (
+    "~",
+    "~/.config",
+)
+_LEGACY_PARENT_DIRS_WINDOWS: tuple[str, ...] = (
+    "%USERPROFILE%",
+    "%LOCALAPPDATA%",
+)
+
+# Per-tool historical profile_subdir names: subdir names a given tool's
+# profile dir may legitimately contain across switcher versions. Union of
+# (current registry) + (historical) gives the expected-subdir set for
+# FS-truth discovery. Sourced from git history of src/switcher/builtins/*.toml.
+_HISTORICAL_PROFILE_SUBDIRS: dict[str, frozenset[str]] = {
+    "copilot": frozenset({"copilot-config", "copilot-auth"}),
+    # claude has always used "claude" — no historical drift to record.
+}
+
+
 class ProfileService:
     def __init__(
         self,
@@ -205,6 +231,44 @@ class ProfileService:
                 )
             derived.append(str(live))
         return derived
+
+    def _expected_subdirs_for(self, tool_id: str) -> frozenset[str]:
+        """Profile-subdir names this tool may legitimately own on disk.
+
+        Union of (a) the tool's current registry subdirs and (b) historical
+        subdirs from prior switcher versions. Used by FS-truth migration
+        discovery (spec §4.2) to bound which symlinks count for which tool
+        and prevent cross-tool misattribution in multi-tool profiles.
+        """
+        tool = find_tool(self._registry, tool_id)
+        current: frozenset[str] = (
+            frozenset(dm.profile_subdir for dm in tool.config_dirs)
+            if tool is not None
+            else frozenset()
+        )
+        historical = _HISTORICAL_PROFILE_SUBDIRS.get(tool_id, frozenset())
+        return current | historical
+
+    def _candidate_parents_for(self, tool_id: str) -> list[Path]:
+        """Parent directories to scan during FS-truth migration discovery.
+
+        Union of (a) parents of the tool's current registry config_dirs and
+        (b) hardcoded legacy parent dirs. The legacy set rescues paths the
+        post-rewrite registry no longer mentions (e.g., ~/.config/github-
+        copilot after the v0.1.4 Copilot single-dir rewrite).
+        """
+        parents: set[Path] = set()
+        tool = find_tool(self._registry, tool_id)
+        if tool is not None:
+            for i in range(len(tool.config_dirs)):
+                parents.add(self._resolver.tool_dir(tool, i).parent)
+        legacy_raw = _LEGACY_PARENT_DIRS_WINDOWS if IS_WINDOWS else _LEGACY_PARENT_DIRS_POSIX
+        for raw in legacy_raw:
+            # Expand env vars on Windows (%USERPROFILE%, %LOCALAPPDATA%),
+            # then expand ~ against the resolver's configured home so
+            # tests with injected home dirs work correctly.
+            parents.add(self._resolver.expand(raw))
+        return sorted(parents)
 
     @staticmethod
     def _warn_migration(tool_id: str, reason: str) -> None:
