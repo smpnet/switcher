@@ -6,7 +6,6 @@ Spec §3.5 — status command empty-active-map message.
 
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 
@@ -65,8 +64,7 @@ def test_tools_rows_pathological_when_managed_live_missing(
     live path was manually deleted. The row's pathological flag fires."""
     init_result = runner.invoke(app, ["init"])
     assert init_result.exit_code == 0, _combined(init_result)
-    home = Path(os.environ.get("HOME", os.environ.get("USERPROFILE", "")))
-    claude_path = home / ".claude"
+    claude_path = tmp_home / ".claude"
     # The init step turned this into a symlink; remove it entirely so
     # detect_installed returns False for claude.
     if claude_path.is_symlink():
@@ -98,8 +96,7 @@ def test_tools_command_renders_pathological_footer(tmp_home: Path, tmp_state: Pa
     """Pathological row triggers the footer warning under the table."""
     init_result = runner.invoke(app, ["init"])
     assert init_result.exit_code == 0, _combined(init_result)
-    home = Path(os.environ.get("HOME", os.environ.get("USERPROFILE", "")))
-    claude_path = home / ".claude"
+    claude_path = tmp_home / ".claude"
     if claude_path.is_symlink():
         claude_path.unlink()
     elif claude_path.is_dir():
