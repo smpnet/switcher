@@ -310,6 +310,59 @@ def test_uninstall_uses_cached_live_paths_after_registry_drift(
     assert (tmp_home / ".claude").is_dir() and not _is_link(tmp_home / ".claude")
 
 
+def test_uninstall_after_config_dirs_reorder(tmp_state: Path, tmp_home: Path) -> None:
+    """CodeRabbit round 4: when a tool's config_dirs are reordered in the
+    TOML between init and uninstall, the classifier must still pair each
+    cached live path with its actual on-disk subdir (read from the symlink
+    target), not with `tool.config_dirs[i].profile_subdir`. The old
+    count-match shortcut paired by index, so a reorder caused healthy
+    mappings to be classified CORRUPT (target-mismatch) and blocked
+    uninstall.
+    """
+    s = _service(tmp_state, tmp_home)
+    s.init()
+    # Pre-condition: copilot's cache has 2 entries.
+    cached_before = list(s._store.get_active_live_paths()["copilot"])
+    assert len(cached_before) == 2
+
+    # Simulate user reordering config_dirs in the TOML between init and
+    # uninstall. The subdirs and live paths stay the same, only the order
+    # within `config_dirs` swaps.
+    registry_d = tmp_state / "registry.d"
+    registry_d.mkdir(parents=True, exist_ok=True)
+    (registry_d / "copilot.toml").write_text(
+        'id = "copilot"\n'
+        'name = "GitHub Copilot CLI (reordered)"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.copilot"\n'
+        'windows_path = "%USERPROFILE%\\\\.copilot"\n'
+        'profile_subdir = "copilot-config"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.config/github-copilot"\n'
+        'windows_path = "%LOCALAPPDATA%\\\\github-copilot"\n'
+        'profile_subdir = "copilot-auth"\n'
+    )
+
+    # Re-instantiate so the reordered registry takes effect.
+    reordered = _service(tmp_state, tmp_home)
+
+    # Dry-run: both mappings classify cleanly, no CORRUPT from mispairing.
+    report = reordered.uninstall(dry_run=True)
+    copilot_mappings = [m for m in report.mappings if m.tool_id == "copilot"]
+    assert len(copilot_mappings) == 2
+    assert all(m.state.value != "corrupt" for m in copilot_mappings), [
+        (m.profile_subdir, m.state.value, m.corruption_reason) for m in copilot_mappings
+    ]
+
+    # Real uninstall succeeds and restores both live dirs to real directories.
+    reordered.uninstall()
+    assert (tmp_home / ".copilot").is_dir() and not _is_link(tmp_home / ".copilot")
+    posix_first = tmp_home / ".config" / "github-copilot"
+    windows_first = tmp_home / "AppData" / "Local" / "github-copilot"
+    first_live = windows_first if IS_WINDOWS else posix_first
+    assert first_live.is_dir() and not _is_link(first_live)
+
+
 def test_uninstall_purge_clears_active_state_before_destructive_delete(
     tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

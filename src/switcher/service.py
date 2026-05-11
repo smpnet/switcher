@@ -221,26 +221,16 @@ class ProfileService:
             profile_dir = self._store.profile_dir(profile_name)
 
             # Reconstruct the (subdir, live_path) pairs we need.
-            if tool is not None and cached_paths and len(cached_paths) == len(tool.config_dirs):
-                # Count-match drift-resilience: pair the cached paths
-                # (authoritative for "what's on disk") with the registry's
-                # subdirs by index. Lets _classify_one_mapping still detect
-                # profile_subdir drift via its symlink-target check.
-                pairs = [
-                    (dm.profile_subdir, Path(cached_paths[i]))
-                    for i, dm in enumerate(tool.config_dirs)
-                ]
-            elif cached_paths:
-                # Cache is populated but either there's no registry entry
-                # (orphan tool) or the count differs from the registry
-                # (TOML added/removed a config_dir post-init). In both
-                # cases the cache is the authoritative record of what's
-                # actually managed on disk; derive each mapping's subdir
-                # from its symlink target (works regardless of TOML
-                # drift). Hermes review: previously the count-mismatch
-                # branch fell back to resolver-derived paths, silently
-                # dropping extras in the cache and leaving symlinks
-                # dangling after uninstall.
+            if cached_paths:
+                # Cache is the authoritative record of what's actually
+                # managed on disk; derive each mapping's subdir from its
+                # symlink target so uninstall is resilient to ANY shape of
+                # TOML drift (reorder, add, remove, rename). CodeRabbit
+                # round 4: a prior count-match shortcut paired cached paths
+                # by index against tool.config_dirs, which mispaired subdirs
+                # whenever the user reordered config_dirs in the registry
+                # post-init and incorrectly classified healthy mappings as
+                # CORRUPT.
                 pairs = []
                 for cached_str in cached_paths:
                     live = Path(cached_str)
@@ -985,7 +975,7 @@ class ProfileService:
                 # `_capture_tool_for_rescan` — populated only if the capture
                 # already committed the metadata update — so the rollback can
                 # revert metadata.json on --into state-write failure.
-                leftovers = self._rollback_partial_rescan(
+                leftovers, rollback_errors = self._rollback_partial_rescan(
                     tool, target, into=into is not None, previous_tools=previous_tools
                 )
                 msg = f"capture failed for {tool.id!r}: {e}"
@@ -994,6 +984,8 @@ class ProfileService:
                         f"; rollback could not restore captured data — "
                         f"user data left at: {', '.join(leftovers)}"
                     )
+                if rollback_errors:
+                    msg += f"; rollback steps also failed: {'; '.join(rollback_errors)}"
                 raise RescanCaptureError(msg) from e
             report.captured.append((tool.id, target))
         return report
@@ -1078,7 +1070,7 @@ class ProfileService:
         *,
         into: bool,
         previous_tools: dict[str, bool] | None = None,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[str]]:
         """Outer-loop cleanup if `_capture_tool_for_rescan` raised.
 
         For default mode: rmtree the partial profile dir (it was created by
@@ -1095,12 +1087,22 @@ class ProfileService:
         Fail-closed: if `move_or_seed_dir(sub, live)` raises, leave `sub` on
         disk and record its path. The rmtree of the partial profile dir (or
         of leftover subs in --into mode) only runs if every sub was either
-        restored or never had real content. The returned list is the set of
-        sub paths that still hold user data and need manual recovery; the
-        caller surfaces it in the RescanCaptureError message.
+        restored or never had real content.
+
+        Returns `(leftovers, rollback_errors)`:
+          - `leftovers`: sub paths that still hold user data and need manual
+            recovery.
+          - `rollback_errors`: human-readable descriptions of rollback steps
+            that failed *without* leaving recoverable artefacts on disk
+            (e.g. metadata.json revert failed → on-disk metadata still
+            claims the tool was added even though state was never updated).
+
+        Both lists are surfaced in the RescanCaptureError message so a
+        suppressed exception never silently leaves the repo inconsistent.
         """
         target_dir = self._store.profile_dir(target)
         leftovers: list[str] = []
+        rollback_errors: list[str] = []
 
         def _is_empty_dir(p: Path) -> bool:
             """An empty sub means the inner phase seeded it (live was missing)
@@ -1131,7 +1133,7 @@ class ProfileService:
             # with real user data must stay on disk.
             if not leftovers:
                 shutil.rmtree(target_dir, ignore_errors=True)
-            return leftovers
+            return leftovers, rollback_errors
 
         # --into mode: same link-aware restore as default mode for THIS
         # tool's subdirs; leave the rest of the existing profile alone.
@@ -1139,15 +1141,20 @@ class ProfileService:
         # update for this tool (cache populated → `previous_tools` set)
         # and a LATER step failed (e.g. `set_active_state`), revert
         # `metadata.json` so it doesn't keep claiming the tool was added.
-        # Best-effort: suppressed because the filesystem restore below is
-        # the more important guarantee — if the metadata revert fails,
-        # drift is bounded to "extra tool listed under this profile but
-        # not in active map", recoverable by re-running rescan. Hermes
-        # review: previously the --into rollback explicitly said "nothing
-        # to revert" and left stale metadata after a state-write failure.
+        # The filesystem restore below is the higher-priority guarantee,
+        # so we still attempt it even if the metadata revert fails — but
+        # the failure is surfaced via rollback_errors instead of silently
+        # suppressed. CodeRabbit round 4: previously suppress'd here, so
+        # metadata.json could continue claiming the tool was added after
+        # a state-write failure without the caller learning about it.
         if previous_tools is not None:
-            with contextlib.suppress(Exception):
+            try:
                 self._store.update_profile_tools(target, previous_tools)
+            except Exception as meta_err:
+                rollback_errors.append(
+                    f"profile {target!r} metadata.json revert failed "
+                    f"(still lists tool {tool.id!r}): {meta_err}"
+                )
         for i, dm in enumerate(tool.config_dirs):
             live = self._resolver.tool_dir(tool, i)
             if self._resolver.is_link(live):
@@ -1173,7 +1180,7 @@ class ProfileService:
                 continue
             if sub.exists():
                 shutil.rmtree(sub, ignore_errors=True)
-        return leftovers
+        return leftovers, rollback_errors
 
     # Prune ------------------------------------------------------------------
 

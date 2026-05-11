@@ -86,7 +86,7 @@ def test_rescan_default_creates_fresh_profile_per_new_tool(tmp_state: Path, tmp_
     # Now "install" copilot post-init.
     (tmp_home / COPILOT_SECOND_DIR).mkdir()
     (tmp_home / COPILOT_SECOND_DIR / "settings.json").write_text("{}")
-    (tmp_home / COPILOT_FIRST_DIR).mkdir()
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
     (tmp_home / COPILOT_FIRST_DIR / "apps.json").write_text("{}")
 
     s.rescan()
@@ -109,7 +109,7 @@ def test_rescan_into_existing_profile(tmp_state: Path, tmp_home: Path) -> None:
     _suppress_copilot(tmp_home)
     s.init()
     (tmp_home / COPILOT_SECOND_DIR).mkdir()
-    (tmp_home / COPILOT_FIRST_DIR).mkdir()
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
 
     init_profile = next(iter(s._store.get_active().values()))
     s.rescan(into=init_profile)
@@ -418,6 +418,57 @@ def test_rescan_into_state_write_failure_reverts_metadata(
     assert not _is_link(tmp_home / COPILOT_SECOND_DIR)
     # Active map unchanged.
     assert "copilot" not in s._store.get_active()
+
+
+def test_rescan_into_metadata_rollback_failure_is_surfaced(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CodeRabbit round 4: if metadata.json revert fails during the
+    `--into` rollback path, the failure must be surfaced in the
+    RescanCaptureError instead of silently suppressed. Without this the
+    on-disk metadata claims the tool was added even though state was
+    never updated, and the caller never learns about the inconsistency.
+    """
+    s = _service(tmp_state, tmp_home)
+    _suppress_copilot(tmp_home)
+    s.init()  # claude only
+    init_profile = next(iter(s._store.get_active().values()))
+
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_SECOND_DIR / "settings.json").write_text("user-config")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
+    (tmp_home / COPILOT_FIRST_DIR / "apps.json").write_text("user-auth")
+
+    real_set_active_state = s._store.set_active_state
+    real_update_profile_tools = s._store.update_profile_tools
+
+    def failing_set_active_state(active: object, live_paths: object) -> None:
+        if "copilot" in active:  # type: ignore[operator]
+            raise RuntimeError("simulated state-write failure")
+        return real_set_active_state(active, live_paths)  # pyright: ignore[reportArgumentType]
+
+    def failing_update_profile_tools(target_name: object, tools: object) -> None:
+        # The rollback call passes the PREVIOUS tools snapshot (no copilot).
+        # The initial commit call passes the UPDATED snapshot (with copilot).
+        # Fail only on the rollback path so rollback metadata revert fails
+        # AFTER set_active_state has already raised.
+        if "copilot" not in tools:  # type: ignore[operator]
+            raise RuntimeError("simulated metadata revert failure")
+        return real_update_profile_tools(target_name, tools)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(s._store, "set_active_state", failing_set_active_state)
+    monkeypatch.setattr(s._store, "update_profile_tools", failing_update_profile_tools)
+
+    with pytest.raises(RescanCaptureError) as excinfo:
+        s.rescan(into=init_profile, only=["copilot"])
+
+    # Both failures surfaced in the error message — the original
+    # state-write failure AND the suppressed metadata revert failure.
+    err = str(excinfo.value)
+    assert "simulated state-write failure" in err
+    assert "rollback steps also failed" in err
+    assert "metadata.json revert failed" in err
+    assert "simulated metadata revert failure" in err
 
 
 def test_rescan_default_rollback_fails_closed_when_restore_fails(

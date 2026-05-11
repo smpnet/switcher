@@ -124,13 +124,18 @@ def test_classify_corrupt_when_symlink_target_does_not_match_profile(
             m.live_path.unlink()
             m.live_path.symlink_to(bogus)
 
+    # Look up by (tool_id, live_path): post-CR-round-4, when the symlink
+    # resolves outside the profile dir, the cache-driven classifier emits
+    # a CORRUPT entry with profile_subdir="<unresolvable>" rather than
+    # echoing the registry's expected subdir, so the (tool_id, subdir)
+    # tuple from the pre-mutation mapping no longer matches.
     re_classified = next(
         c
         for c in service._classify_uninstall_mappings()
-        if (c.tool_id, c.profile_subdir) == (m.tool_id, m.profile_subdir)
+        if (c.tool_id, c.live_path) == (m.tool_id, m.live_path)
     )
     assert re_classified.state == State.CORRUPT
-    assert "points to" in re_classified.corruption_reason
+    assert "outside the profile dir" in re_classified.corruption_reason
 
 
 def test_classify_corrupt_when_real_dir_missing_empty_subdir(
