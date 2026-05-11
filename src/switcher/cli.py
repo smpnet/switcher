@@ -14,7 +14,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from switcher.errors import NothingToInitializeError, SwitcherError, UnknownToolError
+from switcher.errors import (
+    NothingToInitializeError,
+    StateNotInitializedError,
+    SwitcherError,
+    UnknownToolError,
+)
 from switcher.models import Tool
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
@@ -106,9 +111,19 @@ def status(
     deps = get_deps()
     active = deps.store.get_active()
     if not active:
-        console.print(
-            "No tools currently managed. Run 'switcher rescan' to discover installed tools."
-        )
+        # Distinguish two empty-active-map states (Hermes review):
+        #   - Uninitialized: no profiles on disk yet → suggest `init`,
+        #     because `rescan` would fail with NotInitializedError.
+        #   - Initialized but everything unmanaged (post-`unmanage` of
+        #     the last tool, or `uninstall` without --purge): suggest
+        #     `rescan` per spec §3.5 — the profile list is intact, the
+        #     active map just happens to be empty.
+        if not deps.store.list():
+            console.print("No tools currently managed. Run 'switcher init' to set up switcher.")
+        else:
+            console.print(
+                "No tools currently managed. Run 'switcher rescan' to discover installed tools."
+            )
         return
     # `markup=False` is REQUIRED because `[ok]` / `[--]` would otherwise be
     # interpreted as Rich markup tags. Spec §6.5.
@@ -438,7 +453,11 @@ def unmanage(
                 verb = "would recover from interrupted uninstall"
             else:  # ALREADY_RESTORED (CORRUPT refused by pre-flight)
                 verb = "no-op (already restored)"
-            console.print(f"  {m.live_path}  ({m.state.name} -> {verb})")
+            # `soft_wrap=True` keeps the verb token together. Without it,
+            # Rich wraps long Windows paths and splits "would recover"
+            # across a hard newline, breaking substring assertions and
+            # making the preview harder to grep.
+            console.print(f"  {m.live_path}  ({m.state.name} -> {verb})", soft_wrap=True)
         console.print("(dry-run; no changes made)")
     elif report.skipped_orphan:
         console.print(
@@ -473,6 +492,14 @@ def rescan(
         raise typer.BadParameter("--all and --only are mutually exclusive")
 
     deps = get_deps()
+
+    # Preflight: surface StateNotInitializedError BEFORE the new prompt /
+    # warning logic touches the user (Hermes review). Otherwise bare
+    # rescan on an uninitialized machine prints capture-all warnings or
+    # prompts the user, then fails inside service.rescan() with "switcher
+    # has not been initialized" — misleading UX.
+    if not deps.store.list():
+        raise StateNotInitializedError("switcher has not been initialized; run 'switcher init'")
 
     # Mirror `use --only`: an explicitly empty `--only ""` is invalid input,
     # not "no filter". Without this the CLI silently bypasses the
@@ -604,12 +631,16 @@ class _ToolsTableRow:
 
 def _build_tools_table_rows(deps: Deps) -> list[_ToolsTableRow]:
     """Pure: registry → list of rows. Used by tools_main to populate the
-    Rich table; also a clean assertion target for tests."""
+    Rich table; also a clean assertion target for tests.
+
+    `deps.store.get_active()` returns `{}` when config.json doesn't exist
+    yet (pre-init), so no try/except is needed for the uninit case.
+    A real StorageError (corrupt / unreadable config.json) intentionally
+    propagates — the broad `except Exception` we used to have masked exactly
+    the failures the rest of the CLI is careful to surface (Hermes review).
+    """
     installed_ids = {t.id for t in deps.service.detect_installed()}
-    try:
-        managed_ids = set(deps.store.get_active().keys())
-    except Exception:
-        managed_ids = set()
+    managed_ids = set(deps.store.get_active().keys())
     rows: list[_ToolsTableRow] = []
     for tool in deps.registry:
         installed = tool.id in installed_ids

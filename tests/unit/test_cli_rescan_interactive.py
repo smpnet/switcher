@@ -144,6 +144,40 @@ def test_rescan_into_with_dry_run_no_mutation(tmp_home: Path, tmp_state: Path) -
     assert "claude" not in get_deps().store.get_active()
 
 
+def test_rescan_pre_init_fails_before_prompt_or_warning(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hermes review: bare `rescan` on an uninitialized machine must
+    fail with StateNotInitializedError BEFORE the new TTY prompt or
+    non-TTY warning fires. Otherwise the user sees 'capturing all
+    detected unmanaged tools' guidance, then the command fails — a
+    misleading regression vs the pre-v0.1.4 flow."""
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: False)
+    result = runner.invoke(app, ["rescan"])
+    assert result.exit_code != 0
+    out = (result.output + (result.stderr or "")).lower()
+    assert "has not been initialized" in out or "switcher init" in out
+    # No premature capture-all warning before the init guard fires.
+    assert "warning" not in out
+    assert "capturing all" not in out
+
+
+def test_rescan_pre_init_fails_before_tty_prompt(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TTY counterpart to the Hermes finding: must NOT prompt before
+    surfacing the not-initialized error."""
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
+    # Pass empty input — if the prompt fires before the init check,
+    # input() will raise EOFError and the test fails noisily, which is
+    # still informative. The exit_code != 0 assertion catches both.
+    result = runner.invoke(app, ["rescan"], input="")
+    assert result.exit_code != 0
+    out = (result.output + (result.stderr or "")).lower()
+    assert "has not been initialized" in out or "switcher init" in out
+    assert "detected unmanaged tools" not in out
+
+
 def test_rescan_into_tty_prompt_path(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
