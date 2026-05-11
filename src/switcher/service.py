@@ -188,6 +188,13 @@ class ProfileService:
         the same transaction. Validation is performed against the proposed
         active map (which determines the expected profile_subdir target),
         not the on-disk one.
+
+        v0.1.4: tries filesystem-truth discovery first (handles legacy drift
+        where the current registry no longer mentions paths still managed on
+        disk). Falls back to the v0.1.3 strict registry-derived path only
+        when discovery returns empty for a registered tool. Orphan tools
+        with empty discovery emit a migration warning (matches v0.1.3
+        no-derivation-possible behavior, but now visible to the user).
         """
         cached_on_disk = self._store.get_active_live_paths()
         result: dict[str, list[str]] = {}
@@ -197,9 +204,33 @@ class ProfileService:
                 # Trust an already-validated cache entry.
                 result[tool_id] = existing
                 continue
+
+            # 1. FS-truth discovery (spec §4.2).
+            discovered = self._discover_live_paths_for_active(tool_id, profile_name)
+            if discovered:
+                result[tool_id] = discovered
+                # Consistency warning: registry promises N config_dirs but
+                # discovery returned M ≠ N — suggests user-side reconciliation.
+                tool = find_tool(self._registry, tool_id)
+                if tool is not None and len(tool.config_dirs) != len(discovered):
+                    self._warn_migration(
+                        tool_id,
+                        (
+                            f"registry has {len(tool.config_dirs)} config_dir(s), "
+                            f"but {len(discovered)} live path(s) resolve into the "
+                            f"profile dir. Recorded all discovered paths — "
+                            f"consider 'switcher unmanage {tool_id}' then "
+                            f"'switcher rescan --only {tool_id}' to reconcile."
+                        ),
+                    )
+                continue
+
+            # 2. Fallback: v0.1.3 registry-strict derivation. Reached when
+            # discovery found nothing AND the tool is still registered.
             tool = find_tool(self._registry, tool_id)
             if tool is None:
-                continue  # orphan tool — no derivation possible
+                self._warn_migration(tool_id, "no registry entry and no live symlinks found")
+                continue
             try:
                 result[tool_id] = self._derive_live_paths_strict(tool, profile_name)
             except _MigrationValidationError as e:
