@@ -196,18 +196,26 @@ def test_use_is_idempotent(service: ProfileService, tmp_state: Path) -> None:
 def test_use_pre_validates_tools_before_mutating(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    """A profile with a stale tool id must fail before any live link changes.
+    """A managed tool removed from the registry must fail before any swap.
 
-    Without pre-flight validation, the swap loop would process tools in
-    sorted order: 'claude' would switch successfully, then 'ghost' would
-    raise UnknownToolError, leaving the filesystem half-switched. Pre-flight
-    must reject the call without touching any live link.
+    v0.1.4 use() filters target_ids by active.keys() — so a stale tool in
+    profile.tools but NOT in active is silently filtered out (durability
+    for the unmanage flow). Pre-flight only needs to guard the case where
+    a tool was managed (in active) and the registry has since dropped it.
+    Without pre-flight, sorted swap order would process 'claude' before
+    'ghost' raised UnknownToolError, leaving the filesystem half-switched.
     """
     service.init()
     store = FileProfileStore(tmp_state)
-    # Hand-craft a profile dir that references a tool not in the registry.
+    # Profile metadata references 'ghost' (unknown to registry).
     store.create("stale", {"claude": True, "ghost": True})
     (store.profile_dir("stale") / "claude").mkdir()
+    # Simulate registry drift after init: 'ghost' was managed once, then
+    # the registry entry was removed. v0.1.3 service.init() never put a
+    # 'ghost' here, so inject it manually to model the post-drift state.
+    active = store.get_active()
+    cache = service.get_active_live_paths()
+    store.set_active_state({**active, "ghost": "stale"}, cache)
     claude_link = tmp_home / ".claude"
     original_target = claude_link.resolve()
     with pytest.raises(UnknownToolError):

@@ -29,6 +29,7 @@ from switcher.errors import (
     StateNotInitializedError,
     ToolHasNoActiveProfileError,
     ToolNotInProfileError,
+    ToolNotManagedError,
     UninstallPreflightError,
     UnknownProfileError,
     UnknownToolError,
@@ -671,17 +672,41 @@ class ProfileService:
 
     def use(self, profile_name: str, only: list[str] | None = None) -> None:
         self._require_initialized()
+        # v0.1.4 §3.1/§3.5: empty active map → loud failure rather than
+        # a silent no-op switch.
+        self._require_managed()
         profile = self._store.get(profile_name)
         active = self._store.get_active()
+        managed = set(active.keys())
         if only is not None:
             for tid in only:
                 if tid not in profile.tools:
                     raise ToolNotInProfileError(
                         f"profile {profile_name!r} does not include {tid!r}"
                     )
+                if tid not in managed:
+                    # v0.1.4 §3.1 durability: --only must intersect the
+                    # managed set, or the explicit request quietly re-
+                    # adopts an unmanaged tool's live dir.
+                    raise ToolNotManagedError(
+                        f"tool {tid!r} is not currently managed. "
+                        f"To add it: switcher rescan --only {tid}"
+                    )
             target_ids = list(only)
         else:
-            target_ids = sorted(profile.tools.keys())
+            # v0.1.4 §3.1 durability: the default switches only the
+            # managed subset of the profile, not every tool in
+            # profile.tools. Without this filter, use(other_profile)
+            # re-activates a tool the user just unmanaged.
+            target_ids = sorted(profile.tools.keys() & managed)
+        # v0.1.4 §3.1 consultant finding: _require_managed already
+        # passed (active is non-empty) but this profile contributes
+        # zero managed tools. Hard-error rather than silent no-op
+        # (matches spec's "Hard error. Preferred." decision).
+        if not target_ids:
+            raise NoToolsManagedError(
+                f"profile {profile_name!r} contains no currently managed tools; nothing to switch"
+            )
         # Pre-flight 1: resolve every tool BEFORE mutating any link. A stale
         # tool id in profile.tools (registry drift, plugin removed, hand-edited
         # state) would otherwise surface partway through the swap loop and
