@@ -270,6 +270,52 @@ class ProfileService:
             parents.add(self._resolver.expand(raw))
         return sorted(parents)
 
+    def _discover_live_paths_for_active(self, tool_id: str, profile_name: str) -> list[str]:
+        """Walk the FS for symlinks resolving into this tool's owned subdirs.
+
+        Trusts the filesystem over the registry. Used during legacy migration
+        when active_live_paths is unpopulated (spec §4.2). The per-tool subdir
+        map prevents misattribution in multi-tool profiles.
+
+        Returns the discovered live paths as string-form absolute paths.
+        Empty list means "no symlinks resolve into a subdir this tool owns";
+        callers fall back to _derive_live_paths_strict or emit a migration
+        warning per the orphan-tool path.
+        """
+        profile_dir = self._store.profile_dir(profile_name)
+        if not profile_dir.is_dir():
+            return []
+
+        expected_subdirs = self._expected_subdirs_for(tool_id)
+        if not expected_subdirs:
+            return []
+
+        # Resolve only those expected subdirs that actually exist on disk;
+        # non-existent ones can't be the target of any symlink anyway.
+        owned_targets: set[Path] = set()
+        for sub in expected_subdirs:
+            candidate = profile_dir / sub
+            if candidate.is_dir():
+                owned_targets.add(candidate.resolve())
+        if not owned_targets:
+            return []
+
+        discovered: list[Path] = []
+        for parent in self._candidate_parents_for(tool_id):
+            if not parent.is_dir():
+                continue
+            for child in parent.iterdir():
+                if not self._resolver.is_link(child):
+                    continue
+                try:
+                    resolved = child.resolve()
+                except (OSError, RuntimeError):
+                    # Broken/dangling/cyclic symlink — skip silently.
+                    continue
+                if resolved in owned_targets:
+                    discovered.append(child)
+        return [str(p) for p in discovered]
+
     @staticmethod
     def _warn_migration(tool_id: str, reason: str) -> None:
         """One-line stderr warning when migration can't derive a tool's cache entry."""
