@@ -58,3 +58,24 @@ def test_save_with_empty_active_map_raises(
     service._store.set_active_state({}, {})
     with pytest.raises(NoToolsManagedError):
         service.save("would-be-empty")
+
+
+def test_save_when_no_managed_tools_are_installed_raises(
+    service_with_both_tools: ProfileService, tmp_home: Path
+) -> None:
+    """active has entries but every managed tool's live path is gone.
+
+    Without this guard, save() silently writes an empty profile that
+    looks valid until the user tries to use() it — same silent-empty
+    failure mode §3.5 closes off for the empty-active-map case.
+    Reachable via external uninstall of every managed tool or a
+    registry reshuffle that drops every managed tool id.
+    """
+    service = service_with_both_tools
+    # Remove every live symlink init() installed. detect_installed() now
+    # returns [], so the managed-filter intersection is empty.
+    (tmp_home / ".claude").unlink()
+    (tmp_home / ".copilot").unlink()
+    assert service._store.get_active(), "active map should still be populated"
+    with pytest.raises(NoToolsManagedError):
+        service.save("would-be-empty")

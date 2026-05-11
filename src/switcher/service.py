@@ -766,6 +766,18 @@ class ProfileService:
             raise ProfileExistsError(f"profile {name!r} already exists")
         managed = set(self._store.get_active().keys())
         installed = [t for t in self.detect_installed() if t.id in managed]
+        # v0.1.4 §3.5: closing the second silent-empty-profile hole.
+        # _require_managed already passed (active is non-empty), but if every
+        # managed tool was uninstalled outside switcher (or the registry was
+        # reshuffled so no managed id resolves), `installed` is empty and the
+        # downstream loop would persist a profile with no tools dict entries
+        # and no captured data. Fail loud, with a hint that mirrors the spec's
+        # advice for the empty-active-map case.
+        if not installed:
+            raise NoToolsManagedError(
+                "no managed tools are currently installed live; nothing to snapshot. "
+                "reinstall the tools or run 'switcher uninstall' to drop stale entries"
+            )
         # Pre-flight: every live path that detect_installed surfaced must be
         # a real directory. Two pathological shapes slip through if we use
         # plain `live.exists()` here: a regular file (exists True, is_dir
