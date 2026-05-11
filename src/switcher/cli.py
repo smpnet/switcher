@@ -106,7 +106,9 @@ def status(
     deps = get_deps()
     active = deps.store.get_active()
     if not active:
-        console.print("no active profiles")
+        console.print(
+            "No tools currently managed. Run 'switcher rescan' to discover installed tools."
+        )
         return
     # `markup=False` is REQUIRED because `[ok]` / `[--]` would otherwise be
     # interpreted as Rich markup tags. Spec §6.5.
@@ -540,6 +542,42 @@ def tools_scaffold(
     console.print(f"Wrote scaffold to {target}")
 
 
+@dataclass(frozen=True)
+class _ToolsTableRow:
+    tool_id: str
+    name: str
+    installed: bool
+    managed: bool
+    paths: list[str]
+    pathological: bool  # True when managed AND NOT installed
+
+
+def _build_tools_table_rows(deps: Deps) -> list[_ToolsTableRow]:
+    """Pure: registry → list of rows. Used by tools_main to populate the
+    Rich table; also a clean assertion target for tests."""
+    installed_ids = {t.id for t in deps.service.detect_installed()}
+    try:
+        managed_ids = set(deps.store.get_active().keys())
+    except Exception:
+        managed_ids = set()
+    rows: list[_ToolsTableRow] = []
+    for tool in deps.registry:
+        installed = tool.id in installed_ids
+        managed = tool.id in managed_ids
+        paths = [(dm.windows_path if IS_WINDOWS else dm.posix_path) for dm in tool.config_dirs]
+        rows.append(
+            _ToolsTableRow(
+                tool_id=tool.id,
+                name=tool.name,
+                installed=installed,
+                managed=managed,
+                paths=paths,
+                pathological=(managed and not installed),
+            )
+        )
+    return rows
+
+
 @tools_app.callback(invoke_without_command=True)
 @handle_errors
 def tools_main(ctx: typer.Context) -> None:
@@ -547,13 +585,27 @@ def tools_main(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is not None:
         return
     deps = get_deps()
+    rows = _build_tools_table_rows(deps)
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID")
     table.add_column("Name")
+    table.add_column("Installed", justify="center")
+    table.add_column("Managed", justify="center")
     table.add_column("Paths" + (" (Windows)" if IS_WINDOWS else " (POSIX)"))
-    for tool in deps.registry:
-        paths = "\n".join(
-            (dm.windows_path if IS_WINDOWS else dm.posix_path) for dm in tool.config_dirs
+    for row in rows:
+        installed_cell = "⚠" if row.pathological else ("✓" if row.installed else "—")
+        managed_cell = "✓" if row.managed else "—"
+        table.add_row(
+            row.tool_id,
+            row.name,
+            installed_cell,
+            managed_cell,
+            "\n".join(row.paths),
         )
-        table.add_row(tool.id, tool.name, paths)
     console.print(table)
+    for row in rows:
+        if row.pathological:
+            console.print(
+                f"[yellow]⚠ {row.tool_id!r} is in active map but its live path is missing.[/yellow]\n"
+                f"  Run 'switcher unmanage {row.tool_id}' or restore the live path."
+            )
