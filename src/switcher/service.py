@@ -828,6 +828,9 @@ class ProfileService:
         save()'s rollback discipline.
         """
         self._require_initialized()
+        # v0.1.4 §3.5: empty active map → fail loud rather than create
+        # an empty-tools profile that looks valid until first use.
+        self._require_managed()
         if self._store.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
         active = self._store.get_active()
