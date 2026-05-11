@@ -76,8 +76,25 @@ def _suppress_copilot(tmp_home: Path) -> None:
         _remove_path(tmp_home / sub)
 
 
-def test_rescan_default_creates_fresh_profile_per_new_tool(tmp_state: Path, tmp_home: Path) -> None:
+def _freeze_now(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """Pin `switcher.service.now()` to a fixed UTC datetime for date-sensitive
+    assertions. Returns the frozen value so the test derives `today` from the
+    same source `rescan()` sees, eliminating UTC-rollover flakes between the
+    test's `datetime.now()` and rescan's profile-name composition. Matches
+    the spec-pinned monkeypatch seam in `src/switcher/service.py`.
+    """
+    from switcher import service as svc_mod
+
+    frozen = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(svc_mod, "now", lambda: frozen)
+    return frozen
+
+
+def test_rescan_default_creates_fresh_profile_per_new_tool(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Init claude only, then drop a copilot dir, then rescan → fresh profile for copilot."""
+    frozen = _freeze_now(monkeypatch)
     s = _service(tmp_state, tmp_home)
     # Pretend copilot wasn't installed at init time.
     _suppress_copilot(tmp_home)
@@ -91,7 +108,7 @@ def test_rescan_default_creates_fresh_profile_per_new_tool(tmp_state: Path, tmp_
 
     s.rescan()
 
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    today = frozen.strftime("%Y-%m-%d")
     assert (tmp_state / "profiles" / f"{today}-rescan-1").is_dir()
     assert "copilot" in s._store.get_active()
     assert "copilot" in s._store.get_active_live_paths()
@@ -104,7 +121,10 @@ def test_rescan_no_new_tools(tmp_state: Path, tmp_home: Path) -> None:
     assert report.captured == []
 
 
-def test_rescan_into_existing_profile(tmp_state: Path, tmp_home: Path) -> None:
+def test_rescan_into_existing_profile(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frozen = _freeze_now(monkeypatch)
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()
@@ -114,7 +134,7 @@ def test_rescan_into_existing_profile(tmp_state: Path, tmp_home: Path) -> None:
     init_profile = next(iter(s._store.get_active().values()))
     s.rescan(into=init_profile)
 
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    today = frozen.strftime("%Y-%m-%d")
     assert not (tmp_state / "profiles" / f"{today}-rescan-1").exists()
     # copilot's content lives in the init profile now.
     assert (tmp_state / "profiles" / init_profile / "copilot-config").exists()
@@ -181,6 +201,7 @@ def test_rescan_rolls_back_on_partial_capture_failure(
     tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Spec §4.4 / §6.4: if mapping N+1 fails after 0..N captured, undo 0..N."""
+    frozen = _freeze_now(monkeypatch)
     s = _service(tmp_state, tmp_home)
     # Suppress copilot at init so it ends up as the rescan target.
     _suppress_copilot(tmp_home)
@@ -222,7 +243,7 @@ def test_rescan_rolls_back_on_partial_capture_failure(
     # Active map unchanged.
     assert "copilot" not in s._store.get_active()
     # Default-mode profile dir cleaned up.
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    today = frozen.strftime("%Y-%m-%d")
     assert not (tmp_state / "profiles" / f"{today}-rescan-1").exists()
 
 
@@ -338,6 +359,7 @@ def test_rescan_state_write_failure_rolls_back_capture(
     successful capture, rollback must undo the link/move so retries don't
     hit AlreadyLinkedError on the (now-symlinked) live dirs.
     """
+    frozen = _freeze_now(monkeypatch)
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only
@@ -371,7 +393,7 @@ def test_rescan_state_write_failure_rolls_back_capture(
     assert (tmp_home / COPILOT_FIRST_DIR / "apps.json").read_text() == "user-auth"
     # Active map and the partial profile dir are unchanged on disk.
     assert "copilot" not in s._store.get_active()
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    today = frozen.strftime("%Y-%m-%d")
     assert not (tmp_state / "profiles" / f"{today}-rescan-1").exists()
 
 
@@ -483,6 +505,7 @@ def test_rescan_default_rollback_fails_closed_when_restore_fails(
     the user's only copy of the live dir gets rmtree'd via the partial
     profile dir.
     """
+    frozen = _freeze_now(monkeypatch)
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only
@@ -519,7 +542,7 @@ def test_rescan_default_rollback_fails_closed_when_restore_fails(
 
     # Captured user data still on disk in the partial profile dir — NOT
     # silently rmtree'd. The user can recover it manually.
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    today = frozen.strftime("%Y-%m-%d")
     profile_dir = tmp_state / "profiles" / f"{today}-rescan-1"
     assert profile_dir.exists()
     config_sentinel = profile_dir / "copilot-config" / "sentinel.txt"
@@ -585,14 +608,21 @@ def test_rescan_already_linked_raises(tmp_state: Path, tmp_home: Path) -> None:
 
     Setup: suppress copilot at init (both config dirs removed), then recreate
     the first config dir as a real dir (so detection finds copilot) and the
-    second as a foreign symlink (so pre-flight rejects).
+    second as a foreign link (so pre-flight rejects). On Windows the link is
+    a junction (matches the rest of the codebase) so the test runs reliably
+    in CI without needing Developer Mode / elevation for `symlink_to()`.
     """
+    from switcher.links import _create_junction
+
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only
     (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
     foreign = tmp_home / "foreign-copilot"
     foreign.mkdir()
-    (tmp_home / COPILOT_SECOND_DIR).symlink_to(foreign, target_is_directory=True)
+    if IS_WINDOWS:
+        _create_junction(foreign, tmp_home / COPILOT_SECOND_DIR)
+    else:
+        (tmp_home / COPILOT_SECOND_DIR).symlink_to(foreign, target_is_directory=True)
     with pytest.raises(AlreadyLinkedError):
         s.rescan(only=["copilot"])
