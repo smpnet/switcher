@@ -84,7 +84,12 @@ def test_rescan_default_captures_new_tool(tmp_state: Path, tmp_home: Path) -> No
     (tmp_home / COPILOT_SECOND_DIR).mkdir()
     result = runner.invoke(app, ["rescan"])
     assert result.exit_code == 0, result.stderr
+    # Real run uses past-tense "captured", never the dry-run "would" prefix.
+    # Pins the non-dry-run branch of the same conditional that produced the
+    # original "would captured" typo, so the regression can't reappear on
+    # either side.
     assert "captured copilot" in result.stderr
+    assert "would capture" not in result.stderr
 
 
 def test_rescan_only_empty_string_is_rejected(tmp_state: Path, tmp_home: Path) -> None:
