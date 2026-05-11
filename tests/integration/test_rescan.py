@@ -37,6 +37,44 @@ COPILOT_FIRST_DIR = (
 COPILOT_SECOND_DIR = Path(".copilot")
 
 
+def _install_two_dir_copilot_override(tmp_state: Path) -> None:
+    """Install a user-local copilot.toml that re-introduces the legacy
+    two-dir copilot shape (copilot-config + copilot-auth).
+
+    Why: the v0.1.4 builtin copilot.toml targets only the standalone
+    `copilot` binary's single config dir (`~/.copilot`). Tests that
+    exercise multi-dir capture/rollback/seeding semantics need a
+    two-dir tool registered. Rather than depend on a builtin no longer
+    shipped, each test that needs it installs this user-local override
+    before constructing the service.
+
+    Order matches the legacy pre-rewrite bundled builtin:
+    config_dirs[0] = ~/.config/github-copilot (POSIX) or
+        %LOCALAPPDATA%\\github-copilot (Windows) → copilot-auth.
+    config_dirs[1] = ~/.copilot → copilot-config.
+
+    The order is load-bearing: tests reference
+    `COPILOT_FIRST_DIR` (= the [0] live path) for detection setup and
+    `COPILOT_SECOND_DIR` (= the [1] live path) for seeded-mapping
+    assertions. Swapping the order would silently invert which is
+    'first' and break those assertions.
+    """
+    registry_d = tmp_state / "registry.d"
+    registry_d.mkdir(parents=True, exist_ok=True)
+    (registry_d / "copilot.toml").write_text(
+        'id = "copilot"\n'
+        'name = "GitHub Copilot CLI (test two-dir override)"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.config/github-copilot"\n'
+        'windows_path = "%LOCALAPPDATA%\\\\github-copilot"\n'
+        'profile_subdir = "copilot-auth"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.copilot"\n'
+        'windows_path = "%USERPROFILE%\\\\.copilot"\n'
+        'profile_subdir = "copilot-config"\n'
+    )
+
+
 def _service(tmp_state: Path, tmp_home: Path) -> ProfileService:
     return ProfileService(
         FileProfileStore(tmp_state),
@@ -180,6 +218,7 @@ def test_rescan_into_collision_refused(tmp_state: Path, tmp_home: Path) -> None:
 
 def test_rescan_seeds_missing_secondary_config_dir(tmp_state: Path, tmp_home: Path) -> None:
     """Mirror init's move_or_seed_dir behavior for missing secondary dirs."""
+    _install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only
@@ -216,6 +255,7 @@ def test_rescan_rolls_back_on_partial_capture_failure(
 ) -> None:
     """Spec §4.4 / §6.4: if mapping N+1 fails after 0..N captured, undo 0..N."""
     frozen = _freeze_now(monkeypatch)
+    _install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     # Suppress copilot at init so it ends up as the rescan target.
     _suppress_copilot(tmp_home)
@@ -528,6 +568,7 @@ def test_rescan_default_rollback_fails_closed_when_restore_fails(
     profile dir.
     """
     frozen = _freeze_now(monkeypatch)
+    _install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only
@@ -581,6 +622,7 @@ def test_rescan_into_rollback_fails_closed_when_restore_fails(
 ) -> None:
     """Spec §4.4: `--into` rollback must also fail closed if the restore
     call fails — leave the captured sub on disk rather than silent rmtree."""
+    _install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only

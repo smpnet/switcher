@@ -24,6 +24,33 @@ from switcher.store import FileProfileStore
 pytestmark = pytest.mark.integration
 
 
+def _install_two_dir_copilot_override(tmp_state: Path) -> None:
+    """Install a user-local copilot.toml that re-introduces the legacy
+    two-dir copilot shape (copilot-config + copilot-auth).
+
+    See `tests/integration/test_rescan.py` for the rationale — duplicated
+    here to avoid a cross-package import dance for a 20-line helper.
+
+    Order matches the legacy pre-rewrite bundled builtin so existing
+    test assertions (which assume `.config/github-copilot` is the FIRST
+    config_dir and `.copilot` is the SECOND) keep working unchanged.
+    """
+    registry_d = tmp_state / "registry.d"
+    registry_d.mkdir(parents=True, exist_ok=True)
+    (registry_d / "copilot.toml").write_text(
+        'id = "copilot"\n'
+        'name = "GitHub Copilot CLI (test two-dir override)"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.config/github-copilot"\n'
+        'windows_path = "%LOCALAPPDATA%\\\\github-copilot"\n'
+        'profile_subdir = "copilot-auth"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.copilot"\n'
+        'windows_path = "%USERPROFILE%\\\\.copilot"\n'
+        'profile_subdir = "copilot-config"\n'
+    )
+
+
 def _service(tmp_state: Path, tmp_home: Path) -> ProfileService:
     return ProfileService(
         FileProfileStore(tmp_state),
@@ -241,16 +268,18 @@ def test_uninstall_processes_all_cached_paths_when_registry_shrinks(
     one. Uninstall must process ALL cached paths (driving from the cache),
     not silently drop the extras and leave a dangling symlink behind.
     """
+    # Start with the legacy two-dir copilot shape so init captures both
+    # config dirs into the cache. Then simulate the registry shrinking.
+    _install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     s.init()
-    # Pre-condition: copilot's cache has 2 entries (its two builtin config_dirs).
+    # Pre-condition: copilot's cache has 2 entries (the override's two config_dirs).
     assert len(s._store.get_active_live_paths()["copilot"]) == 2
 
-    # Simulate registry drift: shrink copilot to a single config_dir via a
-    # user TOML override. The cached entries are unchanged (cache writes
-    # only on capture/rescan).
+    # Simulate registry drift: shrink copilot to a single config_dir by
+    # rewriting the user override. The cached entries are unchanged (cache
+    # writes only on capture/rescan).
     registry_d = tmp_state / "registry.d"
-    registry_d.mkdir(parents=True, exist_ok=True)
     (registry_d / "copilot.toml").write_text(
         'id = "copilot"\n'
         'name = "GitHub Copilot CLI (shrunk)"\n'
@@ -364,6 +393,8 @@ def test_uninstall_after_config_dirs_reorder(tmp_state: Path, tmp_home: Path) ->
     mappings to be classified CORRUPT (target-mismatch) and blocked
     uninstall.
     """
+    # Start with the legacy two-dir copilot shape so init captures both.
+    _install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     s.init()
     # Pre-condition: copilot's cache has 2 entries.
@@ -374,7 +405,6 @@ def test_uninstall_after_config_dirs_reorder(tmp_state: Path, tmp_home: Path) ->
     # uninstall. The subdirs and live paths stay the same, only the order
     # within `config_dirs` swaps.
     registry_d = tmp_state / "registry.d"
-    registry_d.mkdir(parents=True, exist_ok=True)
     (registry_d / "copilot.toml").write_text(
         'id = "copilot"\n'
         'name = "GitHub Copilot CLI (reordered)"\n'

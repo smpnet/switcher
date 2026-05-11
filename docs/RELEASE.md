@@ -2,6 +2,41 @@
 
 Operational doc for cutting a release. Recipe-first; rationale below.
 
+## Release notes
+
+### v0.1.4 — 2026-MM-DD
+
+**Added**
+
+- `switcher init --only <ids>` / `--skip <ids>` / `--interactive` — declare which tools switcher should manage at init time.
+- `switcher unmanage <tool>` — restore a single tool's live path(s) and remove it from the active map.
+- `switcher tools` now shows `INSTALLED` and `MANAGED` columns alongside ID / Name / Paths. Pathological "managed but live path missing" rows render as `⚠` with a footer pointer to `unmanage` or restore.
+- `switcher rescan` (no flags) is now per-tool interactive on a TTY; new `--all` flag forces non-interactive capture-all (suppresses the non-TTY warning).
+
+**Changed**
+
+- `switcher use <profile>` now defaults to switching only currently-managed tools (`profile.tools ∩ active.keys()`). Makes `unmanage` durable across profile switches.
+- `switcher save` now snapshots only managed tools. Tools installed AFTER `init` are no longer implicitly added to new snapshots — run `switcher rescan --only <tool>` first.
+- The bundled `copilot` builtin now targets the standalone `copilot` binary (single `~/.copilot` config dir, no credentials block). Existing profile data carrying the legacy `copilot-auth` subdir keeps working — the subdir is dead data, not visited. To migrate a legacy profile fully to the new shape, run `switcher unmanage copilot` then `switcher rescan --only copilot`.
+- `switcher status` on an empty active map prints `"No tools currently managed. Run 'switcher rescan' to discover installed tools."` instead of the bare `"no active profiles"`.
+
+**Fixed**
+
+- Legacy state migration (v0.1.0–v0.1.2 → v0.1.3+) now uses filesystem inspection over the current registry, with a per-tool historical-subdir map and a hardcoded legacy-parent scan. Fixes the orphan-symlink data-loss path from v0.1.3 PR #4 review.
+- `rescan --dry-run` output grammar: "would capture X" (was: "would captured X").
+
+**Internal**
+
+- `UninstallMappingState` enum renamed from `_UninstallMappingState`. CLI switches from `.value` string compares to enum compares.
+- `.coderabbit.yaml` `path_instructions` added for `tests/unit/**` and `tests/integration/**`.
+- New sentinel test (`tests/unit/test_migration_metadata_sentinel.py`) fails CI if a builtin TOML adds a `profile_subdir` or live-path basename not represented in `_HISTORICAL_PROFILE_SUBDIRS` / `_HISTORICAL_LIVE_PATH_BASENAMES`. Future builtin path rewrites must update both.
+
+**Schema**
+
+- **No state-file schema change.** v0.1.4 reads and writes the v0.1.3 shape unchanged.
+
+---
+
 ## How to cut a release
 
 Sync local `main` first, then tag and push:
