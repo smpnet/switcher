@@ -17,7 +17,7 @@ from switcher.errors import SwitcherError
 from switcher.models import Tool
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
-from switcher.service import ProfileService
+from switcher.service import ProfileService, UninstallMappingState
 from switcher.store import FileProfileStore, ProfileStore
 
 app = typer.Typer(
@@ -236,9 +236,9 @@ def uninstall(
     )
     prefix = "would " if dry_run else ""
     for m in report.mappings:
-        if m.state.value == "already_restored":
+        if m.state == UninstallMappingState.ALREADY_RESTORED:
             err_console.print(f"already restored {m.live_path}")
-        elif m.state.value == "missing_live_temp_present":
+        elif m.state == UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
             verb = "would recover" if dry_run else "recovered"
             err_console.print(f"{verb} {m.live_path} from interrupted uninstall")
         else:

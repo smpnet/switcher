@@ -39,7 +39,7 @@ from switcher.registry import find_tool
 from switcher.store import ProfileStore
 
 
-class _UninstallMappingState(Enum):
+class UninstallMappingState(Enum):
     SYMLINK = "symlink"
     ALREADY_RESTORED = "already_restored"
     MISSING_LIVE_TEMP_PRESENT = "missing_live_temp_present"
@@ -52,7 +52,7 @@ class _UninstallMapping:
     profile_subdir: str
     live_path: Path
     profile_dir_subdir: Path  # <state_dir>/profiles/<active>/<config_subdir>
-    state: _UninstallMappingState
+    state: UninstallMappingState
     corruption_reason: str = ""  # populated when state == CORRUPT
 
 
@@ -253,7 +253,7 @@ class ProfileService:
                                     profile_subdir="<unresolvable>",
                                     live_path=live,
                                     profile_dir_subdir=profile_dir,
-                                    state=_UninstallMappingState.CORRUPT,
+                                    state=UninstallMappingState.CORRUPT,
                                     corruption_reason=(
                                         f"cached live path {live} resolves outside "
                                         f"the profile dir or cannot be resolved: {e}"
@@ -282,7 +282,7 @@ class ProfileService:
                                     profile_subdir="<unknown>",
                                     live_path=live,
                                     profile_dir_subdir=profile_dir,
-                                    state=_UninstallMappingState.CORRUPT,
+                                    state=UninstallMappingState.CORRUPT,
                                     corruption_reason=(
                                         f"cached live path {live} is not a link "
                                         f"and no matching registry config_dir was "
@@ -310,7 +310,7 @@ class ProfileService:
                         profile_subdir="<unknown>",
                         live_path=Path("<unknown>"),
                         profile_dir_subdir=profile_dir,
-                        state=_UninstallMappingState.CORRUPT,
+                        state=UninstallMappingState.CORRUPT,
                         corruption_reason="orphan tool: no registry entry and no cached live_paths",
                     )
                 )
@@ -333,25 +333,25 @@ class ProfileService:
 
     def _classify_one_mapping(
         self, live: Path, profile_target: Path
-    ) -> tuple[_UninstallMappingState, str]:
+    ) -> tuple[UninstallMappingState, str]:
         """Classify a single DirMapping. See spec §3.2."""
         # SYMLINK? Verify link target matches expected profile subdir.
         if self._resolver.is_link(live):
             if not profile_target.exists():
                 return (
-                    _UninstallMappingState.CORRUPT,
+                    UninstallMappingState.CORRUPT,
                     f"link target profile dir {profile_target} missing",
                 )
             try:
                 actual = live.resolve()
             except OSError as e:
                 return (
-                    _UninstallMappingState.CORRUPT,
+                    UninstallMappingState.CORRUPT,
                     f"could not resolve link {live}: {e}",
                 )
             if actual != profile_target.resolve():
                 return (
-                    _UninstallMappingState.CORRUPT,
+                    UninstallMappingState.CORRUPT,
                     f"live link {live} points to {actual}, expected {profile_target}",
                 )
             # Pre-flight collision check: a sibling temp dir at this point
@@ -361,11 +361,11 @@ class ProfileService:
             temp = _temp_dir_for_uninstall(live)
             if temp.exists():
                 return (
-                    _UninstallMappingState.CORRUPT,
+                    UninstallMappingState.CORRUPT,
                     f"sibling temp dir {temp} exists alongside live link "
                     f"{live}; refusing to overwrite. Inspect/remove {temp} manually.",
                 )
-            return (_UninstallMappingState.SYMLINK, "")
+            return (UninstallMappingState.SYMLINK, "")
 
         # MISSING_LIVE_TEMP_PRESENT?
         if not live.exists():
@@ -377,24 +377,24 @@ class ProfileService:
             # guard: real directory only.
             temp_is_link = temp.is_symlink() or (IS_WINDOWS and os.path.isjunction(temp))
             if temp.is_dir() and not temp_is_link and self._dirs_match(temp, profile_target):
-                return (_UninstallMappingState.MISSING_LIVE_TEMP_PRESENT, "")
+                return (UninstallMappingState.MISSING_LIVE_TEMP_PRESENT, "")
             return (
-                _UninstallMappingState.CORRUPT,
+                UninstallMappingState.CORRUPT,
                 f"live path missing and no recoverable temp dir at {temp}",
             )
 
         # ALREADY_RESTORED?
         if live.is_dir():
             if self._dirs_match(live, profile_target):
-                return (_UninstallMappingState.ALREADY_RESTORED, "")
+                return (UninstallMappingState.ALREADY_RESTORED, "")
             return (
-                _UninstallMappingState.CORRUPT,
+                UninstallMappingState.CORRUPT,
                 f"real dir at {live} does not match profile contents at {profile_target}",
             )
 
         # Regular file or other — CORRUPT.
         return (
-            _UninstallMappingState.CORRUPT,
+            UninstallMappingState.CORRUPT,
             f"unexpected non-link non-dir entry at {live}",
         )
 
@@ -797,7 +797,7 @@ class ProfileService:
         # via --force per §3.4) for tools that aren't in skipped_tools.
         skipped_ids = {t for t, _ in skipped_tools}
         for m in mappings:
-            if m.state == _UninstallMappingState.CORRUPT and m.tool_id not in skipped_ids:
+            if m.state == UninstallMappingState.CORRUPT and m.tool_id not in skipped_ids:
                 raise UninstallPreflightError(
                     f"tool {m.tool_id!r} mapping {m.profile_subdir!r}: {m.corruption_reason}"
                 )
@@ -1248,7 +1248,7 @@ class ProfileService:
         sibling temp path collides with unrelated content; if we still see
         a temp here it's a race condition, so fail loud (do NOT rmtree).
         """
-        if m.state == _UninstallMappingState.SYMLINK:
+        if m.state == UninstallMappingState.SYMLINK:
             temp = _temp_dir_for_uninstall(m.live_path)
             if temp.exists():
                 raise UninstallPreflightError(
@@ -1278,7 +1278,7 @@ class ProfileService:
                 raise
             restore_real_dir(temp, m.live_path)
             return
-        if m.state == _UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
+        if m.state == UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
             temp = _temp_dir_for_uninstall(m.live_path)
             # Re-check live_path before rename: classification was made from an
             # earlier read; if the live path reappeared (concurrent process,
@@ -1300,7 +1300,7 @@ class ProfileService:
                 )
             temp.rename(m.live_path)
             return
-        if m.state == _UninstallMappingState.ALREADY_RESTORED:
+        if m.state == UninstallMappingState.ALREADY_RESTORED:
             # No-op; already done.
             return
         # CORRUPT shouldn't reach here — pre-flight rejected it.

@@ -16,7 +16,7 @@ from switcher.links import _create_junction
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService, _temp_dir_for_uninstall
-from switcher.service import _UninstallMappingState as State
+from switcher.service import UninstallMappingState as State
 from switcher.store import FileProfileStore
 
 
