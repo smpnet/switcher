@@ -742,17 +742,30 @@ class ProfileService:
     def save(self, name: str) -> None:
         """Snapshot live config into a new profile.
 
-        Only currently-installed tools are snapshotted. A tool that's in the
-        active map but no longer installed live is intentionally skipped:
-        save's contract is "snapshot live state", and a uninstalled-but-
-        persisted-in-store flow doesn't fit that contract cleanly. If the
-        user wants that data preserved, the active profile already holds it
-        and `use(other_profile)` won't disturb it.
+        Only currently-managed AND currently-installed tools are snapshotted.
+
+        v0.1.4 §3.2: filtered by active.keys(). Two affected scenarios:
+          1. Pre-v0.1.4 env_override workaround users stop seeing
+             intentionally-excluded tools captured under unrelated
+             profile names.
+          2. A tool installed live AFTER init (so it's not in active)
+             is no longer implicitly added to new snapshots. Run
+             `switcher rescan --only <tool>` first to bring it under
+             management.
+
+        Tool-in-active-but-no-longer-installed-live is still intentionally
+        skipped: save's contract is "snapshot live state", and that data is
+        already preserved under the active profile — `use(other_profile)`
+        won't disturb it.
         """
         self._require_initialized()
+        # v0.1.4 §3.5: empty active map → fail loud rather than create
+        # an empty profile silently.
+        self._require_managed()
         if self._store.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
-        installed = self.detect_installed()
+        managed = set(self._store.get_active().keys())
+        installed = [t for t in self.detect_installed() if t.id in managed]
         # Pre-flight: every live path that detect_installed surfaced must be
         # a real directory. Two pathological shapes slip through if we use
         # plain `live.exists()` here: a regular file (exists True, is_dir
