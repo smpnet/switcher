@@ -151,3 +151,64 @@ def test_init_bare_still_succeeds_with_no_filter(tmp_home: Path, tmp_state: Path
     result = runner.invoke(app, ["init"])
     assert result.exit_code == 0, _combined(result)
     assert "Initialized profile" in result.stdout
+
+
+# --- T14: --interactive -----------------------------------------------------
+
+
+def test_init_interactive_requires_tty(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-TTY stdin must reject --interactive with a clear error."""
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: False)
+    result = runner.invoke(app, ["init", "--interactive"])
+    assert result.exit_code != 0
+    assert "tty" in _combined(result).lower()
+
+
+def test_init_interactive_mutually_exclusive_with_only(tmp_home: Path, tmp_state: Path) -> None:
+    result = runner.invoke(app, ["init", "--interactive", "--only", "claude"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in _combined(result).lower()
+
+
+def test_init_interactive_mutually_exclusive_with_skip(tmp_home: Path, tmp_state: Path) -> None:
+    result = runner.invoke(app, ["init", "--interactive", "--skip", "claude"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in _combined(result).lower()
+
+
+def test_init_interactive_default_yes_captures_all(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty input lines accept the default-Y; all tools captured."""
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
+    result = runner.invoke(app, ["init", "--interactive"], input="\n\n")
+    assert result.exit_code == 0, _combined(result)
+    from switcher.cli import get_deps
+
+    active = get_deps().store.get_active()
+    assert "claude" in active and "copilot" in active
+
+
+def test_init_interactive_all_no_raises_nothing_to_initialize(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
+    result = runner.invoke(app, ["init", "--interactive"], input="n\nn\n")
+    assert result.exit_code != 0
+    out = _combined(result).lower()
+    assert "nothing to initialize" in out or "every detected tool was skipped" in out
+
+
+def test_init_interactive_some_no_surfaces_skipped(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Y for claude, N for copilot: report shows skipped_via_interactive."""
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
+    result = runner.invoke(app, ["init", "--interactive"], input="\nn\n")
+    assert result.exit_code == 0, _combined(result)
+    out = _combined(result)
+    assert "Captured: claude" in out
+    assert "Skipped (via interactive): copilot" in out
+    assert "switcher rescan --only copilot" in out

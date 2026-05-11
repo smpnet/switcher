@@ -14,7 +14,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from switcher.errors import SwitcherError, UnknownToolError
+from switcher.errors import NothingToInitializeError, SwitcherError, UnknownToolError
 from switcher.models import Tool
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
@@ -161,6 +161,41 @@ def _resolve_init_targets(
     return [tid for tid in registered_ids if tid not in user_ids]
 
 
+def _stdin_is_tty() -> bool:
+    """Indirection for --interactive's TTY check.
+
+    Direct `sys.stdin.isatty()` calls are uncooperative under
+    click.testing.CliRunner, which swaps in its own StringIO during
+    `invoke()`. Tests monkeypatch this module-level helper instead.
+    """
+    return sys.stdin.isatty()
+
+
+def _resolve_init_targets_interactive(deps: Deps) -> tuple[list[str], list[str]]:
+    """Prompt yes/no per detected tool. Returns (accepted_ids, declined_ids).
+
+    Empty input accepts the default (Y). Any answer starting with 'n' or
+    'N' declines; anything else (including 'y', 'Y', or empty) accepts.
+
+    Per spec §2.1: --interactive is a *filtered* init mode. An empty
+    detected list means the filter resolves to zero captures — the caller
+    raises NothingToInitializeError (NOT the bare-init warn-and-empty path).
+    """
+    detected = deps.service.detect_installed()
+    if not detected:
+        return [], []
+    accepted: list[str] = []
+    declined: list[str] = []
+    console.print("Detected installed tools:")
+    for tool in detected:
+        answer = input(f"  Manage {tool.id}? [Y/n] ").strip().lower()
+        if answer.startswith("n"):
+            declined.append(tool.id)
+            continue
+        accepted.append(tool.id)
+    return accepted, declined
+
+
 def _print_init_report(report: InitReport) -> None:
     """Render an InitReport to the console with captured / skipped /
     requested-but-not-installed sections and re-add hints."""
@@ -189,15 +224,22 @@ def init(
     only: str | None = typer.Option(
         None,
         "--only",
-        help="Comma-separated tool IDs to manage. Mutually exclusive with --skip.",
+        help="Comma-separated tool IDs to manage. Mutually exclusive with --skip/--interactive.",
     ),
     skip: str | None = typer.Option(
         None,
         "--skip",
-        help="Comma-separated tool IDs to exclude. Mutually exclusive with --only.",
+        help="Comma-separated tool IDs to exclude. Mutually exclusive with --only/--interactive.",
+    ),
+    interactive: bool = typer.Option(
+        False,
+        "--interactive",
+        help="Prompt per-detected-tool. Mutually exclusive with --only/--skip.",
     ),
 ) -> None:
     """Initialize switcher; optionally restrict to a subset of detected tools."""
+    if interactive and (only is not None or skip is not None):
+        raise typer.BadParameter("--interactive is mutually exclusive with --only/--skip")
     if only is not None and skip is not None:
         raise typer.BadParameter("--only and --skip are mutually exclusive")
 
@@ -207,7 +249,17 @@ def init(
     skipped_via_interactive: list[str] = []
     target_ids: list[str] | None
 
-    if only is not None:
+    if interactive:
+        if not _stdin_is_tty():
+            raise typer.BadParameter(
+                "--interactive requires a tty; use --only or --skip in non-interactive contexts"
+            )
+        accepted, declined = _resolve_init_targets_interactive(deps)
+        if not accepted:
+            raise NothingToInitializeError("every detected tool was skipped; nothing to initialize")
+        target_ids = accepted
+        skipped_via_interactive = declined
+    elif only is not None:
         ids = [t.strip() for t in only.split(",") if t.strip()]
         if not ids:
             raise typer.BadParameter("--only must contain at least one tool id")
