@@ -286,9 +286,9 @@ def rescan(
     if not report.captured:
         err_console.print("no new tools detected")
         return
-    prefix = "would " if dry_run else ""
+    verb = "would capture" if dry_run else "captured"
     for tool_id, target in report.captured:
-        err_console.print(f"{prefix}captured {tool_id} into {target}")
+        err_console.print(f"{verb} {tool_id} into {target}")
 
 
 @app.command()

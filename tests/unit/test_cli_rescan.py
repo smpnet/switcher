@@ -66,7 +66,10 @@ def test_rescan_dry_run_makes_no_changes(tmp_state: Path, tmp_home: Path) -> Non
     (tmp_home / COPILOT_SECOND_DIR).mkdir()
     result = runner.invoke(app, ["rescan", "--dry-run"])
     assert result.exit_code == 0, result.stderr
-    assert "would" in result.stderr
+    # Dry-run uses present-tense "would capture" (not the past-tense
+    # "would captured" produced by the prior prefix-then-verb shape).
+    assert "would capture" in result.stderr
+    assert "would captured" not in result.stderr
     # Live dirs untouched (dry run): not a symlink/junction.
     assert not _is_link(tmp_home / COPILOT_SECOND_DIR)
     assert not _is_link(tmp_home / COPILOT_FIRST_DIR)
