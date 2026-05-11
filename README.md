@@ -202,7 +202,7 @@ tools into a fresh profile (see "Recovery commands" above).
 > Pass `switcher rescan --into <profile>` to consolidate into an
 > existing profile.
 >
-> #### If everything else fails: destructive recovery
+> ### If everything else fails: destructive recovery
 >
 > The v0.1.0 wipe procedure is retained for cases where `uninstall`
 > can't run — e.g. live config paths manually broken, state-dir
