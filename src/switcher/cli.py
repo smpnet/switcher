@@ -271,6 +271,14 @@ def init(
         if not ids:
             raise typer.BadParameter("--skip must contain at least one tool id")
         target_ids = _resolve_init_targets(deps.registry, ids, mode="skip")
+        if not target_ids:
+            # --skip excluded every registered tool. The generic
+            # "no requested tools are installed" message at the service
+            # layer is wrong for this path — surface the actual cause
+            # before reaching service.init(). (abby review)
+            raise NothingToInitializeError(
+                "--skip excluded every registered tool; nothing left to initialize"
+            )
         skipped_via_skip_flag = ids
     else:
         target_ids = None
@@ -420,7 +428,14 @@ def unmanage(
     if dry_run:
         console.print(f"Would unmanage {report.tool_id!r}:")
         for m in report.mappings:
-            verb = "would restore" if m.state == UninstallMappingState.SYMLINK else "no-op"
+            if m.state == UninstallMappingState.SYMLINK:
+                verb = "would restore"
+            elif m.state == UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
+                # A real run renames the sibling temp dir back into the
+                # live position — that's a recovery, NOT a no-op. (abby review)
+                verb = "would recover from interrupted uninstall"
+            else:  # ALREADY_RESTORED (CORRUPT refused by pre-flight)
+                verb = "no-op (already restored)"
             console.print(f"  {m.live_path}  ({m.state.name} -> {verb})")
         console.print("(dry-run; no changes made)")
     elif report.skipped_orphan:

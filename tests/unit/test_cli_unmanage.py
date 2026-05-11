@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from switcher.cli import app
+from switcher.paths import IS_WINDOWS
+from switcher.service import _temp_dir_for_uninstall
 
 runner = CliRunner()
 
@@ -19,8 +22,12 @@ def _combined(result: object) -> str:
     return stdout + stderr
 
 
-def _home() -> Path:
-    return Path(os.environ.get("HOME", os.environ.get("USERPROFILE", "")))
+def _drop_link(p: Path) -> None:
+    if IS_WINDOWS and os.path.isjunction(p):
+        p.rmdir()
+        return
+    if p.is_symlink():
+        p.unlink()
 
 
 def test_unmanage_happy_path(tmp_home: Path, tmp_state: Path) -> None:
@@ -34,7 +41,7 @@ def test_unmanage_happy_path(tmp_home: Path, tmp_state: Path) -> None:
 
     assert "claude" not in get_deps().store.get_active()
     # Live path is a real dir, not a symlink.
-    claude_path = _home() / ".claude"
+    claude_path = tmp_home / ".claude"
     assert claude_path.is_dir()
     assert not claude_path.is_symlink()
 
@@ -66,7 +73,36 @@ def test_unmanage_dry_run_no_changes(tmp_home: Path, tmp_state: Path) -> None:
     # Still managed.
     assert "claude" in get_deps().store.get_active()
     # Symlink still in place.
-    assert (_home() / ".claude").is_symlink()
+    assert (tmp_home / ".claude").is_symlink()
+
+
+def test_unmanage_dry_run_labels_missing_live_temp_present_as_recover(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """abby review: dry-run must not call MISSING_LIVE_TEMP_PRESENT a 'no-op'
+    — a real run renames the sibling temp back into place. The preview has to
+    surface that recovery action so operators can trust the dry-run."""
+    setup = runner.invoke(app, ["init"])
+    assert setup.exit_code == 0, _combined(setup)
+
+    # Simulate a crash between unlink and rename for claude: drop the symlink
+    # at the live path, leave a populated sibling temp dir.
+    from switcher.cli import get_deps
+
+    deps = get_deps()
+    service = deps.service
+    mapping = next(m for m in service._classify_uninstall_mappings() if m.tool_id == "claude")
+    temp = _temp_dir_for_uninstall(mapping.live_path)
+    _drop_link(mapping.live_path)
+    shutil.copytree(mapping.profile_dir_subdir, temp)
+
+    result = runner.invoke(app, ["unmanage", "claude", "--dry-run"])
+    assert result.exit_code == 0, _combined(result)
+    out = result.stdout
+    assert "MISSING_LIVE_TEMP_PRESENT" in out
+    assert "would recover" in out.lower()
+    # "no-op" must NOT appear for this mapping — that's the unsafe wording.
+    assert "no-op" not in out.lower()
 
 
 def test_unmanage_unknown_tool_raises(tmp_home: Path, tmp_state: Path) -> None:
@@ -95,8 +131,8 @@ def test_unmanage_then_use_does_not_remanage(tmp_home: Path, tmp_state: Path) ->
 
     assert "claude" not in get_deps().store.get_active()
     # Live dir still a real directory — no resurrection.
-    assert (_home() / ".claude").is_dir()
-    assert not (_home() / ".claude").is_symlink()
+    assert (tmp_home / ".claude").is_dir()
+    assert not (tmp_home / ".claude").is_symlink()
 
 
 def test_unmanage_when_uninitialized_errors(tmp_home: Path, tmp_state: Path) -> None:

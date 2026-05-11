@@ -201,6 +201,17 @@ def test_init_interactive_all_no_raises_nothing_to_initialize(
     assert "nothing to initialize" in out or "every detected tool was skipped" in out
 
 
+def test_init_skip_excludes_every_registered_tool_errors(tmp_home: Path, tmp_state: Path) -> None:
+    """abby review: --skip claude,copilot leaves the target set empty; the
+    error must reflect 'skipped everything', not 'requested not installed'."""
+    result = runner.invoke(app, ["init", "--skip", "claude,copilot"])
+    assert result.exit_code != 0
+    out = _combined(result).lower()
+    assert "every registered tool" in out or "excluded every" in out
+    # And the misleading --only-shaped message must NOT appear.
+    assert "requested tools are installed" not in out
+
+
 def test_init_interactive_some_no_surfaces_skipped(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
