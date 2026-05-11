@@ -117,8 +117,22 @@ def test_rescan_default_creates_fresh_profile_per_new_tool(
 def test_rescan_no_new_tools(tmp_state: Path, tmp_home: Path) -> None:
     s = _service(tmp_state, tmp_home)
     s.init()
+    active_before = s._store.get_active()
+    cache_before = s._store.get_active_live_paths()
+    profiles_before = {p.name for p in (tmp_state / "profiles").iterdir() if p.is_dir()}
+
     report = s.rescan()
+
+    # No-op semantics: no new captures AND no on-disk side effects.
     assert report.captured == []
+    assert s._store.get_active() == active_before
+    assert s._store.get_active_live_paths() == cache_before
+    profiles_after = {p.name for p in (tmp_state / "profiles").iterdir() if p.is_dir()}
+    assert profiles_after == profiles_before
+    # CodeRabbit round 6: a regression that quietly mints an empty
+    # *-rescan-* profile would still satisfy `captured == []`, so check
+    # the rescan-named profile shape explicitly.
+    assert not any(name.endswith("-rescan-1") for name in profiles_after)
 
 
 def test_rescan_into_existing_profile(
@@ -240,8 +254,12 @@ def test_rescan_rolls_back_on_partial_capture_failure(
         tmp_home / COPILOT_SECOND_DIR / "settings.json"
     ).read_text() == "{copilot-config-marker}"
     assert (tmp_home / COPILOT_FIRST_DIR / "apps.json").read_text() == "{copilot-auth-marker}"
-    # Active map unchanged.
+    # Active map AND live-paths cache unchanged. CodeRabbit round 6:
+    # `active_live_paths` is the cache later recovery paths consume, so
+    # a leftover cache entry after a failed rescan would silently
+    # corrupt subsequent uninstall/status calls.
     assert "copilot" not in s._store.get_active()
+    assert "copilot" not in s._store.get_active_live_paths()
     # Default-mode profile dir cleaned up.
     today = frozen.strftime("%Y-%m-%d")
     assert not (tmp_state / "profiles" / f"{today}-rescan-1").exists()
@@ -391,8 +409,11 @@ def test_rescan_state_write_failure_rolls_back_capture(
     # Original content preserved at live paths.
     assert (tmp_home / COPILOT_SECOND_DIR / "settings.json").read_text() == "user-config"
     assert (tmp_home / COPILOT_FIRST_DIR / "apps.json").read_text() == "user-auth"
-    # Active map and the partial profile dir are unchanged on disk.
+    # Active map and live-paths cache unchanged after rollback — both
+    # halves of the persisted state must roll back together (CodeRabbit
+    # round 6).
     assert "copilot" not in s._store.get_active()
+    assert "copilot" not in s._store.get_active_live_paths()
     today = frozen.strftime("%Y-%m-%d")
     assert not (tmp_state / "profiles" / f"{today}-rescan-1").exists()
 
@@ -438,8 +459,9 @@ def test_rescan_into_state_write_failure_reverts_metadata(
     # Live dirs restored — not left as symlinks into the target profile.
     assert (tmp_home / COPILOT_SECOND_DIR).is_dir()
     assert not _is_link(tmp_home / COPILOT_SECOND_DIR)
-    # Active map unchanged.
+    # Active map AND cache unchanged after rollback (CodeRabbit round 6).
     assert "copilot" not in s._store.get_active()
+    assert "copilot" not in s._store.get_active_live_paths()
 
 
 def test_rescan_into_metadata_rollback_failure_is_surfaced(
@@ -549,8 +571,9 @@ def test_rescan_default_rollback_fails_closed_when_restore_fails(
     auth_sentinel = profile_dir / "copilot-auth" / "apps.json"
     assert config_sentinel.exists() and config_sentinel.read_text() == "user-config"
     assert auth_sentinel.exists() and auth_sentinel.read_text() == "user-auth"
-    # Active map unchanged.
+    # Active map AND cache unchanged (CodeRabbit round 6).
     assert "copilot" not in s._store.get_active()
+    assert "copilot" not in s._store.get_active_live_paths()
 
 
 def test_rescan_into_rollback_fails_closed_when_restore_fails(

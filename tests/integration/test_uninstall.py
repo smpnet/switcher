@@ -90,6 +90,51 @@ def test_uninstall_purge_refuses_non_tty_without_yes(
     assert (tmp_state / "config.json").exists()
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="POSIX symlink semantics; Windows config-dir symlinks need elevation"
+)
+def test_uninstall_preserves_symlinks_inside_managed_config_dir(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """Hermes review: `shutil.copytree(..., symlinks=False)` dereferences
+    symlinks inside the managed config dir, so uninstall silently changes
+    the user's tree shape and an interrupted uninstall becomes
+    non-resumable (`_dirs_match()` sees more entries in temp than in
+    profile because `os.walk` does not recurse into linked dirs). With
+    `symlinks=True`, the symlink structure round-trips through capture
+    and uninstall.
+    """
+    # Stage a symlink target dir + a content file under ~/.claude BEFORE
+    # init, so the symlink is captured into the profile in its original
+    # form.
+    target_outside = tmp_home / ".claude-external-data"
+    target_outside.mkdir()
+    (target_outside / "sentinel.txt").write_text("external")
+    (tmp_home / ".claude" / "linked-subdir").symlink_to(target_outside, target_is_directory=True)
+    (tmp_home / ".claude" / "linked-file.txt").symlink_to(target_outside / "sentinel.txt")
+
+    s = _service(tmp_state, tmp_home)
+    s.init()
+
+    # Pre-condition: the symlinks survived capture into the profile.
+    profile_name = next(iter(s._store.get_active().values()))
+    profile_claude = tmp_state / "profiles" / profile_name / "claude"
+    assert (profile_claude / "linked-subdir").is_symlink()
+    assert (profile_claude / "linked-file.txt").is_symlink()
+
+    s.uninstall()
+
+    # Live ~/.claude is a real directory again — but the nested symlinks
+    # are preserved (NOT dereferenced into real copies).
+    claude_live = tmp_home / ".claude"
+    assert claude_live.is_dir() and not _is_link(claude_live)
+    assert (claude_live / "linked-subdir").is_symlink()
+    assert (claude_live / "linked-file.txt").is_symlink()
+    # The symlinks resolve to the same external target they originally pointed at.
+    assert (claude_live / "linked-subdir").resolve() == target_outside.resolve()
+    assert (claude_live / "linked-file.txt").read_text() == "external"
+
+
 def test_uninstall_resume_skips_already_restored_mapping(tmp_state: Path, tmp_home: Path) -> None:
     """A previously-aborted run left ~/.claude already restored; rerun completes."""
     s = _service(tmp_state, tmp_home)

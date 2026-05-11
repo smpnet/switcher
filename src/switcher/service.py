@@ -1260,8 +1260,19 @@ class ProfileService:
             # wedging recovery until manual cleanup. ignore_errors is fine
             # because the temp is wholly within our control (sibling of live)
             # and the original error is what we want to surface.
+            #
+            # symlinks=True preserves the user's original tree shape: any
+            # symlink inside the managed config dir (file or directory) was
+            # captured into the profile by `move_or_seed_dir` as-is, and
+            # uninstall must restore it as-is. With symlinks=False, copytree
+            # would dereference linked subdirs and silently change the live
+            # tree shape; the resume classifier's `_dirs_match()` would then
+            # see more entries in temp than in profile (because os.walk does
+            # not recurse into linked dirs) and mark the mapping CORRUPT
+            # instead of MISSING_LIVE_TEMP_PRESENT, breaking interrupted-
+            # uninstall resume. Hermes review.
             try:
-                shutil.copytree(m.profile_dir_subdir, temp, symlinks=False, dirs_exist_ok=False)
+                shutil.copytree(m.profile_dir_subdir, temp, symlinks=True, dirs_exist_ok=False)
             except Exception:
                 shutil.rmtree(temp, ignore_errors=True)
                 raise
