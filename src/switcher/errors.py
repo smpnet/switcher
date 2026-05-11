@@ -73,3 +73,22 @@ class RescanCaptureError(SwitcherError):
 
 class PruneError(SwitcherError):
     """`prune` orphan walk failed for a non-classification reason (e.g. permissions)."""
+
+
+class NothingToInitializeError(SwitcherError):
+    """Raised when init is given explicit filters (--only/--skip/--interactive)
+    but the resolved target set is empty. Bare init with zero detected tools
+    preserves v0.1.3 behavior (warn + empty profiles) and does NOT raise this."""
+
+
+class ToolNotManagedError(SwitcherError):
+    """Raised when a command operates on a tool id that's not in the active
+    map. Surfaces by unmanage (no entry to remove), by use --only (tool not
+    currently managed), and by tools-table pathological-row detection."""
+
+
+class NoToolsManagedError(SwitcherError):
+    """Raised when save / create / use is called with an empty active map.
+    The state is valid (after `unmanage` of the last tool, or after
+    `uninstall` without purge), but these mutating commands have no work
+    to do; better to fail loud than create empty profiles silently."""

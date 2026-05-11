@@ -19,6 +19,7 @@ from pathlib import Path
 
 from switcher.errors import (
     AlreadyLinkedError,
+    NoToolsManagedError,
     PathNotADirectoryError,
     ProfileExistsError,
     ProfileIsActiveError,
@@ -96,6 +97,18 @@ class ProfileService:
     def _require_initialized(self) -> None:
         if not self._store.list():
             raise StateNotInitializedError("switcher has not been initialized; run 'switcher init'")
+
+    def _require_managed(self) -> None:
+        """Guard for commands that need at least one tool under management.
+
+        Distinct from _require_initialized: a freshly-uninstalled-no-purge
+        state has profiles on disk (passes _require_initialized) but no
+        active map (fails _require_managed).
+        """
+        if not self._store.get_active():
+            raise NoToolsManagedError(
+                "no tools currently managed; run 'switcher rescan' to discover installed tools"
+            )
 
     def _seed_credentials(self, src_profile: str, dst_profile: str, tool: Tool) -> None:
         """Copy a tool's credential files from src_profile into dst_profile.
