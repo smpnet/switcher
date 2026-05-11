@@ -1694,7 +1694,7 @@ class UninstallReport:
     purged: bool = False
 
 
-@dataclass
+@dataclass(frozen=True)
 class UnmanageReport:
     """Return shape of ProfileService.unmanage() — v0.1.4.
 
