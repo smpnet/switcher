@@ -73,6 +73,9 @@ def test_expected_subdirs_for_unknown_tool_falls_back_to_empty(
     assert expected == frozenset()
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="POSIX-specific legacy parent (~/.config); Windows uses %LOCALAPPDATA%"
+)
 def test_candidate_parents_for_copilot_includes_legacy_config(
     tmp_state: Path, tmp_home: Path
 ) -> None:
@@ -86,6 +89,9 @@ def test_candidate_parents_for_copilot_includes_legacy_config(
     assert (tmp_home / ".config").resolve() in resolved
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="POSIX-specific legacy parent (~/.config); Windows uses %LOCALAPPDATA%"
+)
 def test_candidate_parents_for_unknown_tool_uses_legacy_only(
     tmp_state: Path, tmp_home: Path
 ) -> None:
@@ -226,9 +232,11 @@ def test_discover_rejects_non_canonical_basenames(tmp_state: Path, tmp_home: Pat
     profile_dir = service._store.profile_dir(profile_name)
     (profile_dir / "copilot-config").mkdir(parents=True)
 
-    # User-created backup symlink at a name switcher does NOT own.
+    # User-created backup symlink at a name switcher does NOT own. Use the
+    # platform-aware helper so Windows CI (without Developer Mode) still
+    # exercises this path via a directory junction.
     backup = tmp_home / "copilot-backup"
-    backup.symlink_to(profile_dir / "copilot-config")
+    _replace_with_symlink(backup, profile_dir / "copilot-config")
 
     discovered = service._discover_live_paths_for_active("copilot", profile_name)
     assert str(backup) not in discovered
