@@ -384,7 +384,8 @@ class ProfileService:
                     continue
                 if resolved in owned_targets:
                     discovered.append(child)
-        return [str(p) for p in discovered]
+        # Deterministic order: cached + warnings should be platform-stable.
+        return sorted(str(p) for p in discovered)
 
     @staticmethod
     def _warn_migration(tool_id: str, reason: str) -> None:

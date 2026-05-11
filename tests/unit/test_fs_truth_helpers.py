@@ -76,8 +76,9 @@ def test_candidate_parents_for_unknown_tool_uses_legacy_only(
 ) -> None:
     service = _make_service(tmp_state, tmp_home)
     parents = service._candidate_parents_for("nonexistent")
-    # No registry entry → only legacy parents.
-    assert len(parents) > 0
+    # No registry entry → only legacy parents (e.g., ~/.config on POSIX).
+    resolved = {p.resolve() for p in parents}
+    assert (tmp_home / ".config").resolve() in resolved
 
 
 def test_discover_empty_profile_dir_returns_empty(tmp_state: Path, tmp_home: Path) -> None:
@@ -101,25 +102,40 @@ def test_discover_finds_symlink_into_owned_subdir(tmp_state: Path, tmp_home: Pat
     assert str(link) in discovered
 
 
-def test_discover_per_tool_isolation_in_multi_tool_profile(tmp_state: Path, tmp_home: Path) -> None:
-    """Copilot's discovery must NOT pick up Claude's symlink and vice versa,
-    even when both tools' subdirs live in the same profile dir."""
-    service = _make_service(tmp_state, tmp_home)
-    profile_name = "multi"
-    profile_dir = service._store.profile_dir(profile_name)
+def _seed_multi_tool_profile(service: ProfileService, tmp_home: Path) -> tuple[Path, Path]:
+    """Pre-stage a profile dir with copilot+claude subdirs and live symlinks
+    at canonical basenames. Returns (copilot_link, claude_link).
+    """
+    profile_dir = service._store.profile_dir("multi")
     (profile_dir / "copilot-config").mkdir(parents=True)
     (profile_dir / "claude").mkdir(parents=True)
-    # Canonical live-path basenames. Conftest pre-seeds both as real dirs;
-    # replace with symlinks into the profile.
     copilot_link = tmp_home / ".copilot"
     claude_link = tmp_home / ".claude"
     _replace_with_symlink(copilot_link, profile_dir / "copilot-config")
     _replace_with_symlink(claude_link, profile_dir / "claude")
+    return copilot_link, claude_link
 
-    copilot_paths = service._discover_live_paths_for_active("copilot", profile_name)
-    claude_paths = service._discover_live_paths_for_active("claude", profile_name)
+
+def test_discover_copilot_ignores_claude_symlinks_in_shared_profile(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """Copilot's discovery must NOT pick up Claude's symlink even when both
+    tools' subdirs live in the same profile dir."""
+    service = _make_service(tmp_state, tmp_home)
+    copilot_link, claude_link = _seed_multi_tool_profile(service, tmp_home)
+    copilot_paths = service._discover_live_paths_for_active("copilot", "multi")
     assert str(copilot_link) in copilot_paths
     assert str(claude_link) not in copilot_paths
+
+
+def test_discover_claude_ignores_copilot_symlinks_in_shared_profile(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """Claude's discovery must NOT pick up Copilot's symlink even when both
+    tools' subdirs live in the same profile dir."""
+    service = _make_service(tmp_state, tmp_home)
+    copilot_link, claude_link = _seed_multi_tool_profile(service, tmp_home)
+    claude_paths = service._discover_live_paths_for_active("claude", "multi")
     assert str(claude_link) in claude_paths
     assert str(copilot_link) not in claude_paths
 
@@ -148,16 +164,20 @@ def test_discover_legacy_copilot_auth_path_after_rewrite(tmp_state: Path, tmp_ho
 
 
 def test_discover_skips_broken_symlinks(tmp_state: Path, tmp_home: Path) -> None:
+    """A symlink at a canonical basename whose target is missing must not
+    raise — the discovery walker has to absorb the missing-target case and
+    skip the entry. Using a canonical basename (`.copilot`) so the basename
+    filter doesn't short-circuit before the resolve attempt."""
     service = _make_service(tmp_state, tmp_home)
     profile_name = "broken"
     profile_dir = service._store.profile_dir(profile_name)
     (profile_dir / "copilot-config").mkdir(parents=True)
-    # A symlink pointing to a non-existent target — must not raise.
-    broken = tmp_home / ".broken-link"
-    broken.symlink_to(tmp_home / "does-not-exist")
-    # The symlink resolves to something not under profile_dir, so it
-    # gets filtered out — no exception.
+    # Replace conftest-seeded ~/.copilot real dir with a broken symlink.
+    broken = tmp_home / ".copilot"
+    _replace_with_symlink(broken, tmp_home / "does-not-exist")
+
     discovered = service._discover_live_paths_for_active("copilot", profile_name)
+    # The target doesn't resolve into an owned subdir → filtered out, no exception.
     assert str(broken) not in discovered
 
 
