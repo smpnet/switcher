@@ -454,21 +454,71 @@ def unmanage(
 def rescan(
     only: str | None = typer.Option(None, "--only", help="Comma-separated tool ids."),
     into: str | None = typer.Option(None, "--into", help="Capture into an existing profile."),
+    all_: bool = typer.Option(
+        False,
+        "--all",
+        help="Capture all detected unmanaged tools without prompting. "
+        "Mutually exclusive with --only.",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print plan; make no changes."),
 ) -> None:
-    """Pick up tools installed after init."""
+    """Pick up tools installed after init.
+
+    With no flags, on a TTY: prompt per detected unmanaged tool (default-Y).
+    Off-TTY: print a stderr warning and capture every detected unmanaged
+    tool. Use --all to suppress the warning, or --only to be selective.
+    --dry-run never prompts regardless of TTY.
+    """
+    if all_ and only is not None:
+        raise typer.BadParameter("--all and --only are mutually exclusive")
+
+    deps = get_deps()
+
     # Mirror `use --only`: an explicitly empty `--only ""` is invalid input,
     # not "no filter". Without this the CLI silently bypasses the
     # service-layer guard at service.rescan (`--only requires at least one
     # tool id`), making `--only ""` behave like bare `rescan`.
-    if only is None:
-        only_list = None
-    else:
+    if only is not None:
         only_list = [s.strip() for s in only.split(",") if s.strip()]
         if not only_list:
             raise typer.BadParameter("--only must contain at least one tool id")
-    deps = get_deps()
-    report = deps.service.rescan(only=only_list, into=into, dry_run=dry_run)
+        report = deps.service.rescan(only=only_list, into=into, dry_run=dry_run)
+    elif all_:
+        report = deps.service.rescan(only=None, into=into, dry_run=dry_run)
+    elif dry_run:
+        # --dry-run alone: preview-all, never prompt regardless of TTY.
+        report = deps.service.rescan(only=None, into=into, dry_run=True)
+    else:
+        # Bare rescan: TTY prompt per tool; non-TTY warn-and-capture-all.
+        # Detection mirrors service.rescan's candidate set so the prompt
+        # only lists what would actually be captured.
+        unmanaged_detected = [
+            t for t in deps.service.detect_installed() if t.id not in deps.store.get_active()
+        ]
+        if not unmanaged_detected:
+            err_console.print("no new tools detected")
+            return
+        if _stdin_is_tty():
+            console.print("Detected unmanaged tools:")
+            accepted: list[str] = []
+            for tool in unmanaged_detected:
+                answer = input(f"  Capture {tool.id}? [Y/n] ").strip().lower()
+                if answer.startswith("n"):
+                    continue
+                accepted.append(tool.id)
+            if not accepted:
+                console.print("Nothing accepted; nothing captured.")
+                return
+            report = deps.service.rescan(only=accepted, into=into, dry_run=False)
+        else:
+            ids = [t.id for t in unmanaged_detected]
+            err_console.print(
+                f"warning: capturing all detected unmanaged tools without prompt: "
+                f"{', '.join(ids)}. Use --only to be selective, or --all to "
+                f"suppress this warning."
+            )
+            report = deps.service.rescan(only=None, into=into, dry_run=False)
+
     if not report.captured:
         err_console.print("no new tools detected")
         return
