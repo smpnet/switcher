@@ -27,6 +27,15 @@ from switcher.store import FileProfileStore
 
 pytestmark = pytest.mark.integration
 
+# Copilot's two config dirs differ between platforms — see
+# src/switcher/builtins/copilot.toml. Tests that suppress + recreate copilot
+# need the platform-appropriate first dir so service.detect_installed (which
+# checks the FIRST config dir only) sees the tool.
+COPILOT_FIRST_DIR = (
+    Path("AppData/Local/github-copilot") if IS_WINDOWS else Path(".config/github-copilot")
+)
+COPILOT_SECOND_DIR = Path(".copilot")
+
 
 def _service(tmp_state: Path, tmp_home: Path) -> ProfileService:
     return ProfileService(
@@ -75,10 +84,10 @@ def test_rescan_default_creates_fresh_profile_per_new_tool(tmp_state: Path, tmp_
     s.init()  # captures only claude
 
     # Now "install" copilot post-init.
-    (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".copilot" / "settings.json").write_text("{}")
-    (tmp_home / ".config" / "github-copilot").mkdir()
-    (tmp_home / ".config" / "github-copilot" / "apps.json").write_text("{}")
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_SECOND_DIR / "settings.json").write_text("{}")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir()
+    (tmp_home / COPILOT_FIRST_DIR / "apps.json").write_text("{}")
 
     s.rescan()
 
@@ -99,8 +108,8 @@ def test_rescan_into_existing_profile(tmp_state: Path, tmp_home: Path) -> None:
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()
-    (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".config" / "github-copilot").mkdir()
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_FIRST_DIR).mkdir()
 
     init_profile = next(iter(s._store.get_active().values()))
     s.rescan(into=init_profile)
@@ -124,8 +133,8 @@ def test_rescan_into_collision_refused(tmp_state: Path, tmp_home: Path) -> None:
     s.init()  # claude only
 
     # Recreate copilot live dirs (eligible for rescan).
-    (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
 
     # Manually pre-create the colliding subdir inside the init profile.
     init_profile = next(iter(s._store.get_active().values()))
@@ -141,13 +150,13 @@ def test_rescan_seeds_missing_secondary_config_dir(tmp_state: Path, tmp_home: Pa
     _suppress_copilot(tmp_home)
     s.init()  # claude only
 
-    # First config dir present (~/.config/github-copilot), second absent.
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
+    # First config dir present (platform-appropriate path), second absent.
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
 
     s.rescan(only=["copilot"])
 
     # Secondary dir was seeded empty; symlink created.
-    assert _is_link(tmp_home / ".copilot")
+    assert _is_link(tmp_home / COPILOT_SECOND_DIR)
 
 
 def test_rescan_real_file_at_live_path_raises_path_not_a_directory(
@@ -162,8 +171,8 @@ def test_rescan_real_file_at_live_path_raises_path_not_a_directory(
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
-    (tmp_home / ".copilot").write_text("not a dir")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
+    (tmp_home / COPILOT_SECOND_DIR).write_text("not a dir")
     with pytest.raises(PathNotADirectoryError):
         s.rescan(only=["copilot"])
 
@@ -178,10 +187,10 @@ def test_rescan_rolls_back_on_partial_capture_failure(
     s.init()  # claude only
 
     # Recreate copilot dirs with content.
-    (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".copilot" / "settings.json").write_text("{copilot-config-marker}")
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
-    (tmp_home / ".config" / "github-copilot" / "apps.json").write_text("{copilot-auth-marker}")
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_SECOND_DIR / "settings.json").write_text("{copilot-config-marker}")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
+    (tmp_home / COPILOT_FIRST_DIR / "apps.json").write_text("{copilot-auth-marker}")
 
     # Force the SECOND swap_link call to fail.
     from switcher import service as svc_mod
@@ -201,15 +210,15 @@ def test_rescan_rolls_back_on_partial_capture_failure(
         s.rescan(only=["copilot"])
 
     # Both live paths are real dirs again (rolled back).
-    assert (tmp_home / ".config" / "github-copilot").is_dir()
-    assert not _is_link(tmp_home / ".config" / "github-copilot")
-    assert (tmp_home / ".copilot").is_dir()
-    assert not _is_link(tmp_home / ".copilot")
+    assert (tmp_home / COPILOT_FIRST_DIR).is_dir()
+    assert not _is_link(tmp_home / COPILOT_FIRST_DIR)
+    assert (tmp_home / COPILOT_SECOND_DIR).is_dir()
+    assert not _is_link(tmp_home / COPILOT_SECOND_DIR)
     # Original content preserved.
-    assert (tmp_home / ".copilot" / "settings.json").read_text() == "{copilot-config-marker}"
     assert (
-        tmp_home / ".config" / "github-copilot" / "apps.json"
-    ).read_text() == "{copilot-auth-marker}"
+        tmp_home / COPILOT_SECOND_DIR / "settings.json"
+    ).read_text() == "{copilot-config-marker}"
+    assert (tmp_home / COPILOT_FIRST_DIR / "apps.json").read_text() == "{copilot-auth-marker}"
     # Active map unchanged.
     assert "copilot" not in s._store.get_active()
     # Default-mode profile dir cleaned up.
@@ -227,8 +236,8 @@ def test_rescan_into_rollback_restores_metadata(
     init_profile = next(iter(s._store.get_active().values()))
     tools_before = dict(s._store.get(init_profile).tools)
 
-    (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
 
     from switcher import service as svc_mod
 
@@ -257,10 +266,10 @@ def test_rescan_into_rollback_restores_live_dir_contents(
     s.init()  # claude only
     init_profile = next(iter(s._store.get_active().values()))
 
-    (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".copilot" / "sentinel.txt").write_text("user-data")
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
-    (tmp_home / ".config" / "github-copilot" / "config").write_text("settings")
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_SECOND_DIR / "sentinel.txt").write_text("user-data")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
+    (tmp_home / COPILOT_FIRST_DIR / "config").write_text("settings")
 
     from switcher import service as svc_mod
 
@@ -273,10 +282,10 @@ def test_rescan_into_rollback_restores_live_dir_contents(
         s.rescan(into=init_profile, only=["copilot"])
 
     # Live dirs and contents must be restored — NOT silently deleted.
-    assert (tmp_home / ".copilot").is_dir()
-    assert (tmp_home / ".copilot" / "sentinel.txt").read_text() == "user-data"
-    assert (tmp_home / ".config" / "github-copilot").is_dir()
-    assert (tmp_home / ".config" / "github-copilot" / "config").read_text() == "settings"
+    assert (tmp_home / COPILOT_SECOND_DIR).is_dir()
+    assert (tmp_home / COPILOT_SECOND_DIR / "sentinel.txt").read_text() == "user-data"
+    assert (tmp_home / COPILOT_FIRST_DIR).is_dir()
+    assert (tmp_home / COPILOT_FIRST_DIR / "config").read_text() == "settings"
 
 
 def test_rescan_rollback_does_not_create_empty_live_dir_for_seeded_mapping(
@@ -292,8 +301,8 @@ def test_rescan_rollback_does_not_create_empty_live_dir_for_seeded_mapping(
     s.init()  # claude only
 
     # Set up: first config dir present, second missing → second is seeded.
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
-    (tmp_home / ".config" / "github-copilot" / "config").write_text("settings")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
+    (tmp_home / COPILOT_FIRST_DIR / "config").write_text("settings")
     # `.copilot` deliberately NOT created — this is the seeded mapping.
 
     from switcher import service as svc_mod
@@ -317,8 +326,53 @@ def test_rescan_rollback_does_not_create_empty_live_dir_for_seeded_mapping(
     # Critical assertion: `.copilot` was missing originally and must STAY
     # missing after rollback. Creating an empty dir here would corrupt
     # detection on the next rescan run.
-    assert not (tmp_home / ".copilot").exists()
-    assert not (tmp_home / ".copilot").is_symlink()
+    assert not (tmp_home / COPILOT_SECOND_DIR).exists()
+    assert not (tmp_home / COPILOT_SECOND_DIR).is_symlink()
+
+
+def test_rescan_state_write_failure_rolls_back_capture(
+    tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §4.4: per-tool capture is finalized only when the active +
+    active_live_paths write lands. If `set_active_state` fails after a
+    successful capture, rollback must undo the link/move so retries don't
+    hit AlreadyLinkedError on the (now-symlinked) live dirs.
+    """
+    s = _service(tmp_state, tmp_home)
+    _suppress_copilot(tmp_home)
+    s.init()  # claude only
+
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_SECOND_DIR / "settings.json").write_text("user-config")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
+    (tmp_home / COPILOT_FIRST_DIR / "apps.json").write_text("user-auth")
+
+    real_set_active_state = s._store.set_active_state
+
+    def failing_set_active_state(active: object, live_paths: object) -> None:
+        # Fail only when the rescan tries to add the new tool entry.
+        if "copilot" in active:  # type: ignore[operator]
+            raise RuntimeError("simulated state-write failure")
+        return real_set_active_state(active, live_paths)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(s._store, "set_active_state", failing_set_active_state)
+
+    with pytest.raises(RescanCaptureError, match="simulated state-write failure"):
+        s.rescan(only=["copilot"])
+
+    # Live dirs restored to real directories — not left as symlinks pointing
+    # into a profile the active map doesn't know about.
+    assert (tmp_home / COPILOT_SECOND_DIR).is_dir()
+    assert not _is_link(tmp_home / COPILOT_SECOND_DIR)
+    assert (tmp_home / COPILOT_FIRST_DIR).is_dir()
+    assert not _is_link(tmp_home / COPILOT_FIRST_DIR)
+    # Original content preserved at live paths.
+    assert (tmp_home / COPILOT_SECOND_DIR / "settings.json").read_text() == "user-config"
+    assert (tmp_home / COPILOT_FIRST_DIR / "apps.json").read_text() == "user-auth"
+    # Active map and the partial profile dir are unchanged on disk.
+    assert "copilot" not in s._store.get_active()
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    assert not (tmp_state / "profiles" / f"{today}-rescan-1").exists()
 
 
 def test_rescan_default_rollback_fails_closed_when_restore_fails(
@@ -337,10 +391,10 @@ def test_rescan_default_rollback_fails_closed_when_restore_fails(
     _suppress_copilot(tmp_home)
     s.init()  # claude only
 
-    (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".copilot" / "sentinel.txt").write_text("user-config")
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
-    (tmp_home / ".config" / "github-copilot" / "apps.json").write_text("user-auth")
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_SECOND_DIR / "sentinel.txt").write_text("user-config")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
+    (tmp_home / COPILOT_FIRST_DIR / "apps.json").write_text("user-auth")
 
     from switcher import service as svc_mod
 
@@ -390,10 +444,10 @@ def test_rescan_into_rollback_fails_closed_when_restore_fails(
     s.init()  # claude only
     init_profile = next(iter(s._store.get_active().values()))
 
-    (tmp_home / ".copilot").mkdir()
-    (tmp_home / ".copilot" / "sentinel.txt").write_text("user-config")
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
-    (tmp_home / ".config" / "github-copilot" / "apps.json").write_text("user-auth")
+    (tmp_home / COPILOT_SECOND_DIR).mkdir()
+    (tmp_home / COPILOT_SECOND_DIR / "sentinel.txt").write_text("user-config")
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
+    (tmp_home / COPILOT_FIRST_DIR / "apps.json").write_text("user-auth")
 
     from switcher import service as svc_mod
 
@@ -440,9 +494,9 @@ def test_rescan_already_linked_raises(tmp_state: Path, tmp_home: Path) -> None:
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only
-    (tmp_home / ".config" / "github-copilot").mkdir(parents=True)
+    (tmp_home / COPILOT_FIRST_DIR).mkdir(parents=True)
     foreign = tmp_home / "foreign-copilot"
     foreign.mkdir()
-    (tmp_home / ".copilot").symlink_to(foreign, target_is_directory=True)
+    (tmp_home / COPILOT_SECOND_DIR).symlink_to(foreign, target_is_directory=True)
     with pytest.raises(AlreadyLinkedError):
         s.rescan(only=["copilot"])

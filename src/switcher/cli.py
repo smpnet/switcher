@@ -128,11 +128,10 @@ def status(
                 for p in paths:
                     console.print(f"       {p}", markup=False, soft_wrap=True)
             else:
-                console.print(
-                    "       live_paths not cached (will fall back to registry on uninstall)",
-                    markup=False,
-                    soft_wrap=True,
-                )
+                # Don't promise "fall back to registry": for orphan tools
+                # (no registry entry AND no cache) uninstall refuses, so the
+                # earlier wording contradicted the next command's behavior.
+                console.print("       live_paths not cached", markup=False, soft_wrap=True)
 
 
 # -- mutating commands ------------------------------------------------------
@@ -272,7 +271,16 @@ def rescan(
     dry_run: bool = typer.Option(False, "--dry-run", help="Print plan; make no changes."),
 ) -> None:
     """Pick up tools installed after init."""
-    only_list = [s.strip() for s in only.split(",") if s.strip()] if only else None
+    # Mirror `use --only`: an explicitly empty `--only ""` is invalid input,
+    # not "no filter". Without this the CLI silently bypasses the
+    # service-layer guard at service.rescan (`--only requires at least one
+    # tool id`), making `--only ""` behave like bare `rescan`.
+    if only is None:
+        only_list = None
+    else:
+        only_list = [s.strip() for s in only.split(",") if s.strip()]
+        if not only_list:
+            raise typer.BadParameter("--only must contain at least one tool id")
     deps = get_deps()
     report = deps.service.rescan(only=only_list, into=into, dry_run=dry_run)
     if not report.captured:

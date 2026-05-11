@@ -222,10 +222,26 @@ class ProfileService:
 
             # Reconstruct the (subdir, live_path) pairs we need.
             if tool is not None:
-                pairs = [
-                    (dm.profile_subdir, self._resolver.tool_dir(tool, i))
-                    for i, dm in enumerate(tool.config_dirs)
-                ]
+                # Drift-resilience (spec §3.4 / Hermes review): when the
+                # cache is populated and matches the registry's config_dirs
+                # count, prefer cached live_paths over resolver-derived
+                # paths. The cache holds the paths as they existed at
+                # init/rescan time, so a TOML edit that moves a config_dir
+                # to a different filesystem location after init still has
+                # an existing on-disk symlink at the old (cached) path.
+                # Without this, uninstall reconstructs from the *new*
+                # registry paths and fails with "live path missing" —
+                # exactly the recovery case the cache was added for.
+                if cached_paths and len(cached_paths) == len(tool.config_dirs):
+                    pairs = [
+                        (dm.profile_subdir, Path(cached_paths[i]))
+                        for i, dm in enumerate(tool.config_dirs)
+                    ]
+                else:
+                    pairs = [
+                        (dm.profile_subdir, self._resolver.tool_dir(tool, i))
+                        for i, dm in enumerate(tool.config_dirs)
+                    ]
             elif cached_paths:
                 # Orphan tool with cache. Determine each cached path's subdir by
                 # following the symlink. For real-dir / missing live paths
@@ -915,15 +931,30 @@ class ProfileService:
         if dry_run:
             return RescanReport(captured=[(t.id, targets[t.id]) for t in candidates])
 
-        # Capture per tool, with rollback on partial failure. Single combined
-        # write per tool (active + cache atomic per spec §4.4).
+        # Capture per tool, with rollback on partial failure. The per-tool
+        # state write (active + cache, atomic per spec §4.4) lives INSIDE
+        # the rollback try/except: a config-write failure after a successful
+        # capture would otherwise leave live dirs symlinked into a profile
+        # the persisted active map doesn't reference, causing retries to
+        # hit AlreadyLinkedError instead of recovering cleanly.
         report = RescanReport(captured=[])
         live_paths_cache = self.get_active_live_paths()
         for tool in candidates:
             target = targets[tool.id]
+            new_paths = [
+                str(self._resolver.tool_dir(tool, i)) for i in range(len(tool.config_dirs))
+            ]
             try:
                 self._capture_tool_for_rescan(tool, target, into=into is not None)
+                active[tool.id] = target
+                live_paths_cache[tool.id] = new_paths
+                self._store.set_active_state(active, live_paths_cache)
             except Exception as e:
+                # Revert in-memory dict mutations so a rollback after the
+                # state-write step starts cleanly; the on-disk active map
+                # is unaffected (set_active_state is the only writer).
+                active.pop(tool.id, None)
+                live_paths_cache.pop(tool.id, None)
                 # The per-tool capture method already attempted in-loop rollback;
                 # this catch is the outer safety net for the post-loop cleanup
                 # (profile dir / metadata revert) that an in-loop rollback might
@@ -936,12 +967,6 @@ class ProfileService:
                         f"user data left at: {', '.join(leftovers)}"
                     )
                 raise RescanCaptureError(msg) from e
-            # Both keys in one atomic write.
-            active[tool.id] = target
-            live_paths_cache[tool.id] = [
-                str(self._resolver.tool_dir(tool, i)) for i in range(len(tool.config_dirs))
-            ]
-            self._store.set_active_state(active, live_paths_cache)
             report.captured.append((tool.id, target))
         return report
 

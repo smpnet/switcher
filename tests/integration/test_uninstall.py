@@ -188,6 +188,49 @@ def test_uninstall_purge_succeeded_sets_purged_flag(tmp_state: Path, tmp_home: P
     assert not tmp_state.exists()
 
 
+def test_uninstall_uses_cached_live_paths_after_registry_drift(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """Spec §3.4 / Hermes review: uninstall must use active_live_paths
+    when the tool's TOML changes config_dirs post-init. Without this the
+    cache is consulted only for orphan tools, and a TOML edit (e.g. the
+    user moves a config dir to a different location) makes uninstall
+    fail with `live path missing` against the new path even though the
+    old (cached) symlink is still on disk.
+    """
+    s = _service(tmp_state, tmp_home)
+    s.init()
+    # Cache has the original ~/.claude path.
+    assert "claude" in s._store.get_active_live_paths()
+
+    # Simulate registry drift: user TOML overrides claude with a different
+    # posix_path. profile_subdir stays "claude" so the on-disk profile
+    # subdir keeps matching what the cached symlink points to.
+    registry_d = tmp_state / "registry.d"
+    registry_d.mkdir(parents=True, exist_ok=True)
+    (registry_d / "claude.toml").write_text(
+        'id = "claude"\n'
+        'name = "Claude (drifted)"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.claude-elsewhere"\n'
+        'windows_path = "%USERPROFILE%\\\\.claude-elsewhere"\n'
+        'profile_subdir = "claude"\n'
+    )
+
+    # Re-instantiate so the new registry takes effect for this service.
+    drifted = _service(tmp_state, tmp_home)
+
+    # Dry-run honors the cached path: no CORRUPT classification.
+    report = drifted.uninstall(dry_run=True)
+    assert all(m.state.value != "corrupt" for m in report.mappings), [
+        (m.tool_id, m.state.value, m.corruption_reason) for m in report.mappings
+    ]
+
+    # Real uninstall restores the cached live path to a real directory.
+    drifted.uninstall()
+    assert (tmp_home / ".claude").is_dir() and not _is_link(tmp_home / ".claude")
+
+
 def test_uninstall_purge_clears_active_state_before_destructive_delete(
     tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
