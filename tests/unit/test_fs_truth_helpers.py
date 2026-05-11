@@ -90,8 +90,11 @@ def test_discover_finds_symlink_into_owned_subdir(tmp_state: Path, tmp_home: Pat
     profile_name = "test-profile"
     profile_dir = service._store.profile_dir(profile_name)
     (profile_dir / "copilot-config").mkdir(parents=True)
-    link = tmp_home / ".copilot-link"
-    link.symlink_to(profile_dir / "copilot-config")
+    # Canonical live-path basename — required by the basename filter that
+    # rejects non-managed aliases. Conftest pre-seeds ~/.copilot as a real
+    # dir, so replace it with a symlink.
+    link = tmp_home / ".copilot"
+    _replace_with_symlink(link, profile_dir / "copilot-config")
 
     discovered = service._discover_live_paths_for_active("copilot", profile_name)
     assert str(link) in discovered
@@ -105,10 +108,12 @@ def test_discover_per_tool_isolation_in_multi_tool_profile(tmp_state: Path, tmp_
     profile_dir = service._store.profile_dir(profile_name)
     (profile_dir / "copilot-config").mkdir(parents=True)
     (profile_dir / "claude").mkdir(parents=True)
-    copilot_link = tmp_home / ".copilot-link"
-    claude_link = tmp_home / ".claude-link"
-    copilot_link.symlink_to(profile_dir / "copilot-config")
-    claude_link.symlink_to(profile_dir / "claude")
+    # Canonical live-path basenames. Conftest pre-seeds both as real dirs;
+    # replace with symlinks into the profile.
+    copilot_link = tmp_home / ".copilot"
+    claude_link = tmp_home / ".claude"
+    _replace_with_symlink(copilot_link, profile_dir / "copilot-config")
+    _replace_with_symlink(claude_link, profile_dir / "claude")
 
     copilot_paths = service._discover_live_paths_for_active("copilot", profile_name)
     claude_paths = service._discover_live_paths_for_active("claude", profile_name)
@@ -165,3 +170,21 @@ def test_discover_skips_regular_files_in_candidate_parents(tmp_state: Path, tmp_
     real.write_text("regular file")
     discovered = service._discover_live_paths_for_active("copilot", profile_name)
     assert str(real) not in discovered
+
+
+def test_discover_rejects_non_canonical_basenames(tmp_state: Path, tmp_home: Path) -> None:
+    """A user-created symlink at a non-canonical name that happens to resolve
+    into the profile dir (e.g., `~/copilot-backup -> <profile>/copilot-config`)
+    must NOT be captured as a managed live path — uninstall would otherwise
+    delete/rename a user alias switcher never owned."""
+    service = _make_service(tmp_state, tmp_home)
+    profile_name = "alias"
+    profile_dir = service._store.profile_dir(profile_name)
+    (profile_dir / "copilot-config").mkdir(parents=True)
+
+    # User-created backup symlink at a name switcher does NOT own.
+    backup = tmp_home / "copilot-backup"
+    backup.symlink_to(profile_dir / "copilot-config")
+
+    discovered = service._discover_live_paths_for_active("copilot", profile_name)
+    assert str(backup) not in discovered

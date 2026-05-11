@@ -99,4 +99,5 @@ def test_legacy_migration_warns_on_count_mismatch(
 
     service.get_active_live_paths()
     err = capsys.readouterr().err
-    assert "registry has" in err and "live path" in err
+    assert "registry has" in err
+    assert "live path" in err

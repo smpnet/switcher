@@ -91,6 +91,17 @@ _HISTORICAL_PROFILE_SUBDIRS: dict[str, frozenset[str]] = {
     # claude has always used "claude" — no historical drift to record.
 }
 
+# Per-tool historical live-path basenames: the leaf names a tool's live path
+# may have used across switcher versions. Union of (current registry) +
+# (historical) gives the canonical-basename set discovery requires before
+# capturing a symlink — without this, any user-created symlink resolving
+# into an owned profile subdir (e.g., `~/copilot-backup`) would be falsely
+# classified as managed and later mutated by uninstall.
+_HISTORICAL_LIVE_PATH_BASENAMES: dict[str, frozenset[str]] = {
+    "copilot": frozenset({"github-copilot"}),
+    # claude has always lived at ~/.claude (or %USERPROFILE%\.claude).
+}
+
 
 class ProfileService:
     def __init__(
@@ -280,6 +291,24 @@ class ProfileService:
         historical = _HISTORICAL_PROFILE_SUBDIRS.get(tool_id, frozenset())
         return current | historical
 
+    def _candidate_live_basenames_for(self, tool_id: str) -> frozenset[str]:
+        """Live-path leaf names this tool may legitimately own on disk.
+
+        Union of (a) basenames of the tool's current registry config_dirs
+        and (b) hardcoded historical basenames from prior switcher versions.
+        Used by FS-truth discovery to reject user-created symlinks that
+        happen to resolve into an owned profile subdir but were never
+        managed by switcher (e.g., a `~/copilot-backup` alias).
+        """
+        tool = find_tool(self._registry, tool_id)
+        current: frozenset[str] = (
+            frozenset(self._resolver.tool_dir(tool, i).name for i in range(len(tool.config_dirs)))
+            if tool is not None
+            else frozenset()
+        )
+        historical = _HISTORICAL_LIVE_PATH_BASENAMES.get(tool_id, frozenset())
+        return current | historical
+
     def _candidate_parents_for(self, tool_id: str) -> list[Path]:
         """Parent directories to scan during FS-truth migration discovery.
 
@@ -321,6 +350,14 @@ class ProfileService:
         if not expected_subdirs:
             return []
 
+        # Hermes round-1: capture must be gated on canonical leaf names as
+        # well as resolved target. Otherwise an unrelated `~/copilot-backup
+        # -> <profile>/copilot-config` alias gets recorded and later mutated
+        # by uninstall — a destructive false positive.
+        expected_basenames = self._candidate_live_basenames_for(tool_id)
+        if not expected_basenames:
+            return []
+
         # Resolve only those expected subdirs that actually exist on disk;
         # non-existent ones can't be the target of any symlink anyway.
         owned_targets: set[Path] = set()
@@ -336,6 +373,8 @@ class ProfileService:
             if not parent.is_dir():
                 continue
             for child in parent.iterdir():
+                if child.name not in expected_basenames:
+                    continue
                 if not self._resolver.is_link(child):
                     continue
                 try:
