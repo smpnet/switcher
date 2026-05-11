@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
-from switcher.paths import PathResolver
+import pytest
+
+from switcher.links import _create_junction
+from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
@@ -22,16 +26,23 @@ def _make_service(tmp_state: Path, tmp_home: Path) -> ProfileService:
 
 
 def _replace_with_symlink(path: Path, target: Path) -> None:
-    """Replace whatever is at `path` (real dir, file, or symlink) with a
-    symlink pointing at `target`. Idempotent — handles the conftest seed
-    that pre-creates real dirs at live-path locations."""
-    if path.is_symlink():
+    """Replace whatever is at `path` (real dir, file, or symlink/junction)
+    with a directory link pointing at `target`. Idempotent — handles the
+    conftest seed that pre-creates real dirs at live-path locations.
+
+    On Windows uses a directory junction so the suite runs in CI without
+    Developer Mode / elevation (matches the repo pattern in test_rescan.py).
+    """
+    if path.is_symlink() or (IS_WINDOWS and os.path.isjunction(path)):
         path.unlink()
     elif path.is_dir():
         shutil.rmtree(path)
     elif path.exists():
         path.unlink()
-    path.symlink_to(target)
+    if IS_WINDOWS:
+        _create_junction(target, path)
+    else:
+        path.symlink_to(target)
 
 
 def test_expected_subdirs_for_copilot_includes_historical(tmp_state: Path, tmp_home: Path) -> None:
@@ -140,6 +151,9 @@ def test_discover_claude_ignores_copilot_symlinks_in_shared_profile(
     assert str(copilot_link) not in claude_paths
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="POSIX-specific legacy parent (~/.config); Windows uses %LOCALAPPDATA%"
+)
 def test_discover_legacy_copilot_auth_path_after_rewrite(tmp_state: Path, tmp_home: Path) -> None:
     """After the Copilot builtin rewrite, the registry only mentions ~/.copilot.
     The orphan symlink at ~/.config/github-copilot must still be discovered."""

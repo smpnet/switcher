@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 
-from switcher.paths import PathResolver
+from switcher.links import _create_junction
+from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
@@ -23,16 +25,23 @@ def _make_service(state_dir: Path, home: Path) -> ProfileService:
 
 
 def _replace_symlink(link: Path, target: Path) -> None:
-    """Replace whatever is at `link` (real dir, file, or symlink) with a
-    symlink pointing at `target`. Idempotent — handles the conftest seed
-    that pre-creates real dirs at the live-path locations."""
-    if link.is_symlink():
+    """Replace whatever is at `link` (real dir, file, or symlink/junction)
+    with a directory link pointing at `target`. Idempotent — handles the
+    conftest seed that pre-creates real dirs at the live-path locations.
+
+    On Windows uses a directory junction so the suite runs in CI without
+    Developer Mode / elevation (matches the repo pattern in test_rescan.py).
+    """
+    if link.is_symlink() or (IS_WINDOWS and os.path.isjunction(link)):
         link.unlink()
     elif link.is_dir():
         shutil.rmtree(link)
     elif link.exists():
         link.unlink()
-    link.symlink_to(target)
+    if IS_WINDOWS:
+        _create_junction(target, link)
+    else:
+        link.symlink_to(target)
 
 
 def _write_legacy_config(state_dir: Path, active: dict[str, str]) -> None:
@@ -41,6 +50,9 @@ def _write_legacy_config(state_dir: Path, active: dict[str, str]) -> None:
     (state_dir / "config.json").write_text(json.dumps({"active": active}))
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="POSIX-specific legacy parent (~/.config); Windows uses %LOCALAPPDATA%"
+)
 def test_legacy_migration_with_drifted_copilot_two_dir(tmp_state: Path, tmp_home: Path) -> None:
     """User initialized v0.1.0 with the two-dir Copilot layout. Registry
     has since rewritten to single-dir. Migration must discover BOTH live
@@ -77,6 +89,9 @@ def test_legacy_migration_with_drifted_copilot_two_dir(tmp_state: Path, tmp_home
     assert str(old_link) in paths
 
 
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="POSIX-specific legacy parent (~/.config); Windows uses %LOCALAPPDATA%"
+)
 def test_legacy_migration_warns_on_count_mismatch(
     tmp_state: Path, tmp_home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
