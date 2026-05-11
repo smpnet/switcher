@@ -31,8 +31,12 @@ def _replace_symlink(link: Path, target: Path) -> None:
 
     On Windows uses a directory junction so the suite runs in CI without
     Developer Mode / elevation (matches the repo pattern in test_rescan.py).
+    Junction removal goes through rmdir(); unlink() on a junction raises
+    because junctions are directory reparse points (mirrors links.remove_link).
     """
-    if link.is_symlink() or (IS_WINDOWS and os.path.isjunction(link)):
+    if IS_WINDOWS and os.path.isjunction(link):
+        link.rmdir()
+    elif link.is_symlink():
         link.unlink()
     elif link.is_dir():
         shutil.rmtree(link)
