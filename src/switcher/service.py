@@ -374,7 +374,14 @@ class ProfileService:
         for parent in self._candidate_parents_for(tool_id):
             if not parent.is_dir():
                 continue
-            for child in parent.iterdir():
+            try:
+                children = list(parent.iterdir())
+            except OSError:
+                # Unreadable candidate parent (PermissionError, etc.) — skip
+                # this parent and continue with the remaining candidates so
+                # one restrictive directory doesn't sink the whole migration.
+                continue
+            for child in children:
                 if child.name not in expected_basenames:
                     continue
                 if not self._resolver.is_link(child):
