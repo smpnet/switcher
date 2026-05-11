@@ -103,6 +103,45 @@ def _force_remove(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def remove_link(link_path: Path) -> None:
+    """Remove a symlink (POSIX) or junction (Windows). Raise on anything else.
+
+    Cross-platform link removal: `Path.unlink` invokes `DeleteFile` on
+    Windows, which refuses junction reparse points; `Path.rmdir`
+    invokes `RemoveDirectory`, which accepts them. POSIX symlinks always
+    go through `unlink`. Anything that's not a link (real dir, regular
+    file, missing) raises `PathNotADirectoryError` — callers that need
+    "remove anything" should use `_force_remove` instead.
+    """
+    if IS_WINDOWS and os.path.isjunction(link_path):
+        link_path.rmdir()
+        return
+    # Defensive Windows fallback for broken junctions on hosts where
+    # `os.path.isjunction` is unreliable — `_swap_link_windows` documents
+    # the same caveat. For a broken junction, `exists()` returns False
+    # (target is gone) and `is_symlink()` returns False (junctions are
+    # reparse points, not symlinks), so without this branch the helper
+    # would refuse to clean up exactly the case its docstring promises.
+    # `exists()` returning True for real dirs/files keeps the rejection
+    # path below safe from accidental removal.
+    if IS_WINDOWS and not link_path.exists() and not link_path.is_symlink():
+        try:
+            link_path.rmdir()
+            return
+        except FileNotFoundError:
+            pass  # truly missing — fall through to raise the strict error
+        # Other OSErrors (PermissionError, sharing violations, ACL issues)
+        # propagate: this helper is for cleanup, and silently masking an
+        # operational failure would defeat the unhappy-path teardown
+        # case the docstring promises.
+    if link_path.is_symlink():
+        link_path.unlink(missing_ok=True)
+        return
+    if not link_path.exists():
+        raise PathNotADirectoryError(f"{link_path} does not exist; nothing to remove")
+    raise PathNotADirectoryError(f"{link_path} is not a symlink or junction; refusing to remove")
+
+
 def swap_link(target: Path, link_path: Path) -> None:
     """Replace any existing link at `link_path` with a link to `target`.
 
@@ -215,3 +254,31 @@ def move_or_seed_dir(live: Path, profile_target: Path) -> None:
         profile_target.mkdir(exist_ok=False)
         return
     live.replace(profile_target)
+
+
+def restore_real_dir(temp_dir: Path, live_path: Path) -> None:
+    """Replace a live symlink/junction with a real directory.
+
+    The inverse of `swap_link`: validates `live_path` is a link, drops
+    it via the link-aware `remove_link` helper, then renames `temp_dir`
+    into place. The two operations are NOT atomic; the microseconds-long
+    window where `live_path` is missing AND `temp_dir` is present is
+    detectable and recoverable by the caller's pre-flight (see uninstall
+    `MISSING_LIVE_TEMP_PRESENT` classification).
+
+    Refuses to mutate if `temp_dir` is not a *real* directory. `is_dir()`
+    follows links, so a symlink/junction at `temp_dir` would silently pass
+    that check and rename the link itself into `live_path` — leaving a
+    relinked live path instead of the real-dir restore the helper promises.
+    A regular file at that path must also NOT be renamed over the live path.
+    """
+    if temp_dir.is_symlink() or (IS_WINDOWS and os.path.isjunction(temp_dir)):
+        raise NotADirectoryError(
+            f"temp dir {temp_dir} is a symlink/junction; restore_real_dir requires a real directory"
+        )
+    if not temp_dir.is_dir():
+        raise NotADirectoryError(
+            f"temp dir {temp_dir} is not a directory; copy step must precede restore"
+        )
+    remove_link(live_path)
+    temp_dir.rename(live_path)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,19 +98,40 @@ def list_cmd() -> None:
 
 @app.command()
 @handle_errors
-def status() -> None:
-    """Show active profile per tool."""
+def status(
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show cached live paths."),
+) -> None:
+    """Show currently-active profiles per tool, plus live-path cache state."""
     deps = get_deps()
     active = deps.store.get_active()
     if not active:
         console.print("no active profiles")
         return
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("Tool")
-    table.add_column("Active Profile")
-    for tool in deps.registry:
-        table.add_row(tool.id, active.get(tool.id, "-"))
-    console.print(table)
+    # `markup=False` is REQUIRED because `[ok]` / `[--]` would otherwise be
+    # interpreted as Rich markup tags. Spec §6.5.
+    # Read the RAW persisted cache (not the derived view) so `[ok]` strictly
+    # means "active_live_paths[tool_id] is populated on disk" per spec §6.5.
+    # The derived view via service.get_active_live_paths() synthesizes from
+    # live links when cache is empty, which would mask the legacy / drifted
+    # state operators are trying to diagnose.
+    cache = deps.store.get_active_live_paths()
+    for tool_id in sorted(active):
+        profile = active[tool_id]
+        cache_marker = "[ok]" if cache.get(tool_id) else "[--]"
+        # `soft_wrap=True` so paths/profile names are never broken across lines
+        # by Rich's terminal-width wrap. Status output has to remain stable
+        # (and substring-greppable) under narrow CI terminals.
+        console.print(f"{cache_marker} {tool_id:20} {profile}", markup=False, soft_wrap=True)
+        if verbose:
+            paths = cache.get(tool_id, [])
+            if paths:
+                for p in paths:
+                    console.print(f"       {p}", markup=False, soft_wrap=True)
+            else:
+                # Don't promise "fall back to registry": for orphan tools
+                # (no registry entry AND no cache) uninstall refuses, so the
+                # earlier wording contradicted the next command's behavior.
+                console.print("       live_paths not cached", markup=False, soft_wrap=True)
 
 
 # -- mutating commands ------------------------------------------------------
@@ -190,6 +212,129 @@ def which(tool: str) -> None:
     """Show which profile a specific tool is currently using."""
     name = get_deps().service.which(tool)
     console.print(name)
+
+
+@app.command()
+@handle_errors
+def uninstall(
+    purge: bool = typer.Option(
+        False, "--purge", help="Also remove the state directory after restoring real dirs."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the --purge confirmation prompt."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print plan; make no changes."),
+    force: bool = typer.Option(
+        False, "--force", help="Skip orphan tools (registry-and-cache-missing)."
+    ),
+) -> None:
+    """Inverse of init: replace every active symlink with a real directory."""
+    deps = get_deps()
+    report = deps.service.uninstall(
+        purge=purge,
+        yes=yes,
+        dry_run=dry_run,
+        force=force,
+    )
+    prefix = "would " if dry_run else ""
+    for m in report.mappings:
+        if m.state.value == "already_restored":
+            err_console.print(f"already restored {m.live_path}")
+        elif m.state.value == "missing_live_temp_present":
+            verb = "would recover" if dry_run else "recovered"
+            err_console.print(f"{verb} {m.live_path} from interrupted uninstall")
+        else:
+            err_console.print(
+                f"{prefix}unlink {m.live_path} (was symlink to "
+                f"{m.profile_dir_subdir.parent.name}/{m.profile_subdir})"
+            )
+    for tool_id, reason in report.skipped:
+        err_console.print(f"skipped {tool_id}: {reason}")
+    # Footer: consult report.purged (NOT the purge flag) — service may have
+    # returned without purging if the user declined the prompt.
+    if dry_run:
+        if purge:
+            err_console.print(f"would purge {deps.store.state_dir()}")
+        else:
+            err_console.print(
+                f"would clear active map; would keep state at {deps.store.state_dir()}"
+            )
+    elif report.purged:
+        err_console.print(f"purged {deps.store.state_dir()}")
+    else:
+        err_console.print(f"cleared active map; kept state at {deps.store.state_dir()}")
+
+
+@app.command()
+@handle_errors
+def rescan(
+    only: str | None = typer.Option(None, "--only", help="Comma-separated tool ids."),
+    into: str | None = typer.Option(None, "--into", help="Capture into an existing profile."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print plan; make no changes."),
+) -> None:
+    """Pick up tools installed after init."""
+    # Mirror `use --only`: an explicitly empty `--only ""` is invalid input,
+    # not "no filter". Without this the CLI silently bypasses the
+    # service-layer guard at service.rescan (`--only requires at least one
+    # tool id`), making `--only ""` behave like bare `rescan`.
+    if only is None:
+        only_list = None
+    else:
+        only_list = [s.strip() for s in only.split(",") if s.strip()]
+        if not only_list:
+            raise typer.BadParameter("--only must contain at least one tool id")
+    deps = get_deps()
+    report = deps.service.rescan(only=only_list, into=into, dry_run=dry_run)
+    if not report.captured:
+        err_console.print("no new tools detected")
+        return
+    prefix = "would " if dry_run else ""
+    for tool_id, target in report.captured:
+        err_console.print(f"{prefix}captured {tool_id} into {target}")
+
+
+@app.command()
+@handle_errors
+def prune(
+    force: bool = typer.Option(False, "--force", help="Skip the confirmation prompt."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="List orphans; make no changes."),
+) -> None:
+    """Delete orphan profiles."""
+    deps = get_deps()
+
+    # First call is always a dry-run to enumerate orphans + sizes.
+    preview = deps.service.prune(dry_run=True)
+    if not preview.sizes_bytes:
+        err_console.print("no orphan profiles")
+        return
+
+    _print_orphan_list(preview.sizes_bytes)
+    if dry_run:
+        err_console.print("Run without --dry-run to delete.")
+        return
+
+    if not force:
+        if not sys.stdin.isatty():
+            err_console.print("refusing to delete without --force in non-interactive mode")
+            raise typer.Exit(code=1)
+        if not typer.confirm("Delete all?"):
+            err_console.print("aborted; nothing deleted")
+            return
+
+    final = deps.service.prune(force=True)
+    err_console.print(f"deleted {len(final.deleted)} orphan profile(s)")
+
+
+def _print_orphan_list(sizes: dict[str, int]) -> None:
+    err_console.print(f"{len(sizes)} orphan profile(s):")
+    for name, sz in sizes.items():
+        err_console.print(f"  {name}  {_fmt_size(sz)}")
+
+
+def _fmt_size(n: int) -> str:
+    if n < 1024:
+        return "<1 KB"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
 
 
 @tools_app.command(name="scaffold")

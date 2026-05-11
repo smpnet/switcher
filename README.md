@@ -89,11 +89,10 @@ with a `git clone`-style auth error, that's a GitHub auth problem, not a
 
 > **⚠ Run `switcher init` only after the tools you want to manage are
 > already installed.** `init` is one-shot — it captures whichever tools
-> exist at the moment you run it, then refuses to run again. Tools you
-> install *after* `init` are not picked up automatically. The only
-> recovery in v0.1.0 is the destructive procedure documented under "How
-> it works" (back up state, restore live configs, wipe state, re-init).
-> A non-destructive `rescan` command is on the v0.2.0 roadmap.
+> exist at the moment you run it, then refuses to run again. Tools
+> installed *after* `init` are picked up by `switcher rescan` (see
+> "Recovery commands" below). To remove `switcher` and restore your
+> live config directories to real directories, use `switcher uninstall`.
 
 ```bash
 # One-time setup: detect installed tools, MOVE each tool's live config dir
@@ -139,6 +138,23 @@ switcher tools
 switcher version
 ```
 
+## Recovery commands
+
+Three commands cover post-`init` recovery without resorting to the
+destructive procedure:
+
+- **`switcher uninstall`** — inverse of `init`. Replaces every active
+  symlink with a real directory restored from each tool's currently-active
+  profile. State dir is preserved by default; `--purge` also removes it.
+- **`switcher rescan`** — picks up tools installed after `init`,
+  capturing each into a fresh profile (`<today>-rescan-N`). Pass
+  `--into <profile>` to consolidate into an existing profile.
+- **`switcher prune`** — removes profiles that aren't active for any
+  tool. Shows sizes; `--force` skips the confirmation prompt.
+
+Run `switcher status -v` to see which tools have cached `live_paths`
+(used by `uninstall` to recover even when the registry has drifted).
+
 ## How it works
 
 `switcher init` performs a one-time setup:
@@ -163,20 +179,44 @@ at the moment you run it, and then refuses to run again
   are simply not in the active map.
 
 In both cases, a tool installed *after* `init` is not retroactively picked
-up. The recovery path today is to delete the state directory (see the
-per-OS table further down) and re-run `switcher init`.
+up by `init` itself. Use `switcher rescan` to capture newly-installed
+tools into a fresh profile (see "Recovery commands" above).
 
-> **⚠ Destructive recovery — last resort.** This is an exceptional
-> manual procedure with multiple failure modes, not a routine
-> operation. **You will lose every saved profile, your live tool
-> config, AND any user-added tool registry entries if you do not back
-> up the entire `<state_dir>` first.** The `<dated>-current` profile is
-> where your real Claude/Copilot config lives after `init` (the live
-> `~/.claude` etc. are just symlinks into it); `<state_dir>/registry.d/`
-> holds user-added tool definitions; `<state_dir>/profiles/` holds every
+> **⚠ Manual recovery.** When the normal commands can't repair the
+> state — a half-finished `init`, dangling links, registry drift, or a
+> tool installed after `init` — recovery is staged: try the
+> non-destructive commands first, fall through to the destructive wipe
+> only as a last resort.
+>
+> **`switcher uninstall` — inverse of `init`.** Replaces every live
+> config symlink with a real directory restored from each tool's
+> currently-active profile. State is preserved by default;
+> `switcher uninstall --purge` also removes `<state_dir>` after the
+> swap. `uninstall` reads the per-tool active profile from cached
+> `live_paths` (visible via `switcher status -v`) so it still works
+> when the registry has drifted. Use this for "I want to remove
+> `switcher`" or "my `init` ended up wedged."
+>
+> **`switcher rescan` — for tools installed after `init`.** Captures
+> each newly-detected tool into a fresh `<today>-rescan-N` profile.
+> Pass `switcher rescan --into <profile>` to consolidate into an
+> existing profile.
+>
+> ### If everything else fails: destructive recovery
+>
+> The v0.1.0 wipe procedure is retained for cases where `uninstall`
+> can't run — e.g. live config paths manually broken, state-dir
+> contents corrupted past recognition, or a half-finished `init` that
+> `uninstall`'s classifier rejects. This is an exceptional manual
+> procedure with multiple failure modes, not a routine operation.
+> **You will lose every saved profile, your live tool config, AND any
+> user-added tool registry entries if you do not back up the entire
+> `<state_dir>` first.** The `<dated>-current` profile is where your
+> real Claude/Copilot config lives after `init` (the live `~/.claude`
+> etc. are just symlinks into it); `<state_dir>/registry.d/` holds
+> user-added tool definitions; `<state_dir>/profiles/` holds every
 > saved profile. Read the whole procedure before running any of the
-> steps. A non-destructive `rescan` command on the v0.2.0 roadmap will
-> replace this dance.
+> steps.
 >
 > 1. **Record the active profile per tool, then back up the entire state
 >    directory.** The active profile is what each tool's live config
@@ -284,13 +324,11 @@ in `<state_dir>/registry.d/` matching the schema — generate a stub with
 
 > **Same `init`-is-one-shot caveat applies.** Registering a new tool TOML
 > after `init` makes it visible to `switcher tools` and `switcher list`,
-> but it is NOT automatically captured into existing profiles or
-> the active map. To bring a newly registered tool under management in
-> v0.1.0, you have to use the destructive recovery procedure (back up
-> state, restore live configs, wipe state, re-init) so that `init` sees
-> the new tool's live config dir at run time. The forthcoming `rescan`
-> command (v0.2.0 roadmap) will replace both this case and the
-> "tool installed after init" case with a non-destructive flow.
+> but it is NOT automatically captured into existing profiles or the
+> active map. Run `switcher rescan` to capture the newly-registered
+> tool's live config dir into a fresh `<today>-rescan-N` profile (or
+> `switcher rescan --into <profile>` to consolidate into an existing
+> profile).
 
 ```bash
 switcher tools scaffold gemini

@@ -660,6 +660,17 @@ def test_delete_active_profile_refuses(service: ProfileService) -> None:
         service.delete(name)
 
 
+def test_delete_active_profile_error_wording_locked_in(service: ProfileService) -> None:
+    """Spec §7.3 audit: lock in the delete error wording so it stays
+    consistent with prune's vocabulary across future changes."""
+    name = service.init()
+    with pytest.raises(ProfileIsActiveError) as exc:
+        service.delete(name)
+    msg = str(exc.value)
+    assert f"profile {name!r} is active for:" in msg
+    assert "Switch the active tools to a different profile before deleting." in msg
+
+
 def test_delete_unknown_raises(service: ProfileService) -> None:
     service.init()
     with pytest.raises(UnknownProfileError):

@@ -8,12 +8,15 @@ from switcher.errors import (
     ProfileExistsError,
     ProfileIsActiveError,
     ProfileTargetExistsError,
+    PruneError,
+    RescanCaptureError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
     StorageError,
     SwitcherError,
     ToolHasNoActiveProfileError,
     ToolNotInProfileError,
+    UninstallPreflightError,
     UnknownProfileError,
     UnknownToolError,
 )
@@ -34,6 +37,9 @@ from switcher.errors import (
         ToolNotInProfileError,
         ToolHasNoActiveProfileError,
         StorageError,
+        UninstallPreflightError,
+        RescanCaptureError,
+        PruneError,
     ],
 )
 def test_all_errors_inherit_from_switcher_error(cls: type[Exception]) -> None:

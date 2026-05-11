@@ -11,7 +11,14 @@ from switcher.errors import (
     PathNotADirectoryError,
     ProfileTargetExistsError,
 )
-from switcher.links import IS_WINDOWS, link_dir, move_or_seed_dir, swap_link
+from switcher.links import (
+    IS_WINDOWS,
+    link_dir,
+    move_or_seed_dir,
+    remove_link,
+    restore_real_dir,
+    swap_link,
+)
 
 
 def test_link_dir_creates_link_to_directory(tmp_path: Path) -> None:
@@ -286,3 +293,174 @@ def test_move_or_seed_rejects_existing_junction_target(tmp_path: Path) -> None:
     link_dir(real, target)
     with pytest.raises(ProfileTargetExistsError):
         move_or_seed_dir(live, target)
+
+
+# --- remove_link helper (v0.1.3) ----------------------------------------------
+
+
+def _make_dir_link(tmp_path: Path) -> tuple[Path, Path]:
+    target = tmp_path / "real"
+    target.mkdir()
+    link = tmp_path / "link"
+    # `link_dir` is the public surface that branches to junctions on Windows
+    # and symlinks on POSIX — same behavior as the prior-art Windows-only
+    # tests above (e.g. `test_move_or_seed_rejects_existing_junction_target`).
+    link_dir(target, link)
+    return target, link
+
+
+def test_remove_link_drops_a_symlink_or_junction(tmp_path: Path) -> None:
+    target, link = _make_dir_link(tmp_path)
+    remove_link(link)
+    assert not link.exists()
+    assert not link.is_symlink()
+    if IS_WINDOWS:
+        assert not os.path.isjunction(link)
+    # The target itself is unaffected.
+    assert target.is_dir()
+
+
+def test_remove_link_refuses_a_real_directory(tmp_path: Path) -> None:
+    real_dir = tmp_path / "realdir"
+    real_dir.mkdir()
+    with pytest.raises(PathNotADirectoryError):
+        remove_link(real_dir)
+    assert real_dir.is_dir()  # untouched
+
+
+def test_remove_link_refuses_a_regular_file(tmp_path: Path) -> None:
+    f = tmp_path / "file.txt"
+    f.write_text("content")
+    with pytest.raises(PathNotADirectoryError):
+        remove_link(f)
+    assert f.is_file()
+
+
+def test_remove_link_refuses_a_missing_path(tmp_path: Path) -> None:
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(PathNotADirectoryError):
+        remove_link(missing)
+
+
+def test_remove_link_drops_a_broken_link(tmp_path: Path) -> None:
+    """Cleanup primitive must handle dangling links — the exact case it's
+    designed for during partial/unhappy-path teardown. POSIX `is_symlink()`
+    works on broken symlinks; Windows `os.path.isjunction()` works on
+    broken junctions because the reparse point persists even after the
+    target directory is removed."""
+    target, link = _make_dir_link(tmp_path)
+    # Break the link by removing the target. The link reparse point/
+    # symlink entry remains; only the target dir is gone.
+    target.rmdir()
+    remove_link(link)
+    # `link.exists()` is vacuously False for a broken link (it follows
+    # the dangling target), so it's not evidence of removal. `lstat`
+    # inspects the link entry itself — its raise is the proof. (Both
+    # `is_symlink()` and `os.path.isjunction()` ultimately call lstat
+    # too, so the lstat check subsumes them.)
+    with pytest.raises(FileNotFoundError):
+        link.lstat()
+
+
+@pytest.mark.skipif(
+    not IS_WINDOWS,
+    reason="Windows-only: the unreliable-isjunction fallback only triggers when "
+    "IS_WINDOWS is True, isjunction returns False, and is_symlink is False — "
+    "a combination only reachable with a real Windows junction.",
+)
+def test_remove_link_falls_back_when_isjunction_unreliable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the affected Windows hosts (per `_swap_link_windows`'s comment),
+    `os.path.isjunction()` returns False for a broken junction even though
+    `rmdir()` would still succeed. Simulate the unreliable-host condition
+    by patching `os.path.isjunction` to always return False, and verify
+    the defensive fallback branch in `remove_link` still cleans up."""
+    target, link = _make_dir_link(tmp_path)
+    target.rmdir()  # break the junction
+    # Patch the symbol that `remove_link` actually consults.
+    import switcher.links as links_module
+
+    def _isjunction_unreliable(_p: object) -> bool:
+        return False
+
+    monkeypatch.setattr(links_module.os.path, "isjunction", _isjunction_unreliable)
+    remove_link(link)
+    with pytest.raises(FileNotFoundError):
+        link.lstat()
+
+
+# --- restore_real_dir helper (v0.1.3) -----------------------------------------
+
+
+def test_restore_real_dir_replaces_a_symlink_with_the_temp_dir(tmp_path: Path) -> None:
+    target, link = _make_dir_link(tmp_path)
+    temp = tmp_path / "link.switcher-uninstall-tmp"
+    temp.mkdir()
+    (temp / "marker.txt").write_text("hi")
+
+    restore_real_dir(temp, link)
+
+    # link is now a real dir holding temp's content.
+    assert link.is_dir() and not link.is_symlink()
+    if IS_WINDOWS:
+        assert not os.path.isjunction(link)
+    assert (link / "marker.txt").read_text() == "hi"
+    # temp is gone (renamed away).
+    assert not temp.exists()
+    # The original symlink target is untouched (we copied, then swapped).
+    assert target.is_dir()
+
+
+def test_restore_real_dir_refuses_when_live_path_is_not_a_link(tmp_path: Path) -> None:
+    real_dir = tmp_path / "realdir"
+    real_dir.mkdir()
+    temp = tmp_path / "tmp"
+    temp.mkdir()
+    with pytest.raises(PathNotADirectoryError):
+        restore_real_dir(temp, real_dir)
+    # Both untouched.
+    assert real_dir.is_dir()
+    assert temp.is_dir()
+
+
+def test_restore_real_dir_refuses_when_temp_dir_missing(tmp_path: Path) -> None:
+    _target, link = _make_dir_link(tmp_path)
+    temp = tmp_path / "missing-tmp"
+    with pytest.raises(NotADirectoryError):
+        restore_real_dir(temp, link)
+    assert link.is_symlink() or (IS_WINDOWS and os.path.isjunction(link))
+
+
+def test_restore_real_dir_refuses_when_temp_path_is_a_regular_file(tmp_path: Path) -> None:
+    _target, link = _make_dir_link(tmp_path)
+    temp = tmp_path / "tmp-but-actually-file"
+    temp.write_text("not a dir")
+    with pytest.raises(NotADirectoryError):
+        restore_real_dir(temp, link)
+    assert link.is_symlink() or (IS_WINDOWS and os.path.isjunction(link))
+    assert temp.is_file()  # untouched
+
+
+def test_restore_real_dir_refuses_when_temp_path_is_a_link(tmp_path: Path) -> None:
+    """The helper's contract is to restore a *real* directory at live_path.
+    `is_dir()` follows symlinks/junctions, so without an explicit link
+    rejection a linked temp_dir would survive the precondition and the
+    rename would relink live_path instead of installing real contents."""
+    _target, link = _make_dir_link(tmp_path)
+    # Build a separate link to act as the bogus "temp_dir": real backing
+    # directory, but the path the caller hands us is a link to it.
+    backing = tmp_path / "backing"
+    backing.mkdir()
+    (backing / "marker").write_text("x")
+    temp_link = tmp_path / "temp-as-link"
+    link_dir(backing, temp_link)
+
+    with pytest.raises(NotADirectoryError):
+        restore_real_dir(temp_link, link)
+
+    # Both untouched: live link is still a link, temp_link is still a link.
+    assert link.is_symlink() or (IS_WINDOWS and os.path.isjunction(link))
+    assert temp_link.is_symlink() or (IS_WINDOWS and os.path.isjunction(temp_link))
+    # Backing dir intact (we didn't rename through the link).
+    assert (backing / "marker").read_text() == "x"
