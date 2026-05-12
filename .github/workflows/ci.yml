@@ -28,11 +28,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The actual step list (setup-pixi, lint, typecheck, test, test-integration,
-  # test-e2e, verify-windows, build) lives in .github/actions/run-pixi-ci/
-  # action.yml -- a composite action both jobs invoke. There is exactly one
-  # source of truth for what CI runs, with per-step GitHub UI visibility
-  # preserved through the composite's nested steps.
+  # The matrix `test` job invokes the .github/actions/run-pixi-ci composite,
+  # which runs `pixi run check` -- whatever the check aggregate names in
+  # pixi.toml is what the matrix runs, with no duplicate step list here to
+  # drift. The standalone `build` job below builds the wheel + sdist on
+  # ubuntu-latest only (pure-Python artifact; an OS matrix would be redundant)
+  # and uploads the result as a downloadable artifact.
 
   # GitHub-hosted runners: always run, including for fork PRs. These are
   # ephemeral and isolated, so untrusted PR code is safe here. windows-latest
@@ -64,6 +65,33 @@ jobs:
           # for the same reason.
           fetch-depth: 0
       - uses: ./.github/actions/run-pixi-ci
+
+  # Linux-only wheel + sdist build. The package is pure-Python (no compiled
+  # extensions), so the artifact is identical regardless of build OS -- running
+  # it across the three-OS test matrix was redundant. This job runs once and
+  # uploads the resulting wheel + sdist as a downloadable artifact, which
+  # later release-artifact wiring can pull from at tag time.
+  build:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          # hatch-vcs reads `git describe --tags` at build time to derive the
+          # package version. A shallow checkout would produce a 0.0.0+local-style
+          # version and break the build -- same reason the test job above and
+          # release.yml use fetch-depth: 0.
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-pixi-pinned
+      - name: Build wheel + sdist
+        shell: bash
+        run: pixi run build
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: switcher-dist
+          path: dist/
+          if-no-files-found: error
 
   # Self-hosted Windows runner: provisioned-tool sanity check ONLY.
   #
