@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -20,6 +21,16 @@ def _combined(result: object) -> str:
     stdout = getattr(result, "stdout", "") or ""
     stderr = getattr(result, "stderr", "") or ""
     return stdout + stderr
+
+
+def _is_link(p: Path) -> bool:
+    """True for POSIX symlinks AND Windows directory junctions.
+
+    `Path.is_symlink()` returns False for junctions on Windows, which would
+    silently turn a "post-unmanage path is not a link" assertion into a
+    false pass when init/unmanage left a junction in place by accident.
+    """
+    return p.is_symlink() or (IS_WINDOWS and os.path.isjunction(p))
 
 
 def _drop_link(p: Path) -> None:
@@ -40,10 +51,10 @@ def test_unmanage_happy_path(tmp_home: Path, tmp_state: Path) -> None:
     from switcher.cli import get_deps
 
     assert "claude" not in get_deps().store.get_active()
-    # Live path is a real dir, not a symlink.
+    # Live path is a real dir, not a symlink/junction.
     claude_path = tmp_home / ".claude"
     assert claude_path.is_dir()
-    assert not claude_path.is_symlink()
+    assert not _is_link(claude_path)
 
 
 def test_unmanage_drops_cache_entry(tmp_home: Path, tmp_state: Path) -> None:
@@ -74,8 +85,7 @@ def test_unmanage_dry_run_no_changes(tmp_home: Path, tmp_state: Path) -> None:
     assert "claude" in get_deps().store.get_active()
     # Symlink (POSIX) or junction (Windows) still in place — dry-run
     # never touches the filesystem.
-    claude_path = tmp_home / ".claude"
-    assert claude_path.is_symlink() or (IS_WINDOWS and os.path.isjunction(claude_path))
+    assert _is_link(tmp_home / ".claude")
 
 
 def test_unmanage_dry_run_labels_missing_live_temp_present_as_recover(
@@ -102,7 +112,10 @@ def test_unmanage_dry_run_labels_missing_live_temp_present_as_recover(
     assert result.exit_code == 0, _combined(result)
     out = result.stdout
     assert "MISSING_LIVE_TEMP_PRESENT" in out
-    assert "would recover" in out.lower()
+    # `re.search(\s+)` so the assertion survives Rich's terminal-width
+    # line-wrap on long Windows paths (the `soft_wrap=True` on the CLI
+    # print is the primary fix; this is defense-in-depth).
+    assert re.search(r"would\s+recover", out, flags=re.IGNORECASE), out
     # "no-op" must NOT appear for this mapping — that's the unsafe wording.
     assert "no-op" not in out.lower()
 
@@ -134,7 +147,7 @@ def test_unmanage_then_use_does_not_remanage(tmp_home: Path, tmp_state: Path) ->
     assert "claude" not in get_deps().store.get_active()
     # Live dir still a real directory — no resurrection.
     assert (tmp_home / ".claude").is_dir()
-    assert not (tmp_home / ".claude").is_symlink()
+    assert not _is_link(tmp_home / ".claude")
 
 
 def test_unmanage_when_uninitialized_errors(tmp_home: Path, tmp_state: Path) -> None:

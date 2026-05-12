@@ -4,7 +4,7 @@ Operational doc for cutting a release. Recipe-first; rationale below.
 
 ## Release notes
 
-### v0.1.4 — 2026-MM-DD
+### v0.1.4 — 2026-05-11
 
 **Added**
 

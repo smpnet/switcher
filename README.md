@@ -160,6 +160,7 @@ Run `switcher status -v` to see which tools have cached `live_paths`
 `init` is one-shot. To change which tools switcher manages after init:
 
 - **Initialize with a subset of detected tools:**
+
   ```bash
   switcher init --only copilot              # manage Copilot only
   switcher init --skip claude               # manage everything detected except Claude
