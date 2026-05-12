@@ -248,3 +248,31 @@ def test_classify_corrupt_when_temp_dir_collides_with_live_link(
     )
     assert re_classified.state == State.CORRUPT
     assert "temp dir" in re_classified.corruption_reason
+
+
+def test_classify_corrupt_when_profile_target_is_a_regular_file(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """CodeRabbit Major: a regular file at `profile_target` used to pass
+    the SYMLINK branch's `exists()` guard and crash mid-uninstall inside
+    `copytree()`. The pre-flight now requires `is_dir()`, classifying
+    file-at-target as CORRUPT so the corrupt-state refusal at the orchestrator
+    catches it before any mutation runs.
+    """
+    service = _build_initialized(tmp_state, tmp_home)
+    mappings = service._classify_uninstall_mappings()
+    m = mappings[0]  # link still in place; its profile_target is a real dir
+
+    # Replace the profile-side target dir with a regular file.
+    target = m.profile_dir_subdir
+    assert target.is_dir(), "fixture invariant: classifier's target should be a dir"
+    shutil.rmtree(target)
+    target.write_text("intentionally not a directory")
+
+    re_classified = next(
+        c
+        for c in service._classify_uninstall_mappings()
+        if (c.tool_id, c.profile_subdir) == (m.tool_id, m.profile_subdir)
+    )
+    assert re_classified.state == State.CORRUPT
+    assert "missing or not a directory" in re_classified.corruption_reason

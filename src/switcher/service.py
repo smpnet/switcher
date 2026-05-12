@@ -81,27 +81,38 @@ _HISTORICAL_PROFILE_SUBDIRS: dict[str, frozenset[str]] = {
     # claude has always used "claude" — no historical drift to record.
 }
 
-# Per-tool historical FULL live-path templates: exact paths (env-expanded
-# at lookup time) a tool's live config dir may have occupied in prior
-# switcher versions. Union of (current registry tool_dirs) + (historical
-# templates) gives the EXACT set of paths discovery considers — NEVER a
-# parent-x-basename cross-product, which historically allowed phantom
-# combinations like `~/github-copilot` (parent ~, basename github-copilot)
-# to be falsely classified as managed and later mutated by uninstall
-# (Hermes / CodeRabbit blocker post-PR-#5).
+# Per-tool historical (live_path_template, profile_subdir) pairs: exact
+# paths (env-expanded at lookup time) a tool's live config dir may have
+# occupied in prior switcher versions, paired with the profile_subdir they
+# used to be linked into. Union of (current registry tool_dirs) +
+# (historical pair keys) gives the EXACT set of paths discovery considers
+# — NEVER a parent-x-basename cross-product, which historically allowed
+# phantom combinations like `~/github-copilot` to be falsely classified as
+# managed and later mutated by uninstall (Hermes / CodeRabbit blocker
+# post-PR-#5).
 #
-# Add a new tool by adding the actual on-disk path strings it has used,
-# per platform. Use POSIX-style strings on POSIX (resolver.expand handles
-# `~`) and Windows %VAR%\path strings on Windows (resolver.expand handles
-# env vars). Don't reuse current registry paths here — those come from
-# the registry directly.
-_HISTORICAL_LIVE_PATHS_POSIX: dict[str, frozenset[str]] = {
-    "copilot": frozenset({"~/.config/github-copilot"}),
-    # claude has always lived at ~/.claude.
+# The pair shape (path → subdir, not just a set of paths) is needed by
+# `_classify_uninstall_mappings`'s resume path: when a cached live path
+# is no longer a link (e.g. a partial uninstall already restored it to a
+# real dir) AND the current registry no longer mentions that path (e.g.
+# the user shrank the tool's config_dirs between uninstalls), we still
+# need to know which profile_subdir the cached path used to be linked
+# into to resume the unwind. Without this we'd misclassify the
+# already-restored mapping as CORRUPT (Hermes blocker post-b621f02).
+#
+# Add a new tool by adding the actual on-disk path strings it has used
+# AND the profile_subdir it was linked into, per platform. Use POSIX-style
+# strings on POSIX (resolver.expand handles `~`) and Windows %VAR%\path
+# strings on Windows (resolver.expand handles env vars). Don't include
+# current registry paths here — those come from the registry directly.
+_HISTORICAL_LIVE_PATH_PAIRS_POSIX: dict[str, dict[str, str]] = {
+    # tool_id → { live_path_template: profile_subdir }
+    "copilot": {"~/.config/github-copilot": "copilot-auth"},
+    # claude has always lived at ~/.claude → "claude"; no historical drift.
 }
-_HISTORICAL_LIVE_PATHS_WINDOWS: dict[str, frozenset[str]] = {
-    "copilot": frozenset({"%LOCALAPPDATA%\\github-copilot"}),
-    # claude has always lived at %USERPROFILE%\.claude.
+_HISTORICAL_LIVE_PATH_PAIRS_WINDOWS: dict[str, dict[str, str]] = {
+    "copilot": {"%LOCALAPPDATA%\\github-copilot": "copilot-auth"},
+    # claude has always lived at %USERPROFILE%\.claude → "claude".
 }
 
 
@@ -318,15 +329,38 @@ class ProfileService:
         if tool is not None:
             for i in range(len(tool.config_dirs)):
                 paths.add(self._resolver.tool_dir(tool, i))
-        historical_raw = (
-            _HISTORICAL_LIVE_PATHS_WINDOWS if IS_WINDOWS else _HISTORICAL_LIVE_PATHS_POSIX
+        historical_pairs = (
+            _HISTORICAL_LIVE_PATH_PAIRS_WINDOWS if IS_WINDOWS else _HISTORICAL_LIVE_PATH_PAIRS_POSIX
         )
-        for raw in historical_raw.get(tool_id, frozenset()):
+        for raw in historical_pairs.get(tool_id, {}):
             # resolver.expand handles `~` (POSIX) and %ENV% (Windows) and
             # routes ~ against the resolver's configured home so injected
             # tmp_home in tests works correctly.
             paths.add(self._resolver.expand(raw))
         return paths
+
+    def _subdir_for_historical_live_path(self, tool_id: str, live: Path) -> str | None:
+        """Recover a `profile_subdir` for a cached live path that is no
+        longer in the current registry (registry-drift resume path).
+
+        Used by `_classify_uninstall_mappings` when a cached live path
+        is a real dir / missing (i.e., not a link anymore) AND the current
+        registry doesn't mention it — typically a partial uninstall
+        followed by a registry rewrite that removed the path's config_dir.
+        Without this fallback we'd misclassify the already-restored
+        mapping as CORRUPT and refuse the resume (Hermes blocker
+        post-b621f02).
+
+        Returns the historical subdir if the live path matches a
+        historical entry for the tool, else None.
+        """
+        historical_pairs = (
+            _HISTORICAL_LIVE_PATH_PAIRS_WINDOWS if IS_WINDOWS else _HISTORICAL_LIVE_PATH_PAIRS_POSIX
+        )
+        for raw, subdir in historical_pairs.get(tool_id, {}).items():
+            if self._resolver.expand(raw) == live:
+                return subdir
+        return None
 
     def _discover_live_paths_for_active(self, tool_id: str, profile_name: str) -> list[str]:
         """Walk the FS for symlinks resolving into this tool's owned subdirs.
@@ -455,14 +489,21 @@ class ProfileService:
                         # Match the cached path against a current registry
                         # config_dir by exact path — works for in-registry
                         # resume even when other config_dirs in the same tool
-                        # drifted. Falls through to CORRUPT for orphan resume
-                        # OR registry-drifted resume on this specific mapping.
+                        # drifted. Falls back to historical pair table for
+                        # registry-drift resume (Hermes blocker post-b621f02:
+                        # a partial uninstall already restored this path,
+                        # then the user shrank the registry to drop the
+                        # config_dir → without the historical fallback the
+                        # mapping mis-classifies as CORRUPT and the resume
+                        # wedges).
                         matched_subdir: str | None = None
                         if tool is not None:
                             for i, dm in enumerate(tool.config_dirs):
                                 if self._resolver.tool_dir(tool, i) == live:
                                     matched_subdir = dm.profile_subdir
                                     break
+                        if matched_subdir is None:
+                            matched_subdir = self._subdir_for_historical_live_path(tool_id, live)
                         if matched_subdir is None:
                             result.append(
                                 _UninstallMapping(

@@ -466,3 +466,72 @@ def test_uninstall_dry_run_purge_bypasses_non_tty_guard(
     assert tmp_state.exists()
     # Live paths still symlinks (dry run = no mutation).
     assert _is_link(tmp_home / ".claude")
+
+
+def test_uninstall_resume_after_partial_uninstall_and_registry_drift(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """Hermes blocker post-b621f02: an interrupted uninstall on the legacy
+    two-dir Copilot, followed by a registry rewrite to the new single-dir
+    shape, used to wedge the resume — the cached path was no longer a
+    link AND the current registry didn't mention it, so
+    `_classify_uninstall_mappings` defaulted to CORRUPT and the pre-flight
+    refused. The historical-pair table now provides the missing
+    profile_subdir so the resume completes cleanly.
+
+    Repro flow:
+      1. init with the legacy two-dir copilot override
+         (~/.config/github-copilot + ~/.copilot)
+      2. execute only the first uninstall mapping (simulate
+         crash/interruption mid-uninstall)
+      3. rewrite the registry to drop the github-copilot config_dir
+      4. re-run uninstall — must succeed (resumes the second mapping
+         and treats the first as ALREADY_RESTORED).
+    """
+    install_two_dir_copilot_override(tmp_state)
+    s = _service(tmp_state, tmp_home)
+    s.init()
+
+    # Pre-conditions: both copilot live paths are symlinks; cache has both.
+    legacy_link = tmp_home / ".config" / "github-copilot"
+    new_link = tmp_home / ".copilot"
+    assert _is_link(legacy_link)
+    assert _is_link(new_link)
+    assert len(s._store.get_active_live_paths()["copilot"]) == 2
+
+    # Step 2: simulate partial uninstall — restore ONLY the legacy mapping.
+    profile_name = s._store.get_active()["copilot"]
+    profile_dir = s._store.profile_dir(profile_name)
+    legacy_target = profile_dir / "copilot-auth"
+    _drop_link(legacy_link)
+    shutil.copytree(legacy_target, legacy_link)
+    # Cache untouched — still claims both paths are managed.
+
+    # Step 3: rewrite registry to drop github-copilot. Now the registry
+    # only mentions ~/.copilot.
+    registry_d = tmp_state / "registry.d"
+    (registry_d / "copilot.toml").write_text(
+        'id = "copilot"\n'
+        'name = "GitHub Copilot CLI (shrunk)"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.copilot"\n'
+        'windows_path = "%USERPROFILE%\\\\.copilot"\n'
+        'profile_subdir = "copilot-config"\n'
+    )
+
+    # Step 4: re-run uninstall — must NOT wedge on CORRUPT classification.
+    shrunk = _service(tmp_state, tmp_home)
+    report = shrunk.uninstall(dry_run=True)
+    copilot_mappings = [m for m in report.mappings if m.tool_id == "copilot"]
+    assert len(copilot_mappings) == 2, [
+        (m.profile_subdir, m.state.value, m.corruption_reason) for m in copilot_mappings
+    ]
+    # Neither mapping CORRUPT — historical pair provided the missing subdir.
+    assert all(m.state.value != "corrupt" for m in copilot_mappings), [
+        (m.profile_subdir, m.state.value, m.corruption_reason) for m in copilot_mappings
+    ]
+
+    # Real uninstall completes — second link is unwound, first is no-op.
+    shrunk.uninstall()
+    assert (tmp_home / ".copilot").is_dir() and not _is_link(tmp_home / ".copilot")
+    assert legacy_link.is_dir() and not _is_link(legacy_link)
