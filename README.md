@@ -491,20 +491,12 @@ path = "apps.json"
 > then run `switcher rescan --only copilot`. Running both side-by-side
 > against the same `~/.copilot` will produce confused state.
 
-## Development
+## Contributing
 
-This is a [pixi](https://pixi.sh) workspace.
-
-```bash
-pixi install              # one-time setup
-pixi run test             # unit tests
-pixi run test-integration
-pixi run test-e2e
-pixi run lint
-pixi run typecheck
-pixi run ci               # all of the above + verify-windows + build
-pixi run build            # build wheel into dist/
-```
+Bug reports, feature requests, and PRs are welcome. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev environment setup,
+the test layout, the spec→plan→implementation workflow, commit
+conventions, and a walkthrough for adding a built-in tool.
 
 ## License
 
