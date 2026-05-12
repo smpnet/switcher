@@ -141,6 +141,17 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
         [sys.executable, "-m", "switcher", *args],
         capture_output=True,
         text=True,
+        # Pin BOTH ends to UTF-8: cli.py reconfigures the subprocess's
+        # stdout/stderr to UTF-8 so the v0.1.4 tools-table glyphs
+        # (✓ — ⚠ + Rich's box-drawing characters) survive Windows'
+        # default cp1252 stdout. Without setting `encoding` here the
+        # parent test still decodes the child's output via the local
+        # codepage and fails with UnicodeDecodeError on the very same
+        # bytes (e.g. Rich's `┐` is U+2510 → 0xE2 0x94 0x90, and 0x90
+        # is undefined in cp1252). Forcing UTF-8 keeps child and parent
+        # in agreement on every platform.
+        encoding="utf-8",
+        errors="replace",
         env=env,
         check=False,
         timeout=30,
