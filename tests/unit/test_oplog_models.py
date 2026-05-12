@@ -187,6 +187,99 @@ def test_unknown_field_in_mapping_intent_rejected():
         )
 
 
+def _mapping(tool_id: str = "claude", mapping_index: int = 0) -> _MappingIntent:
+    return _MappingIntent(
+        tool_id=tool_id,
+        mapping_index=mapping_index,
+        live_path=f"/home/u/.{tool_id}",
+        profile_subdir=tool_id,
+        original_kind="real-dir",
+    )
+
+
+def test_init_op_rejects_mapping_for_untargeted_tool():
+    """A mapping for a tool not in target_ids is a corrupt journal entry
+    — recovery would not know whether to treat it as part of this op or
+    as external drift.
+    """
+    with pytest.raises(ValidationError):
+        _InitOp(
+            op="init",
+            started_at=_now(),
+            target_ids=["claude"],
+            profile_name="2026-05-12-current",
+            mappings=[_mapping(tool_id="copilot")],
+        )
+
+
+def test_init_op_rejects_duplicate_mapping_pair():
+    """(tool_id, mapping_index) identifies one DirMapping; duplicates
+    would let recovery double-process the same mapping.
+    """
+    with pytest.raises(ValidationError):
+        _InitOp(
+            op="init",
+            started_at=_now(),
+            target_ids=["claude"],
+            profile_name="2026-05-12-current",
+            mappings=[_mapping(mapping_index=0), _mapping(mapping_index=0)],
+        )
+
+
+def test_init_op_accepts_target_with_zero_mappings():
+    """Registry-only tools (no DirMappings) are legitimate init targets;
+    enforcing "every target_id has a mapping" would reject them.
+    """
+    op = _InitOp(
+        op="init",
+        started_at=_now(),
+        target_ids=["claude", "registry-only-tool"],
+        profile_name="2026-05-12-current",
+        mappings=[_mapping(tool_id="claude")],
+    )
+    assert {m.tool_id for m in op.mappings} == {"claude"}
+
+
+def test_rescan_op_rejects_target_profiles_mismatch():
+    """target_profiles is a per-tool routing table; missing or extra
+    entries vs target_ids would leave recovery without (or with surplus)
+    routing data.
+    """
+    with pytest.raises(ValidationError):
+        _RescanOp(
+            op="rescan",
+            started_at=_now(),
+            target_ids=["claude"],
+            target_profiles={"copilot": "shared"},  # wrong key
+            into_mode=False,
+            previous_tools=None,
+            mappings=[],
+        )
+    with pytest.raises(ValidationError):
+        _RescanOp(
+            op="rescan",
+            started_at=_now(),
+            target_ids=["claude"],
+            target_profiles={"claude": "x", "copilot": "y"},  # extra key
+            into_mode=False,
+            previous_tools=None,
+            mappings=[],
+        )
+
+
+def test_rescan_op_rejects_mapping_for_untargeted_tool():
+    with pytest.raises(ValidationError):
+        _RescanOp(
+            op="rescan",
+            started_at=_now(),
+            target_ids=["claude"],
+            target_profiles={"claude": "shared"},
+            into_mode=False,
+            previous_tools=None,
+            mappings=[_mapping(tool_id="copilot")],
+        )
+
+
 def test_rescan_into_mode_true_without_previous_tools_rejected():
     """into_mode=True snapshots the prior tool-set so abort can
     restore it; missing previous_tools is a semantically impossible

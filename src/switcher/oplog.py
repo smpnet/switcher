@@ -93,11 +93,53 @@ class _BaseOp(BaseModel):
     completed_at: AwareDatetime | None = None
 
 
+def _check_mappings_against_target_ids(
+    op_name: str, target_ids: list[str], mappings: list[_MappingIntent]
+) -> None:
+    """Shared cross-field validator for init/rescan records.
+
+    Two invariants — both "semantically impossible" entries that should
+    never survive validation:
+
+    1. Every `mappings[i].tool_id` must appear in `target_ids`. A mapping
+       for a tool that isn't in the targeted set is a corrupt journal
+       entry; recovery would not know whether to treat it as part of
+       this op or as drift.
+
+    2. `(tool_id, mapping_index)` pairs must be unique within mappings.
+       The pair identifies a single DirMapping (tools can have several
+       — e.g. claude has `~/.claude` and `~/.config/claude`); duplicates
+       in the journal would let recovery double-process or double-revert
+       the same mapping.
+
+    NOT enforced: that every tool in `target_ids` has at least one
+    mapping. Registry-only tools (no DirMappings) are valid targets and
+    legitimately contribute zero entries to `mappings`.
+    """
+    target_set = set(target_ids)
+    seen_pairs: set[tuple[str, int]] = set()
+    for m in mappings:
+        if m.tool_id not in target_set:
+            raise ValueError(
+                f"{op_name}: mapping references tool_id={m.tool_id!r} "
+                f"not in target_ids={sorted(target_set)!r}"
+            )
+        key = (m.tool_id, m.mapping_index)
+        if key in seen_pairs:
+            raise ValueError(f"{op_name}: duplicate (tool_id, mapping_index)={key!r} in mappings")
+        seen_pairs.add(key)
+
+
 class _InitOp(_BaseOp):
     op: Literal["init"]
     target_ids: list[str]
     profile_name: str
     mappings: list[_MappingIntent]
+
+    @model_validator(mode="after")
+    def _check_mappings_consistency(self) -> Self:
+        _check_mappings_against_target_ids("_InitOp", self.target_ids, self.mappings)
+        return self
 
 
 class _RenameOp(_BaseOp):
@@ -130,6 +172,24 @@ class _RescanOp(_BaseOp):
             raise ValueError("_RescanOp: into_mode=True requires previous_tools to be present")
         if not self.into_mode and self.previous_tools is not None:
             raise ValueError("_RescanOp: into_mode=False requires previous_tools to be None")
+        return self
+
+    @model_validator(mode="after")
+    def _check_target_profiles_keys_match_target_ids(self) -> Self:
+        """target_profiles is a per-tool routing table; every targeted
+        tool must have an entry (so recovery knows which profile to
+        continue/abort), and no extra tools may appear.
+        """
+        if set(self.target_profiles.keys()) != set(self.target_ids):
+            raise ValueError(
+                f"_RescanOp: target_profiles keys {sorted(self.target_profiles)!r} "
+                f"must equal target_ids {sorted(self.target_ids)!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_mappings_consistency(self) -> Self:
+        _check_mappings_against_target_ids("_RescanOp", self.target_ids, self.mappings)
         return self
 
 
