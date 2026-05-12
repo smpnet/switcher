@@ -2,10 +2,12 @@ name: Run pixi check tasks
 description: >
   Set up pixi and invoke the `check` task. The pixi.toml `check =
   { depends-on = [...] }` aggregate is the single authoritative task
-  list for the test matrix -- lint, typecheck, test, test-integration,
-  test-e2e, verify-windows. Wheel building is split into its own job
-  (see ci.yml `build` job) and runs once on ubuntu-latest rather than
-  three times across the OS matrix.
+  list for the test matrix -- the workflow runs whatever pixi.toml says
+  it runs, end of story. Wheel building runs in its own workflow job so
+  the pure-Python artifact isn't rebuilt across the OS matrix. Per-task
+  pass/fail visibility comes through pixi's own `✨ Pixi task (X)`
+  output in the step log; one click vs. one glance is the trade we make
+  for not having a duplicate step list to drift.
 
 runs:
   using: composite
