@@ -92,6 +92,7 @@ jobs:
           name: switcher-dist
           path: dist/
           if-no-files-found: error
+          retention-days: 7
 
   # Self-hosted Windows runner: provisioned-tool sanity check ONLY.
   #
