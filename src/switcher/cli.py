@@ -467,7 +467,13 @@ def unmanage(
     if dry_run:
         console.print(f"Would unmanage {report.tool_id!r}:")
         for m in report.mappings:
-            if m.state == UninstallMappingState.SYMLINK:
+            if report.skipped_orphan:
+                # `--force --dry-run` on an orphan-no-cache tool: the real
+                # run drops the tool from the active map and leaves any
+                # symlinks in place. Don't mislabel that as a no-op
+                # restore (CodeRabbit blocker).
+                verb = "would skip orphan (drop from active map; leave links in place)"
+            elif m.state == UninstallMappingState.SYMLINK:
                 verb = "would restore"
             elif m.state == UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
                 # A real run renames the sibling temp dir back into the
@@ -480,6 +486,10 @@ def unmanage(
             # across a hard newline, breaking substring assertions and
             # making the preview harder to grep.
             console.print(f"  {m.live_path}  ({m.state.name} -> {verb})", soft_wrap=True)
+        if report.skipped_orphan and not report.mappings:
+            # Orphan-no-cache produces zero mappings — surface the would-skip
+            # explicitly so the dry-run output isn't an empty body.
+            console.print(f"  (orphan {report.tool_id!r}: no mappings; would drop from active map)")
         console.print("(dry-run; no changes made)")
     elif report.skipped_orphan:
         console.print(

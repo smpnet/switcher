@@ -120,6 +120,42 @@ def test_unmanage_dry_run_labels_missing_live_temp_present_as_recover(
     assert "no-op" not in out.lower()
 
 
+def test_unmanage_force_dry_run_orphan_does_not_say_already_restored(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """CodeRabbit blocker: `unmanage --force --dry-run` on an orphan-no-cache
+    tool used to print "no-op (already restored)", but the real run actually
+    drops the tool from the active map and leaves any symlinks in place.
+    The dry-run preview now says "would skip orphan" so operators evaluating
+    --dry-run see the actual semantics.
+    """
+    setup = runner.invoke(app, ["init"])
+    assert setup.exit_code == 0, _combined(setup)
+
+    # Inject an orphan tool: present in active map but no registry entry
+    # AND no live_paths cache. Use the store directly to construct this
+    # state since the public CLI path can't.
+    from switcher.cli import get_deps
+
+    deps = get_deps()
+    active = deps.store.get_active()
+    new_active = dict(active)
+    new_active["orphan_tool"] = next(iter(active.values()))  # any profile
+    cache = deps.store.get_active_live_paths()
+    new_cache = dict(cache)  # leave cache empty for orphan_tool
+    deps.store.set_active_state(new_active, new_cache)
+
+    result = runner.invoke(app, ["unmanage", "orphan_tool", "--force", "--dry-run"])
+    assert result.exit_code == 0, _combined(result)
+    out = result.stdout.lower()
+    assert "no-op" not in out, (
+        f"orphan dry-run mislabeled as no-op (real run drops from active map): {out}"
+    )
+    assert "skip orphan" in out or "drop from active map" in out, (
+        f"expected explicit orphan-skip wording in dry-run output: {out}"
+    )
+
+
 def test_unmanage_unknown_tool_raises(tmp_home: Path, tmp_state: Path) -> None:
     setup = runner.invoke(app, ["init"])
     assert setup.exit_code == 0, _combined(setup)

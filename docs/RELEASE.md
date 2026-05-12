@@ -18,7 +18,7 @@ Operational doc for cutting a release. Recipe-first; rationale below.
 - `switcher use <profile>` now defaults to switching only currently-managed tools (`profile.tools ∩ active.keys()`). Makes `unmanage` durable across profile switches.
 - `switcher save` now snapshots only managed tools. Tools installed AFTER `init` are no longer implicitly added to new snapshots — run `switcher rescan --only <tool>` first.
 - The bundled `copilot` builtin now targets the standalone `copilot` binary (single `~/.copilot` config dir, no credentials block). Existing profile data carrying the legacy `copilot-auth` subdir keeps working — the subdir is dead data, not visited. To migrate a legacy profile fully to the new shape, run `switcher unmanage copilot` then `switcher rescan --only copilot`.
-- `switcher status` on an empty active map prints `"No tools currently managed. Run 'switcher rescan' to discover installed tools."` instead of the bare `"no active profiles"`.
+- `switcher status` on an empty active map now distinguishes the two reachable empty-states. After init, when every tool has been unmanaged (or after `uninstall` without `--purge`), it prints `"No tools currently managed. Run 'switcher rescan' to discover installed tools."` Pre-init (no profiles on disk yet) it prints `"No tools currently managed. Run 'switcher init' to set up switcher."` — the previous wording recommended `rescan` even when `rescan` would error with `StateNotInitializedError`.
 
 **Fixed**
 
