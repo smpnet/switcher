@@ -144,6 +144,70 @@ def test_unknown_op_value_raises_validation_error():
         parse_record({"op": "vacuum", "started_at": "2026-05-12T10:30:00+00:00"})
 
 
+def test_mapping_index_str_not_coerced_to_int():
+    """Pydantic's default int coercion would accept "0" → 0, which
+    would let a hand-edited journal slip past the corruption boundary.
+    StrictInt rejects.
+    """
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(
+            {
+                "tool_id": "claude",
+                "mapping_index": "0",
+                "live_path": "/home/u/.claude",
+                "profile_subdir": "claude",
+                "original_kind": "real-dir",
+            }
+        )
+
+
+def test_target_ids_int_not_coerced_to_str():
+    """target_ids=[123] would coerce to ["123"] without StrictStr."""
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "init",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": [123],
+                "profile_name": "x",
+                "mappings": [],
+            }
+        )
+
+
+def test_previous_tools_str_not_coerced_to_bool():
+    """previous_tools={"shared": {"claude": "false"}} would coerce
+    "false" → False without StrictBool. The journal must reject."""
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rescan",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": ["claude"],
+                "target_profiles": {"claude": "shared"},
+                "into_mode": True,
+                "previous_tools": {"shared": {"claude": "false"}},
+                "mappings": [],
+            }
+        )
+
+
+def test_into_mode_str_not_coerced_to_bool():
+    """Same rejection on a top-level _RescanOp field."""
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rescan",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": ["claude"],
+                "target_profiles": {"claude": "shared"},
+                "into_mode": "true",
+                "previous_tools": {"shared": {"claude": True}},
+                "mappings": [],
+            }
+        )
+
+
 @pytest.mark.parametrize("bogus", ["hardlink", "link", "file", "directory", ""])
 def test_invalid_original_kind_rejected(bogus: str):
     """original_kind is narrow on purpose: only the values

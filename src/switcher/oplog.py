@@ -20,7 +20,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    TypeAdapter,
+    model_validator,
+)
 
 
 class _MappingIntent(BaseModel):
@@ -56,10 +66,17 @@ class _MappingIntent(BaseModel):
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
-    tool_id: str
-    mapping_index: int
-    live_path: str
-    profile_subdir: str
+    # Strict* types reject Pydantic's default str↔int / str↔bool / etc.
+    # coercion: a hand-edited oplog.json with `mapping_index: "0"` would
+    # otherwise validate as 0 and slip past the corruption boundary the
+    # rest of this module is designed around. AwareDatetime is left as
+    # the regular pydantic type because the on-disk format stores
+    # timestamps as ISO strings — JSON has no native datetime — and
+    # AwareDatetime is itself strict about the tzinfo invariant.
+    tool_id: StrictStr
+    mapping_index: StrictInt
+    live_path: StrictStr
+    profile_subdir: StrictStr
     original_kind: Literal["missing", "real-dir"]
 
 
@@ -179,8 +196,8 @@ def _check_mappings_against_target_ids(
 
 class _InitOp(_BaseOp):
     op: Literal["init"]
-    target_ids: list[str]
-    profile_name: str
+    target_ids: list[StrictStr]
+    profile_name: StrictStr
     mappings: list[_MappingIntent]
 
     @model_validator(mode="after")
@@ -196,9 +213,9 @@ class _InitOp(_BaseOp):
 
 class _RenameOp(_BaseOp):
     op: Literal["rename"]
-    from_: str = Field(alias="from")
-    to: str
-    affected_ids: list[str]
+    from_: StrictStr = Field(alias="from")
+    to: StrictStr
+    affected_ids: list[StrictStr]
 
     @model_validator(mode="after")
     def _check_affected_ids_unique(self) -> Self:
@@ -219,10 +236,10 @@ class _RenameOp(_BaseOp):
 
 class _RescanOp(_BaseOp):
     op: Literal["rescan"]
-    target_ids: list[str]
-    target_profiles: dict[str, str]
-    into_mode: bool
-    previous_tools: dict[str, dict[str, bool]] | None = None
+    target_ids: list[StrictStr]
+    target_profiles: dict[StrictStr, StrictStr]
+    into_mode: StrictBool
+    previous_tools: dict[StrictStr, dict[StrictStr, StrictBool]] | None = None
     mappings: list[_MappingIntent]
 
     @model_validator(mode="after")
