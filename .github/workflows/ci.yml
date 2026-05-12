@@ -58,11 +58,12 @@ jobs:
       # bump on the v0.1.5 security review.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          # hatch-vcs reads `git describe --tags` at build time to derive the
-          # package version. The CI build step (inside `pixi run ci`) needs
-          # full tag history; a shallow checkout produces a 0.0.0+local-style
-          # version and breaks the build. release.yml also has fetch-depth: 0
-          # for the same reason.
+          # hatch-vcs reads `git describe --tags` whenever the package is
+          # installed or built. Without full tag history it produces a
+          # 0.0.0+local-style version, which trips both `pixi install`
+          # (used by every job) and `pixi run build`. release.yml and
+          # the `build` job below also use fetch-depth: 0 for the same
+          # reason.
           fetch-depth: 0
       - uses: ./.github/actions/run-pixi-ci
 
