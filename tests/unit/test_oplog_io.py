@@ -66,6 +66,17 @@ def test_read_records_unknown_op_raises_corrupt(tmp_path: Path):
         io.read_records()
 
 
+def test_read_records_non_list_top_level_raises_corrupt(tmp_path: Path):
+    """A valid JSON value that isn't a list (e.g. an object) is a
+    distinct corruption path from malformed JSON — it parses but fails
+    the top-level array contract enforced before schema validation.
+    """
+    (tmp_path / "oplog.json").write_text("{}")
+    io = OpLogIO(tmp_path)
+    with pytest.raises(OpLogCorruptError):
+        io.read_records()
+
+
 def test_append_record_creates_file(tmp_path: Path):
     io = OpLogIO(tmp_path)
     io.append_record(_make_rename_op())

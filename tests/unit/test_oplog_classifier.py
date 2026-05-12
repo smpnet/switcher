@@ -6,8 +6,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
+from switcher.links import link_dir
 from switcher.oplog import (
     MappingDiskState,
+    _is_link,
     _MappingIntent,
     classify_mapping,
 )
@@ -31,13 +35,17 @@ def _make_intent(
 
 
 def _make_link(src: Path, dst: Path) -> None:
-    """Create a symlink at src pointing to dst.
+    """Create a directory link at ``src`` pointing to ``dst``.
 
-    `target_is_directory=True` is a no-op on POSIX but required on
-    Windows so the link is created as a directory symlink (not a file
-    symlink) when CreateSymbolicLink falls back to that distinction.
+    Delegates to ``switcher.links.link_dir``, which production code
+    also uses: symlink on POSIX, directory junction on Windows. Calling
+    ``Path.symlink_to`` directly would fail on Windows runners without
+    the symlink privilege, making the suite less portable than the
+    production code under test. Using the same helper also means the
+    Windows junction branch of ``_is_link`` (``os.path.isjunction``) is
+    exercised by every test in this file on Windows CI.
     """
-    src.symlink_to(dst, target_is_directory=sys.platform == "win32")
+    link_dir(dst, src)
 
 
 def test_complete_state_symlink_resolves_to_target(tmp_path: Path):
@@ -127,3 +135,21 @@ def test_classifier_pure_read_no_mutations(tmp_path: Path):
     classify_mapping(intent, profile_dir)
     snapshot_after = sorted(p.name for p in tmp_path.rglob("*"))
     assert snapshot_before == snapshot_after
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+def test_is_link_recognizes_directory_junction(tmp_path: Path):
+    """Pin the ``os.path.isjunction`` branch of ``_is_link``.
+
+    On Windows, ``link_dir`` creates a junction rather than a symlink
+    (no Developer Mode required), and ``Path.is_symlink`` returns False
+    for junctions. Without the ``isjunction`` branch, ``_is_link`` would
+    misclassify a perfectly valid production-shaped link as not-a-link,
+    cascading to AMBIGUOUS in the classifier. This test runs only on
+    Windows CI — POSIX has no equivalent reparse-point to construct.
+    """
+    target = tmp_path / "target"
+    target.mkdir()
+    junction = tmp_path / "junction"
+    link_dir(target, junction)
+    assert _is_link(junction) is True
