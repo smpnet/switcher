@@ -154,6 +154,82 @@ def test_invalid_original_kind_rejected():
         )
 
 
+def test_unknown_field_in_init_op_rejected():
+    """Schema drift in oplog.json must surface as ValidationError so
+    OpLogIO can map it to OpLogCorruptError. Silently discarding the
+    unknown field and proceeding on partial data would defeat the
+    journal's correctness role.
+    """
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "init",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": ["claude"],
+                "profile_name": "x",
+                "mappings": [],
+                "rogue_field": "drift",
+            }
+        )
+
+
+def test_unknown_field_in_mapping_intent_rejected():
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(
+            {
+                "tool_id": "claude",
+                "mapping_index": 0,
+                "live_path": "/home/u/.claude",
+                "profile_subdir": "claude",
+                "original_kind": "real-dir",
+                "rogue_field": "drift",
+            }
+        )
+
+
+def test_records_are_frozen():
+    """`frozen=True` enforces the documented immutability contract —
+    callers can't accidentally mutate a record between intent-write
+    and mark_completed.
+    """
+    intent = _MappingIntent(
+        tool_id="claude",
+        mapping_index=0,
+        live_path="/home/u/.claude",
+        profile_subdir="claude",
+        original_kind="real-dir",
+    )
+    op = _InitOp(
+        op="init",
+        started_at=_now(),
+        target_ids=["claude"],
+        profile_name="2026-05-12-current",
+        mappings=[intent],
+    )
+    with pytest.raises(ValidationError):
+        op.completed_at = _now()  # pyright: ignore[reportAttributeAccessIssue]
+    with pytest.raises(ValidationError):
+        intent.original_kind = "missing"  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_model_copy_produces_completed_record():
+    """The documented `model_copy(update=...)` path is how OpLogIO
+    transitions an in-flight record to completed without violating
+    frozen=True.
+    """
+    op = _InitOp(
+        op="init",
+        started_at=_now(),
+        target_ids=["claude"],
+        profile_name="2026-05-12-current",
+        mappings=[],
+    )
+    completed = op.model_copy(update={"completed_at": _now()})
+    assert op.completed_at is None
+    assert completed.completed_at == _now()
+    assert completed is not op
+
+
 def test_storage_path_round_trip_preserves_aliases_across_record_types():
     """The on-disk format is a JSON array, written via dump_records and
     read back via parse_records. Round-tripping through that path is

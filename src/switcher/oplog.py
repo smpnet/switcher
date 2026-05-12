@@ -4,7 +4,12 @@ Spec §2.1. Records carry intent (the op type, its targets, per-mapping
 original-state metadata for safe abort); compensation derives progress
 from disk on every pass via the §2.1.1 four-state classifier.
 
-Records are immutable from intent-write to mark_completed.
+Records are immutable: `frozen=True` on every model rejects in-place
+mutation, and `extra="forbid"` rejects unknown fields so schema drift
+surfaces as ValidationError (mapped to OpLogCorruptError by OpLogIO)
+rather than being silently discarded. Transitioning a record to
+"completed" therefore produces a fresh instance via `model_copy(
+update={"completed_at": ...})` instead of in-place assignment.
 """
 
 from __future__ import annotations
@@ -17,6 +22,11 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 class _MappingIntent(BaseModel):
     """Per-DirMapping original state — seed metadata for abort.
+
+    `frozen=True` enforces the module-level immutability contract;
+    `extra="forbid"` ensures schema drift surfaces as ValidationError
+    (which OpLogIO maps to OpLogCorruptError) rather than being
+    silently dropped.
 
     Captured at intent-write time, BEFORE any FS mutation. Tells abort
     how to undo move_or_seed_dir safely. None of these fields are
@@ -37,6 +47,7 @@ class _MappingIntent(BaseModel):
     diagnostic information.
     """
 
+    model_config = ConfigDict(frozen=True, extra="forbid")
     tool_id: str
     mapping_index: int
     live_path: str
@@ -45,13 +56,26 @@ class _MappingIntent(BaseModel):
 
 
 class _BaseOp(BaseModel):
-    """Shared shape for every op record. `populate_by_name=True` so
-    `_RenameOp.from_` accepts both `from` (JSON-side alias) and `from_`
-    (Python-side keyword). The `op` discriminator is declared on each
-    subclass as `Literal[...]` so basedpyright's invariant-override
-    check stays happy."""
+    """Shared shape for every op record.
 
-    model_config = ConfigDict(populate_by_name=True)
+    Config:
+    - `populate_by_name=True` so `_RenameOp.from_` accepts both `from`
+      (JSON-side alias) and `from_` (Python-side keyword).
+    - `frozen=True` enforces the module-level immutability contract.
+      Transitioning to "completed" uses `model_copy(update={...})`
+      to produce a new record rather than mutating in place.
+    - `extra="forbid"` surfaces schema drift in oplog.json as
+      ValidationError (mapped to OpLogCorruptError by OpLogIO) rather
+      than silently discarding unknown fields and proceeding on
+      partial data — that would defeat the journal's correctness role.
+
+    The `op` discriminator is declared on each subclass as
+    `Literal[...]` so basedpyright's invariant-override check stays
+    happy (declaring `op: str` here would conflict with the narrower
+    subclass overrides).
+    """
+
+    model_config = ConfigDict(populate_by_name=True, frozen=True, extra="forbid")
     started_at: datetime
     completed_at: datetime | None = None
 
