@@ -22,9 +22,19 @@ class _MappingIntent(BaseModel):
     how to undo move_or_seed_dir safely. None of these fields are
     consulted to decide what's "done" — only what's reversible and how.
 
-    Note: a "was_seeded" boolean is fully derivable from
-    `original_kind == "missing"` (init/rescan pre-flight reject "link"
-    and "file"; "real-dir" implies a move). Not stored separately.
+    A "was_seeded" boolean is fully derivable from
+    `original_kind == "missing"` ("real-dir" implies a move). Not stored
+    separately.
+
+    The `original_kind` literal includes `"link"` and `"file"` even
+    though init/rescan pre-flight reject both shapes at intent time
+    (so they should never be written to the log in normal operation).
+    They remain representable so the deserialized record can carry an
+    accurate post-hoc snapshot of pre-op state when external drift has
+    occurred between intent-write and abort; the abort-time classifier
+    then raises AbortPreflightError on either value rather than
+    guessing. Narrowing the literal would force abort to lose this
+    diagnostic information.
     """
 
     tool_id: str

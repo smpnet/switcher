@@ -13,7 +13,9 @@ from switcher.oplog import (
     _MappingIntent,
     _RenameOp,
     _RescanOp,
+    dump_records,
     parse_record,
+    parse_records,
 )
 
 
@@ -150,3 +152,61 @@ def test_invalid_original_kind_rejected():
             profile_subdir="claude",
             original_kind="hardlink",  # pyright: ignore[reportArgumentType]
         )
+
+
+def test_storage_path_round_trip_preserves_aliases_across_record_types():
+    """The on-disk format is a JSON array, written via dump_records and
+    read back via parse_records. Round-tripping through that path is
+    what catches alias loss on _RenameOp.from_, discriminator drift,
+    and any list-shape regressions.
+    """
+    intent = _MappingIntent(
+        tool_id="claude",
+        mapping_index=0,
+        live_path="/home/u/.claude",
+        profile_subdir="claude",
+        original_kind="real-dir",
+    )
+    records = [
+        _InitOp(
+            op="init",
+            started_at=_now(),
+            target_ids=["claude"],
+            profile_name="2026-05-12-current",
+            mappings=[intent],
+        ),
+        _RenameOp.model_validate(
+            {
+                "op": "rename",
+                "started_at": _now(),
+                "from": "experiment",
+                "to": "client-A",
+                "affected_ids": ["claude"],
+            }
+        ),
+        _RescanOp(
+            op="rescan",
+            started_at=_now(),
+            target_ids=["claude"],
+            target_profiles={"claude": "2026-05-12-rescan-1"},
+            into_mode=False,
+            previous_tools=None,
+            mappings=[intent],
+        ),
+    ]
+
+    blob = dump_records(records)
+    raw: list[dict[str, Any]] = json.loads(blob)
+    assert isinstance(raw, list)
+    # JSON-side alias survives the round trip in the rename entry.
+    rename_raw = next(r for r in raw if r["op"] == "rename")
+    assert rename_raw["from"] == "experiment"
+    assert "from_" not in rename_raw
+
+    restored = parse_records(raw)
+    assert len(restored) == 3
+    assert isinstance(restored[0], _InitOp)
+    assert isinstance(restored[1], _RenameOp)
+    assert isinstance(restored[2], _RescanOp)
+    assert restored[1].from_ == "experiment"
+    assert restored[0].mappings[0].original_kind == "real-dir"
