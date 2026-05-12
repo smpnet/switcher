@@ -14,9 +14,9 @@ update={"completed_at": ...})` instead of in-place assignment.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 
 class _MappingIntent(BaseModel):
@@ -59,7 +59,11 @@ class _BaseOp(BaseModel):
 
     Config:
     - `populate_by_name=True` so `_RenameOp.from_` accepts both `from`
-      (JSON-side alias) and `from_` (Python-side keyword).
+      (JSON-side alias) and `from_` (Python-side keyword) on input.
+    - `serialize_by_alias=True` so model_dump / model_dump_json default
+      to alias-style keys (`from`, not `from_`). The journal's on-disk
+      format uses aliases; making it the default removes the chance of
+      a future single-record write accidentally emitting `from_`.
     - `frozen=True` enforces the module-level immutability contract.
       Transitioning to "completed" uses `model_copy(update={...})`
       to produce a new record rather than mutating in place.
@@ -74,7 +78,12 @@ class _BaseOp(BaseModel):
     subclass overrides).
     """
 
-    model_config = ConfigDict(populate_by_name=True, frozen=True, extra="forbid")
+    model_config = ConfigDict(
+        populate_by_name=True,
+        serialize_by_alias=True,
+        frozen=True,
+        extra="forbid",
+    )
     # AwareDatetime rejects naive timestamps at validation time. A
     # recovery journal that accepted naive values would risk
     # cross-timezone ordering bugs: ts serialized on one host and
@@ -106,6 +115,23 @@ class _RescanOp(_BaseOp):
     previous_tools: dict[str, dict[str, bool]] | None = None
     mappings: list[_MappingIntent]
 
+    @model_validator(mode="after")
+    def _check_into_mode_previous_tools_coherence(self) -> Self:
+        """Reject schema-valid but semantically impossible combinations.
+
+        `--into <existing>` rescan snapshots the prior tool-set of the
+        target profile (so abort can restore it); fresh-mode rescan has
+        nothing to snapshot. Allowing `into_mode=True, previous_tools=None`
+        or `into_mode=False, previous_tools={...}` to slip into the
+        journal would push invariant checking into recovery code and
+        blur the line between corruption and a genuine interrupted op.
+        """
+        if self.into_mode and self.previous_tools is None:
+            raise ValueError("_RescanOp: into_mode=True requires previous_tools to be present")
+        if not self.into_mode and self.previous_tools is not None:
+            raise ValueError("_RescanOp: into_mode=False requires previous_tools to be None")
+        return self
+
 
 OpLogRecord = Annotated[
     _InitOp | _RenameOp | _RescanOp,
@@ -130,5 +156,10 @@ def parse_records(data: list[dict[str, Any]]) -> list[OpLogRecord]:
 
 
 def dump_records(records: list[OpLogRecord]) -> str:
-    """Serialize a list of op records to JSON (with alias-style keys)."""
-    return _records_adapter.dump_json(records, by_alias=True).decode("utf-8")
+    """Serialize a list of op records to JSON.
+
+    Alias-style keys (e.g. `from` rather than `from_`) come from the
+    model-level `serialize_by_alias=True` config; this helper does not
+    need to pass `by_alias=True` explicitly.
+    """
+    return _records_adapter.dump_json(records).decode("utf-8")

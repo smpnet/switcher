@@ -187,6 +187,59 @@ def test_unknown_field_in_mapping_intent_rejected():
         )
 
 
+def test_rescan_into_mode_true_without_previous_tools_rejected():
+    """into_mode=True snapshots the prior tool-set so abort can
+    restore it; missing previous_tools is a semantically impossible
+    record and must not be accepted into the journal.
+    """
+    with pytest.raises(ValidationError):
+        _RescanOp(
+            op="rescan",
+            started_at=_now(),
+            target_ids=["claude"],
+            target_profiles={"claude": "shared"},
+            into_mode=True,
+            previous_tools=None,
+            mappings=[],
+        )
+
+
+def test_rescan_into_mode_false_with_previous_tools_rejected():
+    """Fresh-mode rescan has nothing to snapshot; carrying
+    previous_tools alongside into_mode=False is semantically
+    impossible and must not be accepted.
+    """
+    with pytest.raises(ValidationError):
+        _RescanOp(
+            op="rescan",
+            started_at=_now(),
+            target_ids=["claude"],
+            target_profiles={"claude": "2026-05-12-rescan-1"},
+            into_mode=False,
+            previous_tools={"shared": {"claude": True}},
+            mappings=[],
+        )
+
+
+def test_single_record_dump_uses_aliases_by_default():
+    """serialize_by_alias=True at model level means a caller writing
+    one record (rather than going through dump_records) still emits
+    JSON-side aliases — `from`, not `from_`.
+    """
+    op = _RenameOp.model_validate(
+        {
+            "op": "rename",
+            "started_at": _now(),
+            "from": "experiment",
+            "to": "client-A",
+            "affected_ids": ["claude"],
+        }
+    )
+    parsed = json.loads(op.model_dump_json())
+    assert parsed["from"] == "experiment"
+    assert "from_" not in parsed
+
+
 def test_naive_started_at_rejected_for_every_record_type():
     """A recovery journal must use timezone-aware timestamps so that a
     record serialized on one host can't be misordered against aware
