@@ -9,10 +9,11 @@ description: >
 runs:
   using: composite
   steps:
-    # Pinned to immutable commit SHA (= tag v0.8.1) for supply-chain
+    # Pinned to immutable commit SHA (= tag v0.8.14) for supply-chain
     # hardening. Bump along with any other action audits during the
-    # v0.2.0 security review.
-    - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659  # v0.8.1
+    # next security review. Upstream has cut a v0.9 line; stay on v0.8.x
+    # until v0.9's setup contract changes have been audited.
+    - uses: prefix-dev/setup-pixi@8ca4608ef7f4daeb54f5205b20d0b7cb42f11143  # v0.8.14
       with:
         pixi-version: v0.66.0
         cache: true
