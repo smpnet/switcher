@@ -40,6 +40,12 @@ from pydantic import (
 # container.
 NonEmptyStr = Annotated[StrictStr, Field(min_length=1)]
 
+# Mapping indices reference position within a DirMapping list. A
+# negative index would silently resolve to the last element via Python's
+# list-indexing semantics — driving compensation against the wrong
+# mapping. Constrain to ge=0 so the journal never carries one.
+NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
+
 
 class _MappingIntent(BaseModel):
     """Per-DirMapping original state — seed metadata for abort.
@@ -83,7 +89,7 @@ class _MappingIntent(BaseModel):
     # ISO strings — JSON has no native datetime — and AwareDatetime is
     # itself strict about the tzinfo invariant.
     tool_id: NonEmptyStr
-    mapping_index: StrictInt
+    mapping_index: NonNegativeInt
     live_path: NonEmptyStr
     profile_subdir: NonEmptyStr
     original_kind: Literal["missing", "real-dir"]

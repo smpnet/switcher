@@ -210,6 +210,24 @@ def test_rename_op_rejects_empty_from_or_to():
         )
 
 
+def test_negative_mapping_index_rejected():
+    """mapping_index addresses a position in a DirMapping list. A
+    negative value would resolve to the last element via Python's
+    list-indexing semantics — driving compensation against the wrong
+    mapping. ge=0 keeps that out of the journal.
+    """
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(
+            {
+                "tool_id": "claude",
+                "mapping_index": -1,
+                "live_path": "/home/u/.claude",
+                "profile_subdir": "claude",
+                "original_kind": "real-dir",
+            }
+        )
+
+
 def test_mapping_index_str_not_coerced_to_int():
     """Pydantic's default int coercion would accept "0" → 0, which
     would let a hand-edited journal slip past the corruption boundary.
