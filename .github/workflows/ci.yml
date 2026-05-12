@@ -95,7 +95,7 @@ jobs:
 
   # Self-hosted Windows runner: provisioned-tool sanity check ONLY.
   #
-  # The hosted matrix above already runs the full CI aggregate on
+  # The hosted matrix above already runs `pixi run check` on
   # windows-latest, so duplicating it here would be expensive duplication.
   # What the self-hosted runner uniquely contributes is a real, stable
   # Windows account where Claude Code + Copilot CLI are actually installed
