@@ -72,8 +72,10 @@ def test_unmanage_dry_run_no_changes(tmp_home: Path, tmp_state: Path) -> None:
 
     # Still managed.
     assert "claude" in get_deps().store.get_active()
-    # Symlink still in place.
-    assert (tmp_home / ".claude").is_symlink()
+    # Symlink (POSIX) or junction (Windows) still in place — dry-run
+    # never touches the filesystem.
+    claude_path = tmp_home / ".claude"
+    assert claude_path.is_symlink() or (IS_WINDOWS and os.path.isjunction(claude_path))
 
 
 def test_unmanage_dry_run_labels_missing_live_temp_present_as_recover(

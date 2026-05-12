@@ -191,14 +191,26 @@ def test_discover_skips_broken_symlinks(tmp_state: Path, tmp_home: Path) -> None
     """A symlink at a canonical basename whose target is missing must not
     raise — the discovery walker has to absorb the missing-target case and
     skip the entry. Using a canonical basename (`.copilot`) so the basename
-    filter doesn't short-circuit before the resolve attempt."""
+    filter doesn't short-circuit before the resolve attempt.
+
+    Windows note: `_winapi.CreateJunction` requires the target to exist at
+    create time. Create a temp target, point the junction at it, then
+    delete the target — the junction is now "broken" (its stored target
+    no longer exists), which is the state we want to test.
+    """
     service = _make_service(tmp_state, tmp_home)
     profile_name = "broken"
     profile_dir = service._store.profile_dir(profile_name)
     (profile_dir / "copilot-config").mkdir(parents=True)
-    # Replace conftest-seeded ~/.copilot real dir with a broken symlink.
+    # Replace conftest-seeded ~/.copilot real dir with a broken link.
     broken = tmp_home / ".copilot"
-    _replace_with_symlink(broken, tmp_home / "does-not-exist")
+    if IS_WINDOWS:
+        target = tmp_home / "does-not-exist"
+        target.mkdir()
+        _replace_with_symlink(broken, target)
+        target.rmdir()
+    else:
+        _replace_with_symlink(broken, tmp_home / "does-not-exist")
 
     discovered = service._discover_live_paths_for_active("copilot", profile_name)
     # The target doesn't resolve into an owned subdir → filtered out, no exception.
