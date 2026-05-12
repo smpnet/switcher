@@ -89,6 +89,19 @@ def handle_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
         except SwitcherError as e:
             err_console.print(f"[red]error:[/] {e}")
             raise typer.Exit(code=1) from e
+        except (KeyboardInterrupt, EOFError) as e:
+            # Interactive prompts (init --interactive, bare rescan on TTY)
+            # call input() directly. Without this catch a Ctrl-C / closed
+            # stdin during the prompt bubbles out as a raw traceback.
+            # Exit cleanly BEFORE any service-level mutation runs (Hermes
+            # review): the prompt loops gather user choices and only call
+            # service.init / service.rescan after they return, so an
+            # interrupt during the prompt cannot have produced partial
+            # mutation. 130 = 128 + SIGINT, the conventional Unix exit
+            # code for "killed by SIGINT"; EOF gets the same exit since
+            # both are user-side aborts.
+            err_console.print("[yellow]aborted[/]")
+            raise typer.Exit(code=130) from e
 
     return wrapper
 
@@ -317,6 +330,19 @@ def init(
             # before reaching service.init(). (abby review)
             raise NothingToInitializeError(
                 "--skip excluded every registered tool; nothing left to initialize"
+            )
+        # Also catch the more common case (Hermes review): --skip excluded
+        # every DETECTED tool, even though target_ids still contains
+        # registered-but-not-installed tools. Without this branch the call
+        # falls through to service.init() and raises the generic
+        # "no requested tools are installed" — accurate for --only, but
+        # misleading for --skip. Surface the real cause here instead.
+        detected_ids = {t.id for t in deps.service.detect_installed()}
+        if not (set(target_ids) & detected_ids):
+            raise NothingToInitializeError(
+                f"--skip excluded every detected tool. Detected: "
+                f"{sorted(detected_ids) or '(none)'}; after skipping "
+                f"{sorted(ids)} nothing remains to initialize."
             )
         skipped_via_skip_flag = ids
     else:

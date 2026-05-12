@@ -223,3 +223,68 @@ def test_init_interactive_some_no_surfaces_skipped(
     assert "Captured: claude" in out
     assert "Skipped (via interactive): copilot" in out
     assert "switcher rescan --only copilot" in out
+
+
+def test_init_skip_excludes_every_detected_tool_errors(
+    tmp_home_no_copilot: Path, tmp_state: Path
+) -> None:
+    """Hermes review: when only some registered tools are installed, --skip
+    of those installed tools used to fall through to service.init's generic
+    'no requested tools are installed' error — accurate for --only but
+    misleading for --skip. The CLI now intersects `target_ids` with
+    detect_installed and surfaces a --skip-specific error before reaching
+    the service layer.
+
+    Repro: tmp_home_no_copilot has only claude installed. `init --skip claude`
+    builds target_ids=["copilot"] (registry minus skip), but copilot isn't
+    installed, so the intersection with detected is empty. The dedicated
+    'every detected tool' error fires.
+    """
+    result = runner.invoke(app, ["init", "--skip", "claude"])
+    assert result.exit_code != 0
+    out = _combined(result).lower()
+    assert "every detected tool" in out
+    # And the misleading --only-shaped message must NOT appear.
+    assert "requested tools are installed" not in out
+
+
+def test_init_interactive_keyboard_interrupt_exits_cleanly(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hermes review: Ctrl-C during the interactive prompt loop must exit
+    cleanly (non-zero, no traceback), NOT bubble up as a raw KeyboardInterrupt
+    traceback. The catch lives in handle_errors so it covers every command
+    that calls input() directly.
+    """
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
+
+    def raising_input(_prompt: str) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", raising_input)
+    result = runner.invoke(app, ["init", "--interactive"])
+    assert result.exit_code == 130, _combined(result)
+    # No raw traceback in the output.
+    assert "Traceback" not in _combined(result)
+    assert "aborted" in _combined(result).lower()
+    # Critical: no service-level mutation should have run — active map
+    # is still untouched (init never reached service.init).
+    from switcher.cli import get_deps
+
+    assert get_deps().store.get_active() == {}
+
+
+def test_init_interactive_eof_exits_cleanly(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EOFError counterpart of the Ctrl-C test: stdin closing during the
+    prompt also produces a clean exit, not a traceback."""
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
+
+    def raising_input(_prompt: str) -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", raising_input)
+    result = runner.invoke(app, ["init", "--interactive"])
+    assert result.exit_code == 130, _combined(result)
+    assert "Traceback" not in _combined(result)

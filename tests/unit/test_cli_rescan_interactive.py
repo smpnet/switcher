@@ -144,6 +144,29 @@ def test_rescan_into_with_dry_run_no_mutation(tmp_home: Path, tmp_state: Path) -
     assert "claude" not in get_deps().store.get_active()
 
 
+def test_rescan_keyboard_interrupt_during_prompt_exits_cleanly(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hermes review: Ctrl-C during bare-rescan's per-tool prompt must
+    exit cleanly. Without the handle_errors KeyboardInterrupt branch, the
+    raw traceback would surface to the user.
+    """
+    _setup_init_only_copilot()
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
+
+    def raising_input(_prompt: str) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", raising_input)
+    result = runner.invoke(app, ["rescan"])
+    assert result.exit_code == 130, result.output
+    assert "Traceback" not in result.output
+    out = (result.output + (result.stderr or "")).lower()
+    assert "aborted" in out
+    # No mutation: claude was unmanaged before, still not in active.
+    assert "claude" not in get_deps().store.get_active()
+
+
 def test_rescan_pre_init_fails_before_prompt_or_warning(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
