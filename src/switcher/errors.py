@@ -92,3 +92,37 @@ class NoToolsManagedError(SwitcherError):
     The state is valid (after `unmanage` of the last tool, or after
     `uninstall` without purge), but these mutating commands have no work
     to do; better to fail loud than create empty profiles silently."""
+
+
+class OpLogCorruptError(SwitcherError):
+    """Raised when oplog.json is unreadable: malformed JSON, empty file,
+    fails Pydantic validation, or describes an in-flight op whose disk
+    state is unrecognizable. Manual recovery required."""
+
+
+class InitInProgressError(SwitcherError):
+    """Raised when a mutating command runs while an interrupted init is
+    detected in the op-log. The CLI handler surfaces the recovery hint
+    (run `switcher init --continue` or `switcher init --abort`)."""
+
+
+class RescanInProgressError(SwitcherError):
+    """Same shape as InitInProgressError, for an interrupted rescan."""
+
+
+class NoInProgressInitError(SwitcherError):
+    """Raised when `switcher init --continue` or `--abort` is invoked
+    but no in-flight `_InitOp` record is present. Distinct from
+    StateAlreadyInitializedError (the latter means init already
+    finished cleanly)."""
+
+
+class NoInProgressRescanError(SwitcherError):
+    """Same shape as NoInProgressInitError, for rescan."""
+
+
+class AbortPreflightError(SwitcherError):
+    """Raised by op-log abort when a mapping's pre-op state was a link
+    or file (which init/rescan pre-flight rejects). Reaching this state
+    at abort time means external drift since intent-write; refuse
+    defensively rather than guess."""
