@@ -72,18 +72,6 @@ def now() -> datetime:
 #
 # Parents to scan for symlinks during legacy migration, in addition to the
 # current registry's config-dir parents. Hardcoded because a registry-only
-# derivation can't recover live paths whose parent isn't mentioned by the
-# post-rewrite registry (e.g., ~/.config/github-copilot after the v0.1.4
-# Copilot builtin rewrite).
-_LEGACY_PARENT_DIRS_POSIX: tuple[str, ...] = (
-    "~",
-    "~/.config",
-)
-_LEGACY_PARENT_DIRS_WINDOWS: tuple[str, ...] = (
-    "%USERPROFILE%",
-    "%LOCALAPPDATA%",
-)
-
 # Per-tool historical profile_subdir names: subdir names a given tool's
 # profile dir may legitimately contain across switcher versions. Union of
 # (current registry) + (historical) gives the expected-subdir set for
@@ -93,15 +81,27 @@ _HISTORICAL_PROFILE_SUBDIRS: dict[str, frozenset[str]] = {
     # claude has always used "claude" — no historical drift to record.
 }
 
-# Per-tool historical live-path basenames: the leaf names a tool's live path
-# may have used across switcher versions. Union of (current registry) +
-# (historical) gives the canonical-basename set discovery requires before
-# capturing a symlink — without this, any user-created symlink resolving
-# into an owned profile subdir (e.g., `~/copilot-backup`) would be falsely
-# classified as managed and later mutated by uninstall.
-_HISTORICAL_LIVE_PATH_BASENAMES: dict[str, frozenset[str]] = {
-    "copilot": frozenset({"github-copilot"}),
-    # claude has always lived at ~/.claude (or %USERPROFILE%\.claude).
+# Per-tool historical FULL live-path templates: exact paths (env-expanded
+# at lookup time) a tool's live config dir may have occupied in prior
+# switcher versions. Union of (current registry tool_dirs) + (historical
+# templates) gives the EXACT set of paths discovery considers — NEVER a
+# parent-x-basename cross-product, which historically allowed phantom
+# combinations like `~/github-copilot` (parent ~, basename github-copilot)
+# to be falsely classified as managed and later mutated by uninstall
+# (Hermes / CodeRabbit blocker post-PR-#5).
+#
+# Add a new tool by adding the actual on-disk path strings it has used,
+# per platform. Use POSIX-style strings on POSIX (resolver.expand handles
+# `~`) and Windows %VAR%\path strings on Windows (resolver.expand handles
+# env vars). Don't reuse current registry paths here — those come from
+# the registry directly.
+_HISTORICAL_LIVE_PATHS_POSIX: dict[str, frozenset[str]] = {
+    "copilot": frozenset({"~/.config/github-copilot"}),
+    # claude has always lived at ~/.claude.
+}
+_HISTORICAL_LIVE_PATHS_WINDOWS: dict[str, frozenset[str]] = {
+    "copilot": frozenset({"%LOCALAPPDATA%\\github-copilot"}),
+    # claude has always lived at %USERPROFILE%\.claude.
 }
 
 
@@ -293,44 +293,40 @@ class ProfileService:
         historical = _HISTORICAL_PROFILE_SUBDIRS.get(tool_id, frozenset())
         return current | historical
 
-    def _candidate_live_basenames_for(self, tool_id: str) -> frozenset[str]:
-        """Live-path leaf names this tool may legitimately own on disk.
+    def _candidate_live_paths_for(self, tool_id: str) -> set[Path]:
+        """EXACT live paths this tool may legitimately own on disk.
 
-        Union of (a) basenames of the tool's current registry config_dirs
-        and (b) hardcoded historical basenames from prior switcher versions.
-        Used by FS-truth discovery to reject user-created symlinks that
-        happen to resolve into an owned profile subdir but were never
-        managed by switcher (e.g., a `~/copilot-backup` alias).
+        Union of (a) the tool's current registry tool_dirs and (b) historical
+        full-path templates expanded through the resolver. Returns concrete
+        Path objects — NOT a (parents x basenames) cross-product.
+
+        The cross-product approach the v0.1.4 RC originally shipped allowed
+        phantom paths like `~/github-copilot` (parent ~ from registry,
+        basename github-copilot from history) to be classified as managed.
+        Hermes / CodeRabbit flagged that as a destructive-false-positive
+        path: a user-created symlink at one of those phantom paths whose
+        target happened to resolve into an owned profile subdir would be
+        recorded in active_live_paths and later mutated by uninstall.
+
+        Switching to exact paths eliminates that class of false positive
+        entirely while preserving legacy migration coverage — the
+        historical paths still come along, just as concrete entries
+        instead of as (parent, basename) factors.
         """
-        tool = find_tool(self._registry, tool_id)
-        current: frozenset[str] = (
-            frozenset(self._resolver.tool_dir(tool, i).name for i in range(len(tool.config_dirs)))
-            if tool is not None
-            else frozenset()
-        )
-        historical = _HISTORICAL_LIVE_PATH_BASENAMES.get(tool_id, frozenset())
-        return current | historical
-
-    def _candidate_parents_for(self, tool_id: str) -> list[Path]:
-        """Parent directories to scan during FS-truth migration discovery.
-
-        Union of (a) parents of the tool's current registry config_dirs and
-        (b) hardcoded legacy parent dirs. The legacy set rescues paths the
-        post-rewrite registry no longer mentions (e.g., ~/.config/github-
-        copilot after the v0.1.4 Copilot single-dir rewrite).
-        """
-        parents: set[Path] = set()
+        paths: set[Path] = set()
         tool = find_tool(self._registry, tool_id)
         if tool is not None:
             for i in range(len(tool.config_dirs)):
-                parents.add(self._resolver.tool_dir(tool, i).parent)
-        legacy_raw = _LEGACY_PARENT_DIRS_WINDOWS if IS_WINDOWS else _LEGACY_PARENT_DIRS_POSIX
-        for raw in legacy_raw:
-            # Expand env vars on Windows (%USERPROFILE%, %LOCALAPPDATA%),
-            # then expand ~ against the resolver's configured home so
-            # tests with injected home dirs work correctly.
-            parents.add(self._resolver.expand(raw))
-        return sorted(parents)
+                paths.add(self._resolver.tool_dir(tool, i))
+        historical_raw = (
+            _HISTORICAL_LIVE_PATHS_WINDOWS if IS_WINDOWS else _HISTORICAL_LIVE_PATHS_POSIX
+        )
+        for raw in historical_raw.get(tool_id, frozenset()):
+            # resolver.expand handles `~` (POSIX) and %ENV% (Windows) and
+            # routes ~ against the resolver's configured home so injected
+            # tmp_home in tests works correctly.
+            paths.add(self._resolver.expand(raw))
+        return paths
 
     def _discover_live_paths_for_active(self, tool_id: str, profile_name: str) -> list[str]:
         """Walk the FS for symlinks resolving into this tool's owned subdirs.
@@ -338,6 +334,14 @@ class ProfileService:
         Trusts the filesystem over the registry. Used during legacy migration
         when active_live_paths is unpopulated (spec §4.2). The per-tool subdir
         map prevents misattribution in multi-tool profiles.
+
+        Each candidate path comes from either (a) the current registry's
+        tool_dirs or (b) the historical exact-path table — never a
+        cross-product. The path must (a) exist as a link, (b) resolve into
+        an owned profile subdir for THIS tool. User-created symlinks at
+        unrelated paths (`~/copilot-backup`) and at phantom cross-product
+        paths (`~/github-copilot` after the v0.1.4 builtin rewrite) are
+        both excluded by construction.
 
         Returns the discovered live paths as string-form absolute paths.
         Empty list means "no symlinks resolve into a subdir this tool owns";
@@ -352,14 +356,6 @@ class ProfileService:
         if not expected_subdirs:
             return []
 
-        # Hermes round-1: capture must be gated on canonical leaf names as
-        # well as resolved target. Otherwise an unrelated `~/copilot-backup
-        # -> <profile>/copilot-config` alias gets recorded and later mutated
-        # by uninstall — a destructive false positive.
-        expected_basenames = self._candidate_live_basenames_for(tool_id)
-        if not expected_basenames:
-            return []
-
         # Resolve only those expected subdirs that actually exist on disk;
         # non-existent ones can't be the target of any symlink anyway.
         owned_targets: set[Path] = set()
@@ -371,28 +367,17 @@ class ProfileService:
             return []
 
         discovered: list[Path] = []
-        for parent in self._candidate_parents_for(tool_id):
-            if not parent.is_dir():
+        for live in self._candidate_live_paths_for(tool_id):
+            if not self._resolver.is_link(live):
+                # Real dir, regular file, or absent — not a managed link.
                 continue
             try:
-                children = list(parent.iterdir())
-            except OSError:
-                # Unreadable candidate parent (PermissionError, etc.) — skip
-                # this parent and continue with the remaining candidates so
-                # one restrictive directory doesn't sink the whole migration.
+                resolved = live.resolve()
+            except (OSError, RuntimeError):
+                # Broken/dangling/cyclic link — skip silently.
                 continue
-            for child in children:
-                if child.name not in expected_basenames:
-                    continue
-                if not self._resolver.is_link(child):
-                    continue
-                try:
-                    resolved = child.resolve()
-                except (OSError, RuntimeError):
-                    # Broken/dangling/cyclic symlink — skip silently.
-                    continue
-                if resolved in owned_targets:
-                    discovered.append(child)
+            if resolved in owned_targets:
+                discovered.append(live)
         # Deterministic order: cached + warnings should be platform-stable.
         return sorted(str(p) for p in discovered)
 

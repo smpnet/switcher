@@ -74,32 +74,74 @@ def test_expected_subdirs_for_unknown_tool_falls_back_to_empty(
 
 
 @pytest.mark.skipif(
-    IS_WINDOWS, reason="POSIX-specific legacy parent (~/.config); Windows uses %LOCALAPPDATA%"
+    IS_WINDOWS,
+    reason="POSIX historical path (~/.config/github-copilot); Windows uses %LOCALAPPDATA%",
 )
-def test_candidate_parents_for_copilot_includes_legacy_config(
+def test_candidate_live_paths_for_copilot_is_current_plus_historical(
     tmp_state: Path, tmp_home: Path
 ) -> None:
+    """Replaces the v0.1.4-RC parent-x-basename cross-product. The new model
+    returns EXACT candidate paths: current registry tool_dirs union historical
+    full-path templates. Phantom paths like ~/github-copilot are not
+    members of either set and never get scanned."""
     service = _make_service(tmp_state, tmp_home)
-    parents = service._candidate_parents_for("copilot")
-    # The legacy POSIX set adds '~/.config' (= tmp_home/.config); the
-    # current registry adds tmp_home (parent of ~/.copilot). Both must
-    # be present so the legacy github-copilot orphan can be rescued.
-    resolved = {p.resolve() for p in parents}
-    assert tmp_home.resolve() in resolved
-    assert (tmp_home / ".config").resolve() in resolved
+    paths = {p.resolve() for p in service._candidate_live_paths_for("copilot")}
+    # Current registry path:
+    assert (tmp_home / ".copilot").resolve() in paths
+    # Historical legacy gh-copilot path:
+    assert (tmp_home / ".config" / "github-copilot").resolve() in paths
+    # Phantom cross-product paths must NOT be candidates (Hermes blocker).
+    assert (tmp_home / "github-copilot").resolve() not in paths
+    assert (tmp_home / ".config" / ".copilot").resolve() not in paths
 
 
-@pytest.mark.skipif(
-    IS_WINDOWS, reason="POSIX-specific legacy parent (~/.config); Windows uses %LOCALAPPDATA%"
-)
-def test_candidate_parents_for_unknown_tool_uses_legacy_only(
+def test_candidate_live_paths_for_unknown_tool_is_empty(tmp_state: Path, tmp_home: Path) -> None:
+    """Unknown tool: no current registry entry and no historical entry
+    → no candidate paths to scan. Discovery returns empty.
+
+    The old _candidate_parents_for swept the legacy parents for ANY
+    unknown tool, which combined with basename filtering was the
+    ingredient that made the cross-product attack possible."""
+    service = _make_service(tmp_state, tmp_home)
+    paths = service._candidate_live_paths_for("nonexistent")
+    assert paths == set()
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="POSIX historical path; Windows uses %LOCALAPPDATA%")
+def test_discover_does_not_capture_phantom_cross_product_paths(
     tmp_state: Path, tmp_home: Path
 ) -> None:
+    """Hermes blocker (post-PR review): a user-created symlink at one of
+    the phantom (parent x basename) paths whose target resolves into an
+    owned profile subdir must NOT be classified as managed. The
+    pre-fix v0.1.4-RC code would have captured both of these via the
+    cross-product of `{~, ~/.config}` x `{.copilot, github-copilot}`.
+    """
     service = _make_service(tmp_state, tmp_home)
-    parents = service._candidate_parents_for("nonexistent")
-    # No registry entry → only legacy parents (e.g., ~/.config on POSIX).
-    resolved = {p.resolve() for p in parents}
-    assert (tmp_home / ".config").resolve() in resolved
+    profile_name = "phantom-attack"
+    profile_dir = service._store.profile_dir(profile_name)
+    (profile_dir / "copilot-config").mkdir(parents=True)
+
+    # Phantom path #1: parent=~, basename=github-copilot. Real config dir
+    # was never here (the historical legacy path was ~/.config/github-copilot,
+    # not ~/github-copilot).
+    phantom_one = tmp_home / "github-copilot"
+    _replace_with_symlink(phantom_one, profile_dir / "copilot-config")
+
+    # Phantom path #2: parent=~/.config, basename=.copilot. Real current
+    # path is ~/.copilot, NOT ~/.config/.copilot.
+    config_dir = tmp_home / ".config"
+    config_dir.mkdir(exist_ok=True)
+    phantom_two = config_dir / ".copilot"
+    _replace_with_symlink(phantom_two, profile_dir / "copilot-config")
+
+    discovered = service._discover_live_paths_for_active("copilot", profile_name)
+    assert str(phantom_one) not in discovered, (
+        f"phantom path {phantom_one} was incorrectly classified as managed"
+    )
+    assert str(phantom_two) not in discovered, (
+        f"phantom path {phantom_two} was incorrectly classified as managed"
+    )
 
 
 def test_discover_empty_profile_dir_returns_empty(tmp_state: Path, tmp_home: Path) -> None:

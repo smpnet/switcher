@@ -1,20 +1,26 @@
 # pyright: reportPrivateUsage=none
-"""Sentinel: every builtin TOML's profile_subdir + live-path basename is
-represented in the historical-metadata tables in `switcher.service`.
+"""Sentinel: builtin TOMLs and historical-metadata tables stay in sync.
 
-Why: the v0.1.4 FS-truth migration (spec §4) reads
-`_HISTORICAL_PROFILE_SUBDIRS` and `_HISTORICAL_LIVE_PATH_BASENAMES` as
-the source of truth for "what subdirs / basenames a tool's data may
-legitimately occupy on disk across switcher versions." A future commit
-that rewrites a builtin TOML to use a new path or subdir name without
-also updating the historical tables would silently break migration for
-upgrading users — the new path/subdir wouldn't be recognized as
-candidate profile content, so legacy data would be orphaned.
+Why: the v0.1.4 FS-truth migration (spec §4, post-PR Hermes blocker fix)
+reads three per-tool tables in `switcher.service`:
 
-This test enforces the contributor invariant: changing a builtin TOML's
-config_dirs requires also updating the historical tables. Adding a new
-builtin tool requires adding entries (or an explicit empty frozenset for
-tools with no historical drift, like claude).
+- `_HISTORICAL_PROFILE_SUBDIRS` — subdir names a tool's profile dir may
+  contain across switcher versions (current registry union history).
+- `_HISTORICAL_LIVE_PATHS_POSIX` / `_HISTORICAL_LIVE_PATHS_WINDOWS` —
+  EXACT historical full-path templates per tool, per platform.
+
+A future commit that rewrites a builtin TOML to use a new path or subdir
+name without also updating the relevant table would silently break
+migration for upgrading users — the new path/subdir wouldn't be
+recognized as candidate profile content, so legacy data would be
+orphaned.
+
+This test enforces two contributor invariants:
+1. Every current builtin profile_subdir is represented in the
+   _HISTORICAL_PROFILE_SUBDIRS table.
+2. Every entry in the historical full-path tables is structurally valid
+   AND distinct from the tool's current registry paths (so we don't
+   accidentally duplicate-discover the same live path).
 """
 
 from __future__ import annotations
@@ -25,9 +31,11 @@ from pathlib import Path
 import pytest
 
 from switcher.models import Tool
+from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry
 from switcher.service import (
-    _HISTORICAL_LIVE_PATH_BASENAMES,
+    _HISTORICAL_LIVE_PATHS_POSIX,
+    _HISTORICAL_LIVE_PATHS_WINDOWS,
     _HISTORICAL_PROFILE_SUBDIRS,
 )
 
@@ -71,36 +79,48 @@ def test_every_builtin_profile_subdir_is_in_historical_table(
         )
 
 
-def test_every_builtin_live_path_basename_is_in_historical_table(
-    builtins_only_registry: Sequence[Tool],
+def test_historical_live_paths_are_well_formed_and_distinct_from_current(
+    builtins_only_registry: Sequence[Tool], tmp_path: Path
 ) -> None:
-    """For each builtin tool, every live-path basename (POSIX and Windows)
-    must be in _HISTORICAL_LIVE_PATH_BASENAMES[tool.id]. Renaming a live
-    path's leaf without updating the table fails this test."""
-    for tool in builtins_only_registry:
-        historical = _HISTORICAL_LIVE_PATH_BASENAMES.get(tool.id)
-        # Strip the leading dot from POSIX hidden dirs to compare canonically
-        # — the historical table stores leaf names without the dot prefix
-        # (e.g. "github-copilot" not ".config/github-copilot").
-        current_basenames: set[str] = set()
-        for dm in tool.config_dirs:
-            for raw in (dm.posix_path, dm.windows_path):
-                leaf = raw.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-                current_basenames.add(leaf.lstrip("."))
-        if historical is None:
-            # Trivial single-basename case: the basename equals the tool id
-            # (post-dot-strip). Anything richer must opt in.
-            assert current_basenames == {tool.id}, (
-                f"builtin {tool.id!r} has live-path basenames "
-                f"{sorted(current_basenames)} but no "
-                f"_HISTORICAL_LIVE_PATH_BASENAMES entry. Add one so future "
-                f"builtin rewrites surface here."
+    """For each entry in the per-platform historical-paths tables, verify:
+       (a) The path expands cleanly via the resolver (no missing %VAR% or
+           leftover ~).
+       (b) The expanded path is NOT equal to any current registry path
+           for the same tool — historical entries should be GENUINELY
+           historical, not duplicate the current builtin.
+
+    Catches a contributor accidentally either (a) using a syntactically
+    invalid template, or (b) leaving stale entries in the historical
+    table after rotating a builtin's path through it.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    resolver = PathResolver(home=home)
+    historical_table = (
+        _HISTORICAL_LIVE_PATHS_WINDOWS if IS_WINDOWS else _HISTORICAL_LIVE_PATHS_POSIX
+    )
+
+    by_id = {tool.id: tool for tool in builtins_only_registry}
+    for tool_id, raw_paths in historical_table.items():
+        tool = by_id.get(tool_id)
+        current_paths: set[Path] = set()
+        if tool is not None:
+            for i in range(len(tool.config_dirs)):
+                current_paths.add(resolver.tool_dir(tool, i))
+        for raw in raw_paths:
+            expanded = resolver.expand(raw)
+            # Resolver shouldn't leave %VAR% or ~ in place. (Path.expand on
+            # an unresolved env-var template returns the literal string.)
+            assert "%" not in str(expanded), (
+                f"historical entry {raw!r} for tool {tool_id!r} contains an "
+                f"unexpanded %VAR%. Fix the template or add the missing env."
             )
-            continue
-        missing = current_basenames - historical - {tool.id}
-        assert not missing, (
-            f"builtin {tool.id!r} has live-path basename(s) {sorted(missing)} "
-            f"not in _HISTORICAL_LIVE_PATH_BASENAMES[{tool.id!r}]="
-            f"{sorted(historical)}. Update the table in src/switcher/service.py "
-            f"so legacy live paths are still recognized as canonical."
-        )
+            assert "~" not in str(expanded), (
+                f"historical entry {raw!r} for tool {tool_id!r} contains an unresolved '~'."
+            )
+            assert expanded not in current_paths, (
+                f"historical entry {raw!r} for tool {tool_id!r} resolves to "
+                f"{expanded}, which is also a current registry path. "
+                f"Drop the duplicate from the historical table — current "
+                f"paths come from the registry automatically."
+            )
