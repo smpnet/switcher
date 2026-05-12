@@ -174,6 +174,38 @@ def test_unknown_field_in_init_op_rejected():
         )
 
 
+def test_unknown_field_in_rename_op_rejected():
+    """Symmetric coverage with _InitOp — rejecting unknown fields is a
+    journal-wide safety property, not init-only."""
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rename",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "from": "a",
+                "to": "b",
+                "affected_ids": [],
+                "rogue_field": "drift",
+            }
+        )
+
+
+def test_unknown_field_in_rescan_op_rejected():
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rescan",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": [],
+                "target_profiles": {},
+                "into_mode": False,
+                "previous_tools": None,
+                "mappings": [],
+                "rogue_field": "drift",
+            }
+        )
+
+
 def test_unknown_field_in_mapping_intent_rejected():
     with pytest.raises(ValidationError):
         _MappingIntent.model_validate(
