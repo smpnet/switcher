@@ -19,9 +19,8 @@ pixi install
 # 4. Run the local gate before pushing.
 pixi run check
 
-# 5. Push and open a PR.
+# 5. Push, then open a PR — via the GitHub web UI or `gh pr create`.
 git push -u origin <your-branch>
-gh pr create
 ```
 
 `pixi run check` is the only required local gate. Everything else
@@ -163,7 +162,7 @@ Examples from this repo:
 Branch naming: `feat/<topic>` for features, `fix/<topic>` for
 bugfixes. Stable releases use `vX.Y.Z` tags (see Release flow).
 
-**Don't add `Co-Authored-By:` lines to commits** — global standard.
+**Don't add `Co-Authored-By:` lines to commits** — repo convention.
 
 ## Adding a built-in tool
 
