@@ -430,6 +430,11 @@ def _is_link(path: Path) -> bool:
     falls back to "link-like" semantics when the user lacks the symlink
     privilege. Without this check, a junction-rooted live_path would
     classify as AMBIGUOUS even when it correctly resolves to target.
+
+    `os.path.isjunction` was added in Python 3.12 and is always present
+    under this project's `requires-python = ">=3.13"`; `paths.py` and
+    `service.py` use it the same way. A hasattr guard would be
+    redundant with the supported Python contract.
     """
     if path.is_symlink():
         return True
@@ -529,12 +534,14 @@ class OpLogIO:
     """Thin façade over ``<state_dir>/oplog.json``.
 
     Every write goes through ``_write_records`` (tmp + ``Path.replace``)
-    so a crash mid-write cannot tear the file. Empty / malformed /
-    schema-mismatched payloads surface as :class:`OpLogCorruptError`
-    rather than being silently recovered — an atomic write never
-    produces an empty file, so an empty oplog.json on disk means
-    something external interfered, and a silent fallback would mask
-    real corruption.
+    so a process crash mid-write cannot tear the file — observers see
+    either the old contents or the new ones, never a partial write.
+    See ``_write_records`` for the precise atomicity vs. durability
+    contract. Empty / malformed / schema-mismatched payloads surface as
+    :class:`OpLogCorruptError` rather than being silently recovered —
+    a tmp-then-rename write never produces an empty file, so an empty
+    oplog.json on disk means something external interfered, and a
+    silent fallback would mask real corruption.
 
     Single-in-flight invariant: at most one record on disk has
     ``completed_at is None``. ``append_record`` refuses to add an
@@ -688,7 +695,21 @@ class OpLogIO:
             self._write_records(kept)
 
     def _write_records(self, records: list[OpLogRecord]) -> None:
-        """Atomic write: serialize, write to ``<path>.tmp``, ``Path.replace``.
+        """Tmp-then-rename write: prevent torn JSON, not power-loss durability.
+
+        The guarantee is "no observer ever sees a partially-written
+        oplog.json": a process crash mid-write leaves the old file
+        atomically intact and the tmp file as harmless garbage. This is
+        the right scope for the spec — recovery targets SIGKILL-style
+        interruption of the CLI, not a kernel crash or power loss
+        between the write and a subsequent fsync.
+
+        It does NOT guarantee durability across a sudden host crash or
+        power loss. Without an fsync on the tmp file (and the parent
+        directory), a kernel-level event between write completion and
+        the on-disk commit can lose the most recent record. Callers
+        that need that level of durability are out of scope for the
+        single-user recovery journal.
 
         Creates the parent directory if missing — on first-ever
         ``switcher init``, the op-log intent record is written BEFORE
@@ -696,9 +717,9 @@ class OpLogIO:
         may not exist yet. ``mkdir(parents=True, exist_ok=True)`` is
         idempotent and safe to call on every write.
 
-        Path.replace is atomic on POSIX and Windows for same-filesystem
-        renames; the tmp file shares the parent dir, so the rename never
-        crosses filesystems.
+        ``Path.replace`` is atomic on POSIX and Windows for
+        same-filesystem renames; the tmp file shares the parent dir, so
+        the rename never crosses filesystems.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = dump_records(records)
