@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 from switcher.cli import app
 from switcher.paths import IS_WINDOWS
-from switcher.service import _temp_dir_for_uninstall
+from switcher.service import ProfileService, _temp_dir_for_uninstall
 
 runner = CliRunner()
 
@@ -118,6 +118,130 @@ def test_unmanage_dry_run_labels_missing_live_temp_present_as_recover(
     assert re.search(r"would\s+recover", out, flags=re.IGNORECASE), out
     # "no-op" must NOT appear for this mapping — that's the unsafe wording.
     assert "no-op" not in out.lower()
+
+
+def _orphan_copilot_service(
+    tmp_state: Path, tmp_home: Path
+) -> tuple[ProfileService, ProfileService, str]:
+    """Helper used by the orphan-no-cache + --force tests below.
+
+    Returns (full_service, orphan_service, profile_name) where:
+      - full_service has the unmodified registry (used for `init`).
+      - orphan_service has copilot REMOVED from its registry — copilot
+        is now an orphan from this service's POV.
+      - cache for copilot has been stripped to satisfy the
+        orphan-no-cache precondition.
+    """
+    from switcher.paths import PathResolver
+    from switcher.registry import build_registry
+    from switcher.store import FileProfileStore
+
+    full_registry = build_registry(tmp_state / "registry.d")
+    full = ProfileService(
+        FileProfileStore(tmp_state),
+        PathResolver(home=tmp_home),
+        full_registry,
+    )
+    full.init()
+    active = full._store.get_active()
+    assert "copilot" in active
+    profile_name = active["copilot"]
+
+    no_copilot = tuple(t for t in full_registry if t.id != "copilot")
+    orphan = ProfileService(
+        FileProfileStore(tmp_state),
+        PathResolver(home=tmp_home),
+        no_copilot,
+    )
+    cache = orphan._store.get_active_live_paths()
+    new_cache = {k: v for k, v in cache.items() if k != "copilot"}
+    orphan._store.set_active_state(active, new_cache)
+    return full, orphan, profile_name
+
+
+def test_unmanage_force_refuses_when_orphan_has_owned_subdir_in_profile(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes blocker (most realistic shape): `unmanage --force` on
+    orphan-no-cache used to drop the active entry even when the tool
+    still had data inside owned profile subdirs. A subsequent
+    `uninstall --purge` then silently destroyed the data — the tool
+    was no longer in `active`, so its purge-time guard never fired.
+
+    The fix refuses the drop when any historical/current owned subdir
+    for the tool exists in the profile dir. The user's escape: restore
+    the registry TOML, then `unmanage` cleans up properly.
+    """
+    import pytest as _pytest
+
+    from switcher.errors import UninstallPreflightError
+
+    _full, orphan, profile_name = _orphan_copilot_service(tmp_state, tmp_home)
+    profile_dir = orphan._store.profile_dir(profile_name)
+    # init populated copilot-config; that owned subdir is exactly what we're
+    # protecting from a later `uninstall --purge` data loss.
+    assert (profile_dir / "copilot-config").is_dir()
+
+    with _pytest.raises(UninstallPreflightError, match="still has profile data"):
+        orphan.unmanage("copilot", force=True)
+    # active map unchanged — the refusal preserves the purge guard.
+    assert "copilot" in orphan._store.get_active()
+
+
+def test_unmanage_force_succeeds_when_orphan_has_no_on_disk_presence(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """Counterpart to the blocker test: when nothing on disk is at risk
+    (no owned subdir in profile, no discoverable symlink), --force is
+    the documented escape hatch and should still succeed.
+    """
+    _full, orphan, profile_name = _orphan_copilot_service(tmp_state, tmp_home)
+    profile_dir = orphan._store.profile_dir(profile_name)
+    # Remove the owned subdir so the new owned-subdir refusal doesn't fire.
+    shutil.rmtree(profile_dir / "copilot-config")
+    # And remove the live symlink at ~/.copilot so derive-on-read can't
+    # populate cache — keeps the orphan-no-cache branch reachable.
+    copilot_link = tmp_home / ".copilot"
+    if copilot_link.is_symlink():
+        copilot_link.unlink()
+    elif copilot_link.is_dir():
+        shutil.rmtree(copilot_link)
+
+    report = orphan.unmanage("copilot", force=True)
+    assert report.skipped_orphan is True
+    assert "copilot" not in orphan._store.get_active()
+
+
+def test_unmanage_force_succeeds_for_truly_unknown_orphan_tool(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """A tool id that was never in the registry AND has no historical
+    metadata can still be force-skipped — switcher has no on-disk
+    presence to defend. (Pre-fix behavior preserved for the case where
+    the safety check has nothing to find.)
+    """
+    from switcher.paths import PathResolver
+    from switcher.registry import build_registry
+    from switcher.service import ProfileService
+    from switcher.store import FileProfileStore
+
+    full_registry = build_registry(tmp_state / "registry.d")
+    service = ProfileService(
+        FileProfileStore(tmp_state),
+        PathResolver(home=tmp_home),
+        full_registry,
+    )
+    service.init()
+    active = service._store.get_active()
+    new_active = dict(active)
+    new_active["fake_orphan_tool"] = next(iter(active.values()))
+    cache = service._store.get_active_live_paths()
+    service._store.set_active_state(new_active, dict(cache))
+
+    # Discovery + owned-subdir checks both return empty for an unknown id.
+    report = service.unmanage("fake_orphan_tool", force=True)
+    assert report.skipped_orphan is True
+    assert "fake_orphan_tool" not in service._store.get_active()
 
 
 def test_unmanage_force_dry_run_orphan_does_not_say_already_restored(

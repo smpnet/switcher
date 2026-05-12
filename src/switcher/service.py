@@ -525,10 +525,15 @@ class ProfileService:
         """Classify a single DirMapping. See spec §3.2."""
         # SYMLINK? Verify link target matches expected profile subdir.
         if self._resolver.is_link(live):
-            if not profile_target.exists():
+            if not profile_target.is_dir():
+                # `is_dir` is stricter than `exists` — a regular file at
+                # `profile_target` would have passed `exists()` but then
+                # crashed `copytree()` mid-uninstall (CodeRabbit Major).
+                # Either way (missing OR not a directory) the mapping is
+                # unsafe to execute; classify as CORRUPT in pre-flight.
                 return (
                     UninstallMappingState.CORRUPT,
-                    f"link target profile dir {profile_target} missing",
+                    f"link target profile dir {profile_target} missing or not a directory",
                 )
             try:
                 actual = live.resolve()
@@ -1184,6 +1189,44 @@ class ProfileService:
                     f"orphan tool {tool_id!r}: no registry entry and no cached "
                     f"live_paths. Restore the registry TOML, or pass --force "
                     f"to skip this tool (its symlinks will remain in place)."
+                )
+            # --force on orphan-no-cache: dropping the active entry while
+            # owned profile data still exists on disk lets a later
+            # `uninstall --purge` silently destroy that data — the tool is
+            # no longer in `active`, so its purge-time skipped-tool guard
+            # at the uninstall pre-flight never fires (Hermes blocker
+            # post-PR-#5).
+            #
+            # Refuse if any owned subdir for this tool exists in the
+            # profile dir (current registry subdirs union historical ones
+            # via `_expected_subdirs_for`). The user's escape: restore
+            # the registry TOML and re-run normal `unmanage`, which
+            # cleans up properly; or delete the subdirs manually first.
+            #
+            # Note on symlinks: derive-on-read in `get_active_live_paths()`
+            # above already catches the case where a live symlink at one of
+            # the tool's known paths points into an owned subdir — that
+            # populates the cache and `has_cache` becomes True, so we
+            # don't even reach here. (For symlinks whose targets DON'T
+            # resolve into owned subdirs anymore, the purge concern shifts
+            # back to the data inside the subdirs, which is what the
+            # subdir check above defends.) For tools / paths entirely
+            # outside our historical tables no auto-detection is possible
+            # and the user is responsible — same as pre-fix.
+            profile_name = active[tool_id]
+            profile_dir = self._store.profile_dir(profile_name)
+            expected_subdirs = self._expected_subdirs_for(tool_id)
+            existing_subdirs = sorted(
+                sub for sub in expected_subdirs if (profile_dir / sub).is_dir()
+            )
+            if existing_subdirs:
+                raise UninstallPreflightError(
+                    f"orphan tool {tool_id!r} still has profile data on disk "
+                    f"(subdir(s) {existing_subdirs} under {profile_name!r}). "
+                    f"Refusing to drop from active map — that data would be "
+                    f"silently lost on a later `switcher uninstall --purge`. "
+                    f"Restore the registry TOML and re-run, or delete the "
+                    f"subdir(s) manually first."
                 )
             skipped_orphan = True
 

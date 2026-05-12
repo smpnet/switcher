@@ -338,10 +338,20 @@ def use(
     only: str | None = typer.Option(
         None,
         "--only",
-        help="Comma-separated tool IDs; default: all tools the profile includes.",
+        help=(
+            "Comma-separated tool IDs; default: all CURRENTLY-MANAGED tools the "
+            "profile includes (= profile.tools intersect active.keys()). Tools "
+            "previously removed via `unmanage` stay unmanaged across profile "
+            "switches."
+        ),
     ),
 ) -> None:
-    """Switch a profile (atomically re-points the live config dirs)."""
+    """Switch a profile for the currently-managed tools.
+
+    Defaults to switching every tool that is BOTH in the profile AND in the
+    active map. After `unmanage X`, subsequent `use` calls leave X alone —
+    the durability fix from v0.1.4. Pass `--only X` to restrict further.
+    """
     if only is None:
         only_list = None
     else:
@@ -350,7 +360,7 @@ def use(
             raise typer.BadParameter("--only must contain at least one tool id")
     get_deps().service.use(name, only_list)
     if only_list is None:
-        console.print(f"Using profile {name!r} for all tools")
+        console.print(f"Using profile {name!r} for all currently-managed tools")
     else:
         console.print(f"Using profile {name!r} for tools: {', '.join(only_list)}")
 
@@ -457,8 +467,10 @@ def unmanage(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Skip orphan tools with no registry entry and no cache. "
-        "Does NOT bypass corrupt mappings.",
+        help="Drop an orphan tool (no registry entry, no cache) from the "
+        "active map. Refuses if any owned profile subdir for the tool "
+        "still has data on disk — that would be silently lost on a later "
+        "`uninstall --purge`. Does NOT bypass corrupt mappings.",
     ),
 ) -> None:
     """Restore a single tool's live path and remove it from the active map."""
