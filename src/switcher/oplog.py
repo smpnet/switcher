@@ -93,6 +93,25 @@ class _BaseOp(BaseModel):
     completed_at: AwareDatetime | None = None
 
 
+def _check_unique_tool_id_list(op_name: str, field_name: str, ids: list[str]) -> None:
+    """Reject duplicate IDs in a tool-id list.
+
+    `target_ids` / `affected_ids` are sets-as-lists for JSON-friendliness.
+    A duplicate (e.g. target_ids=["claude", "claude"]) is a corrupt
+    journal entry: downstream code that iterates the list double-counts,
+    while code that converts to a set silently discards. We refuse at
+    validation time so neither path can happen.
+    """
+    seen: set[str] = set()
+    dupes: list[str] = []
+    for tid in ids:
+        if tid in seen and tid not in dupes:
+            dupes.append(tid)
+        seen.add(tid)
+    if dupes:
+        raise ValueError(f"{op_name}: {field_name} contains duplicate ids: {dupes!r}")
+
+
 def _check_mappings_against_target_ids(
     op_name: str, target_ids: list[str], mappings: list[_MappingIntent]
 ) -> None:
@@ -115,6 +134,10 @@ def _check_mappings_against_target_ids(
     NOT enforced: that every tool in `target_ids` has at least one
     mapping. Registry-only tools (no DirMappings) are valid targets and
     legitimately contribute zero entries to `mappings`.
+
+    Target-id uniqueness is enforced separately via
+    `_check_unique_tool_id_list` so the error message can point at the
+    offending field directly.
     """
     target_set = set(target_ids)
     seen_pairs: set[tuple[str, int]] = set()
@@ -137,6 +160,11 @@ class _InitOp(_BaseOp):
     mappings: list[_MappingIntent]
 
     @model_validator(mode="after")
+    def _check_target_ids_unique(self) -> Self:
+        _check_unique_tool_id_list("_InitOp", "target_ids", self.target_ids)
+        return self
+
+    @model_validator(mode="after")
     def _check_mappings_consistency(self) -> Self:
         _check_mappings_against_target_ids("_InitOp", self.target_ids, self.mappings)
         return self
@@ -148,6 +176,11 @@ class _RenameOp(_BaseOp):
     to: str
     affected_ids: list[str]
 
+    @model_validator(mode="after")
+    def _check_affected_ids_unique(self) -> Self:
+        _check_unique_tool_id_list("_RenameOp", "affected_ids", self.affected_ids)
+        return self
+
 
 class _RescanOp(_BaseOp):
     op: Literal["rescan"]
@@ -156,6 +189,11 @@ class _RescanOp(_BaseOp):
     into_mode: bool
     previous_tools: dict[str, dict[str, bool]] | None = None
     mappings: list[_MappingIntent]
+
+    @model_validator(mode="after")
+    def _check_target_ids_unique(self) -> Self:
+        _check_unique_tool_id_list("_RescanOp", "target_ids", self.target_ids)
+        return self
 
     @model_validator(mode="after")
     def _check_into_mode_previous_tools_coherence(self) -> Self:
@@ -185,6 +223,28 @@ class _RescanOp(_BaseOp):
                 f"_RescanOp: target_profiles keys {sorted(self.target_profiles)!r} "
                 f"must equal target_ids {sorted(self.target_ids)!r}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_previous_tools_keys_match_target_profile_values(self) -> Self:
+        """In into-mode, previous_tools snapshots the prior contents of
+        every profile that's being rescanned INTO. Its keys must equal
+        `set(target_profiles.values())` — anything else means the journal
+        either has no snapshot for a profile it's about to overwrite, or
+        carries a snapshot of an unrelated profile. Both leave recovery
+        without trustworthy data.
+
+        Skipped in fresh mode — `_check_into_mode_previous_tools_coherence`
+        already requires previous_tools to be None there.
+        """
+        if self.into_mode and self.previous_tools is not None:
+            expected = set(self.target_profiles.values())
+            actual = set(self.previous_tools.keys())
+            if actual != expected:
+                raise ValueError(
+                    f"_RescanOp: previous_tools keys {sorted(actual)!r} must equal "
+                    f"set(target_profiles.values()) = {sorted(expected)!r}"
+                )
         return self
 
     @model_validator(mode="after")

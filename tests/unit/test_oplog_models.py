@@ -280,6 +280,94 @@ def test_rescan_op_rejects_mapping_for_untargeted_tool():
         )
 
 
+def test_init_op_rejects_duplicate_target_ids():
+    """Duplicate target_ids = corrupt journal entry: iteration-based
+    consumers double-count, set-based consumers silently dedupe.
+    Refuse at validation time so neither path can happen.
+    """
+    with pytest.raises(ValidationError):
+        _InitOp(
+            op="init",
+            started_at=_now(),
+            target_ids=["claude", "claude"],
+            profile_name="2026-05-12-current",
+            mappings=[],
+        )
+
+
+def test_rescan_op_rejects_duplicate_target_ids():
+    with pytest.raises(ValidationError):
+        _RescanOp(
+            op="rescan",
+            started_at=_now(),
+            target_ids=["claude", "claude"],
+            target_profiles={"claude": "shared"},
+            into_mode=False,
+            previous_tools=None,
+            mappings=[],
+        )
+
+
+def test_rename_op_rejects_duplicate_affected_ids():
+    with pytest.raises(ValidationError):
+        _RenameOp.model_validate(
+            {
+                "op": "rename",
+                "started_at": _now(),
+                "from": "a",
+                "to": "b",
+                "affected_ids": ["claude", "claude"],
+            }
+        )
+
+
+def test_rescan_previous_tools_keys_must_match_target_profile_values():
+    """In into-mode, previous_tools is the snapshot of every profile
+    being rescanned into. Mismatched keys = no trustworthy snapshot for
+    the profile we're about to overwrite (or snapshot of an unrelated
+    profile carried along by mistake).
+    """
+    # Snapshot is for the wrong profile entirely.
+    with pytest.raises(ValidationError):
+        _RescanOp(
+            op="rescan",
+            started_at=_now(),
+            target_ids=["claude"],
+            target_profiles={"claude": "shared"},
+            into_mode=True,
+            previous_tools={"other-profile": {"claude": True}},
+            mappings=[],
+        )
+    # Snapshot covers only one of two targeted profiles.
+    with pytest.raises(ValidationError):
+        _RescanOp(
+            op="rescan",
+            started_at=_now(),
+            target_ids=["claude", "copilot"],
+            target_profiles={"claude": "shared-a", "copilot": "shared-b"},
+            into_mode=True,
+            previous_tools={"shared-a": {"claude": True}},
+            mappings=[],
+        )
+
+
+def test_rescan_previous_tools_accepts_shared_profile_collapse():
+    """Two tools landing in the same profile = one snapshot, not two.
+    `set(target_profiles.values())` collapses the duplicates so a
+    single-entry previous_tools matches.
+    """
+    op = _RescanOp(
+        op="rescan",
+        started_at=_now(),
+        target_ids=["claude", "copilot"],
+        target_profiles={"claude": "shared", "copilot": "shared"},
+        into_mode=True,
+        previous_tools={"shared": {"claude": True, "copilot": False}},
+        mappings=[],
+    )
+    assert op.into_mode is True
+
+
 def test_rescan_into_mode_true_without_previous_tools_rejected():
     """into_mode=True snapshots the prior tool-set so abort can
     restore it; missing previous_tools is a semantically impossible
