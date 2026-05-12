@@ -17,8 +17,9 @@ not used here.
 
 from __future__ import annotations
 
+import json
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
@@ -32,8 +33,11 @@ from pydantic import (
     StrictInt,
     StrictStr,
     TypeAdapter,
+    ValidationError,
     model_validator,
 )
+
+from switcher.errors import OpLogCorruptError
 
 # StrictStr blocks str/int/bool coercion; Field(min_length=1) rejects
 # the empty string. Together they ensure an empty `tool_id`,
@@ -494,3 +498,171 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
     # non-link shape (data in two places), or any other combination not
     # covered above.
     return MappingDiskState.AMBIGUOUS
+
+
+class OpLogIO:
+    """Thin façade over ``<state_dir>/oplog.json``.
+
+    Every write goes through ``_write_records`` (tmp + ``Path.replace``)
+    so a crash mid-write cannot tear the file. Empty / malformed /
+    schema-mismatched payloads surface as :class:`OpLogCorruptError`
+    rather than being silently recovered — an atomic write never
+    produces an empty file, so an empty oplog.json on disk means
+    something external interfered, and a silent fallback would mask
+    real corruption.
+
+    Single-in-flight invariant: at most one record on disk has
+    ``completed_at is None``. ``append_record`` refuses to add an
+    intent while another op is still in flight; ``read_in_flight``
+    raises on multiple uncompleted records as defense-in-depth against
+    hand-edited journals. The journal serves a single-user CLI with
+    no concurrent ops, so two in-flight records is corruption, not a
+    race.
+    """
+
+    def __init__(self, state_dir: Path) -> None:
+        self._path = state_dir / "oplog.json"
+
+    def read_records(self) -> list[OpLogRecord]:
+        """Return every record on disk; empty list if the file is absent.
+
+        Raises:
+            OpLogCorruptError: file is unreadable, empty (atomic writes
+                never produce that shape), not valid JSON, not a JSON
+                array at the top level, or fails schema validation.
+        """
+        if not self._path.exists():
+            return []
+        try:
+            blob = self._path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise OpLogCorruptError(f"oplog at {self._path} could not be read: {e}") from e
+        if not blob.strip():
+            raise OpLogCorruptError(f"oplog at {self._path} is empty; manual recovery required")
+        try:
+            data = json.loads(blob)
+        except json.JSONDecodeError as e:
+            raise OpLogCorruptError(f"oplog at {self._path} is not valid JSON: {e}") from e
+        if not isinstance(data, list):
+            raise OpLogCorruptError(f"oplog at {self._path}: top-level must be a JSON array")
+        try:
+            return parse_records(data)
+        except ValidationError as e:
+            raise OpLogCorruptError(f"oplog at {self._path} failed schema validation: {e}") from e
+
+    def read_in_flight(self) -> OpLogRecord | None:
+        """Return the unique uncompleted record, or None.
+
+        Raises:
+            OpLogCorruptError: more than one record has
+                ``completed_at is None``. ``append_record`` enforces the
+                invariant on its own writes; surfacing it here protects
+                against hand-edited or otherwise externally-corrupted
+                journals.
+        """
+        in_flight = [r for r in self.read_records() if r.completed_at is None]
+        if len(in_flight) > 1:
+            raise OpLogCorruptError(
+                f"oplog at {self._path}: {len(in_flight)} records are in-flight; "
+                f"single-in-flight invariant violated. Manual recovery required."
+            )
+        return in_flight[0] if in_flight else None
+
+    def append_record(self, record: OpLogRecord) -> None:
+        """Append a new intent record and atomically rewrite the file.
+
+        Raises:
+            OpLogCorruptError: another record is already in-flight on
+                disk. The caller must run the appropriate compensation
+                command (``--continue`` or ``--abort``) for the existing
+                op before starting a new one.
+        """
+        existing = self.read_records()
+        if any(r.completed_at is None for r in existing):
+            raise OpLogCorruptError(
+                f"oplog at {self._path}: cannot append intent record while "
+                f"another op is already in-flight. Run the compensation "
+                f"command for the existing op first."
+            )
+        existing.append(record)
+        self._write_records(existing)
+
+    def mark_completed(self, record: OpLogRecord) -> None:
+        """Set ``completed_at`` on the matching on-disk record and rewrite.
+
+        Matches the disk record by ``op`` + ``started_at`` (sufficient
+        discriminator for a single-user CLI). Delegates to the
+        module-level :func:`mark_completed` helper, which re-validates
+        through ``parse_record`` so a corrupt timestamp cannot slip in
+        via the write path — Pydantic v2's ``model_copy(update={...})``
+        bypasses validators on updated fields, which is intentionally
+        avoided here. ValidationError from the helper is mapped to
+        OpLogCorruptError to match the read-path failure shape.
+
+        Raises:
+            OpLogCorruptError: no in-flight record on disk matches
+                ``op`` + ``started_at``, or the completion timestamp
+                fails re-validation. A caller holding a stale record
+                reference is treated as corruption rather than as a
+                silent no-op.
+        """
+        records = self.read_records()
+        completed_at = datetime.now(UTC)
+        matched = False
+        new_records: list[OpLogRecord] = []
+        for r in records:
+            if (
+                not matched
+                and r.op == record.op
+                and r.started_at == record.started_at
+                and r.completed_at is None
+            ):
+                try:
+                    new_records.append(mark_completed(r, completed_at))
+                except ValidationError as e:
+                    raise OpLogCorruptError(
+                        f"oplog at {self._path}: mark_completed re-validation "
+                        f"failed for op={r.op!r} started_at={r.started_at!r}: {e}"
+                    ) from e
+                matched = True
+            else:
+                new_records.append(r)
+        if not matched:
+            raise OpLogCorruptError(
+                f"oplog at {self._path}: no matching in-flight record for "
+                f"op={record.op!r} started_at={record.started_at!r}"
+            )
+        self._write_records(new_records)
+
+    def vacuum_completed(self) -> None:
+        """Drop every record whose ``completed_at`` is not None.
+
+        Idempotent. If no completed records are present, the file is
+        not rewritten — keeps mtime stable for callers that gate on it
+        and avoids needless disk writes.
+        """
+        if not self._path.exists():
+            return
+        records = self.read_records()
+        kept = [r for r in records if r.completed_at is None]
+        if len(kept) != len(records):
+            self._write_records(kept)
+
+    def _write_records(self, records: list[OpLogRecord]) -> None:
+        """Atomic write: serialize, write to ``<path>.tmp``, ``Path.replace``.
+
+        Creates the parent directory if missing — on first-ever
+        ``switcher init``, the op-log intent record is written BEFORE
+        ``_store.create()`` materializes the state dir, so the parent
+        may not exist yet. ``mkdir(parents=True, exist_ok=True)`` is
+        idempotent and safe to call on every write.
+
+        Path.replace is atomic on POSIX and Windows for same-filesystem
+        renames; the tmp file shares the parent dir, so the rename never
+        crosses filesystems.
+        """
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dump_records(records)
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(self._path)
