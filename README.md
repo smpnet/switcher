@@ -103,12 +103,13 @@ switcher init --skip claude               # manage everything detected except Cl
 switcher init --interactive               # per-tool yes/no prompt (TTY required)
 ```
 
-In v0.1.5, if `init` is interrupted by a process kill or transient
-FS error, `switcher status` reports it and points you at
-`switcher init --continue` (resume the partial capture) or
-`switcher init --abort` (restore the pre-init state). On earlier
-versions, an interrupted `init` requires manual intervention — see
-"Maintenance and recovery".
+> **Recovery (forthcoming in v0.1.5; not in earlier releases):**
+> if `init` is interrupted by a process kill or transient FS error,
+> `switcher status` will report it and point you at
+> `switcher init --continue` (resume the partial capture) or
+> `switcher init --abort` (restore the pre-init state). Pre-v0.1.5,
+> an interrupted `init` requires manual intervention — see
+> "Maintenance and recovery".
 
 ## Switch profiles
 
@@ -152,10 +153,11 @@ switcher rescan                       # TTY-interactive: yes/no per detected too
 switcher rescan --all                 # non-interactive, capture everything
 ```
 
-In v0.1.5, if `rescan` is interrupted, `switcher status` reports it
-and you resolve with `switcher rescan --continue` or
-`switcher rescan --abort`. On earlier versions, see "Maintenance
-and recovery".
+> **Recovery (forthcoming in v0.1.5; not in earlier releases):**
+> if `rescan` is interrupted, `switcher status` will report it and
+> you resolve with `switcher rescan --continue` or
+> `switcher rescan --abort`. Pre-v0.1.5, see "Maintenance and
+> recovery".
 
 ## Stop managing one tool
 
