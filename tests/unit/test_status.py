@@ -92,4 +92,4 @@ def test_status_no_active_profiles(tmp_state: Path, tmp_home: Path) -> None:
     uninstall = runner.invoke(app, ["uninstall"])
     assert uninstall.exit_code == 0, uninstall.stderr
     result = runner.invoke(app, ["status"])
-    assert "no active profiles" in result.output
+    assert "no tools currently managed" in result.output.lower()

@@ -48,7 +48,7 @@ def test_full_lifecycle(tmp_home: Path, tmp_state: Path) -> None:
                 assert live.resolve() == target, f"{live} -> {live.resolve()}, expected {target}"
 
     # --- init ----------------------------------------------------------------
-    current = service.init()
+    current = service.init().profile_name
     assert sorted(p.name for p in store.list()) == sorted([current, "vanilla"])
     # init creates a profile_subdir under both profiles for every tool
     for profile in (current, "vanilla"):
@@ -163,3 +163,25 @@ def test_init_populates_active_live_paths(tmp_state: Path, tmp_home: Path) -> No
         assert len(paths) == len(tool.config_dirs)
         for p in paths:
             assert _is_link(Path(p))
+
+
+def test_init_unmanage_save_only_managed(tmp_home: Path, tmp_state: Path) -> None:
+    """End-to-end: init both → unmanage claude → save snap → snap has only
+    copilot. T16 durability proof using the CLI surface."""
+    from typer.testing import CliRunner
+
+    from switcher.cli import app, get_deps
+
+    runner = CliRunner()
+    init_result = runner.invoke(app, ["init"])
+    assert init_result.exit_code == 0, init_result.stderr
+
+    unmanage_result = runner.invoke(app, ["unmanage", "claude"])
+    assert unmanage_result.exit_code == 0, unmanage_result.stderr
+
+    save_result = runner.invoke(app, ["save", "snap"])
+    assert save_result.exit_code == 0, save_result.stderr
+
+    profile_dir = get_deps().store.profile_dir("snap")
+    assert (profile_dir / "copilot-config").is_dir()
+    assert not (profile_dir / "claude").exists()

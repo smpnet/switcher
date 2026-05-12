@@ -2,23 +2,52 @@
 
 from __future__ import annotations
 
+import contextlib
+import difflib
 import functools
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from switcher.errors import SwitcherError
+from switcher.errors import (
+    NothingToInitializeError,
+    StateAlreadyInitializedError,
+    StateNotInitializedError,
+    SwitcherError,
+    UnknownToolError,
+)
 from switcher.models import Tool
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
-from switcher.service import ProfileService
+from switcher.service import InitReport, ProfileService, UninstallMappingState
 from switcher.store import FileProfileStore, ProfileStore
+
+# Reconfigure stdout/stderr to UTF-8 so the v0.1.4 tools table can emit its
+# ✓ / — / ⚠ glyphs without UnicodeEncodeError on Windows consoles whose
+# default codepage is cp1252 / cp437. Modern Windows Terminal handles UTF-8
+# natively; legacy cmd.exe sessions degrade to "?" via errors="replace"
+# rather than crashing. POSIX terminals are already UTF-8 — the reconfigure
+# is a no-op there.
+#
+# Done at module import time (NOT lazily) so any code path that reaches
+# `console.print(...)` is covered, including subprocess invocations from
+# tests that read stdout via PIPE (the default subprocess.PIPE encoding on
+# Windows is cp1252, which is what surfaced this).
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is None:
+        continue
+    encoding = getattr(_stream, "encoding", None)
+    if encoding and encoding.lower().replace("-", "") != "utf8":
+        # Older Python or non-text stream falls through silently and lets
+        # Rich's default encode-error handling kick in.
+        with contextlib.suppress(AttributeError, OSError):
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -61,6 +90,19 @@ def handle_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
         except SwitcherError as e:
             err_console.print(f"[red]error:[/] {e}")
             raise typer.Exit(code=1) from e
+        except (KeyboardInterrupt, EOFError) as e:
+            # Interactive prompts (init --interactive, bare rescan on TTY)
+            # call input() directly. Without this catch a Ctrl-C / closed
+            # stdin during the prompt bubbles out as a raw traceback.
+            # Exit cleanly BEFORE any service-level mutation runs (Hermes
+            # review): the prompt loops gather user choices and only call
+            # service.init / service.rescan after they return, so an
+            # interrupt during the prompt cannot have produced partial
+            # mutation. 130 = 128 + SIGINT, the conventional Unix exit
+            # code for "killed by SIGINT"; EOF gets the same exit since
+            # both are user-side aborts.
+            err_console.print("[yellow]aborted[/]")
+            raise typer.Exit(code=130) from e
 
     return wrapper
 
@@ -105,7 +147,19 @@ def status(
     deps = get_deps()
     active = deps.store.get_active()
     if not active:
-        console.print("no active profiles")
+        # Distinguish two empty-active-map states (Hermes review):
+        #   - Uninitialized: no profiles on disk yet → suggest `init`,
+        #     because `rescan` would fail with NotInitializedError.
+        #   - Initialized but everything unmanaged (post-`unmanage` of
+        #     the last tool, or `uninstall` without --purge): suggest
+        #     `rescan` per spec §3.5 — the profile list is intact, the
+        #     active map just happens to be empty.
+        if not deps.store.list():
+            console.print("No tools currently managed. Run 'switcher init' to set up switcher.")
+        else:
+            console.print(
+                "No tools currently managed. Run 'switcher rescan' to discover installed tools."
+            )
         return
     # `markup=False` is REQUIRED because `[ok]` / `[--]` would otherwise be
     # interpreted as Rich markup tags. Spec §6.5.
@@ -137,12 +191,189 @@ def status(
 # -- mutating commands ------------------------------------------------------
 
 
+def _resolve_init_targets(
+    registry: Sequence[Tool],
+    user_ids: list[str],
+    mode: Literal["only", "skip"],
+) -> list[str]:
+    """Validate user_ids against the registry; resolve to a target_ids list.
+
+    Hard-errors on unknown ids with a did-you-mean suggestion.
+    `only`: returns user_ids unchanged (the service layer intersects with
+        detect_installed). Unknown ids raise here.
+    `skip`: returns [t.id for t in registry if t.id not in user_ids].
+    """
+    registered_ids = [t.id for t in registry]
+    for uid in user_ids:
+        if uid not in registered_ids:
+            matches = difflib.get_close_matches(uid, registered_ids, n=1, cutoff=0.6)
+            suggestion = f" Did you mean {matches[0]!r}?" if matches else ""
+            raise UnknownToolError(f"tool {uid!r} is not registered.{suggestion}")
+    if mode == "only":
+        return user_ids
+    return [tid for tid in registered_ids if tid not in user_ids]
+
+
+def _stdin_is_tty() -> bool:
+    """Indirection for --interactive's TTY check.
+
+    Direct `sys.stdin.isatty()` calls are uncooperative under
+    click.testing.CliRunner, which swaps in its own StringIO during
+    `invoke()`. Tests monkeypatch this module-level helper instead.
+    """
+    return sys.stdin.isatty()
+
+
+def _resolve_init_targets_interactive(deps: Deps) -> tuple[list[str], list[str]]:
+    """Prompt yes/no per detected tool. Returns (accepted_ids, declined_ids).
+
+    Empty input accepts the default (Y). Any answer starting with 'n' or
+    'N' declines; anything else (including 'y', 'Y', or empty) accepts.
+
+    Per spec §2.1: --interactive is a *filtered* init mode. An empty
+    detected list means the filter resolves to zero captures — the caller
+    raises NothingToInitializeError (NOT the bare-init warn-and-empty path).
+    """
+    detected = deps.service.detect_installed()
+    if not detected:
+        return [], []
+    accepted: list[str] = []
+    declined: list[str] = []
+    console.print("Detected installed tools:")
+    for tool in detected:
+        answer = input(f"  Manage {tool.id}? [Y/n] ").strip().lower()
+        if answer.startswith("n"):
+            declined.append(tool.id)
+            continue
+        accepted.append(tool.id)
+    return accepted, declined
+
+
+def _print_init_report(report: InitReport) -> None:
+    """Render an InitReport to the console with captured / skipped /
+    requested-but-not-installed sections and re-add hints."""
+    console.print(f"Initialized profile {report.profile_name!r}")
+    if report.captured:
+        console.print(f"  Captured: {', '.join(report.captured)}")
+    if report.requested_but_not_installed:
+        console.print(
+            f"  Requested but not detected: {', '.join(report.requested_but_not_installed)}"
+        )
+        for tid in report.requested_but_not_installed:
+            console.print(f"    To add it later: switcher rescan --only {tid}")
+    if report.skipped_via_skip_flag:
+        console.print(f"  Skipped: {', '.join(report.skipped_via_skip_flag)}")
+        for tid in report.skipped_via_skip_flag:
+            console.print(f"    To add it later: switcher rescan --only {tid}")
+    if report.skipped_via_interactive:
+        console.print(f"  Skipped (via interactive): {', '.join(report.skipped_via_interactive)}")
+        for tid in report.skipped_via_interactive:
+            console.print(f"    To add it later: switcher rescan --only {tid}")
+
+
 @app.command()
 @handle_errors
-def init() -> None:
-    """One-time setup: detect tools, snapshot current config, create vanilla."""
-    name = get_deps().service.init()
-    console.print(f"Initialized profile {name!r}")
+def init(
+    only: str | None = typer.Option(
+        None,
+        "--only",
+        help="Comma-separated tool IDs to manage. Mutually exclusive with --skip/--interactive.",
+    ),
+    skip: str | None = typer.Option(
+        None,
+        "--skip",
+        help="Comma-separated tool IDs to exclude. Mutually exclusive with --only/--interactive.",
+    ),
+    interactive: bool = typer.Option(
+        False,
+        "--interactive",
+        help="Prompt per-detected-tool. Mutually exclusive with --only/--skip.",
+    ),
+) -> None:
+    """Initialize switcher; optionally restrict to a subset of detected tools."""
+    if interactive and (only is not None or skip is not None):
+        raise typer.BadParameter("--interactive is mutually exclusive with --only/--skip")
+    if only is not None and skip is not None:
+        raise typer.BadParameter("--only and --skip are mutually exclusive")
+
+    deps = get_deps()
+    # Hermes blocker: surface StateAlreadyInitializedError BEFORE any
+    # flag-specific detection / prompting runs. Without this preflight,
+    # `init --skip claude` on an already-initialized repo reaches the
+    # service layer's StateAlreadyInitialized check ONLY if the
+    # CLI-level "every detected tool" / "nothing to initialize" guards
+    # don't fire first — and `init --interactive` would even prompt
+    # the user before failing. The state-invariant takes priority over
+    # filter validation; emitting the same error for every init variant
+    # keeps the CLI surface consistent.
+    if deps.store.list():
+        raise StateAlreadyInitializedError("switcher is already initialized")
+
+    requested_but_not_installed: list[str] = []
+    skipped_via_skip_flag: list[str] = []
+    skipped_via_interactive: list[str] = []
+    target_ids: list[str] | None
+
+    if interactive:
+        if not _stdin_is_tty():
+            raise typer.BadParameter(
+                "--interactive requires a tty; use --only or --skip in non-interactive contexts"
+            )
+        accepted, declined = _resolve_init_targets_interactive(deps)
+        if not accepted:
+            # Distinguish "no installed tools to prompt for" from "user
+            # declined every prompt" (Hermes nit). Without this branch
+            # the zero-detected case shows the misleading "every detected
+            # tool was skipped" message.
+            if not declined:
+                raise NothingToInitializeError("no installed tools detected; nothing to initialize")
+            raise NothingToInitializeError("every detected tool was skipped; nothing to initialize")
+        target_ids = accepted
+        skipped_via_interactive = declined
+    elif only is not None:
+        ids = [t.strip() for t in only.split(",") if t.strip()]
+        if not ids:
+            raise typer.BadParameter("--only must contain at least one tool id")
+        target_ids = _resolve_init_targets(deps.registry, ids, mode="only")
+        detected_ids = {t.id for t in deps.service.detect_installed()}
+        requested_but_not_installed = [uid for uid in ids if uid not in detected_ids]
+    elif skip is not None:
+        ids = [t.strip() for t in skip.split(",") if t.strip()]
+        if not ids:
+            raise typer.BadParameter("--skip must contain at least one tool id")
+        target_ids = _resolve_init_targets(deps.registry, ids, mode="skip")
+        if not target_ids:
+            # --skip excluded every registered tool. The generic
+            # "no requested tools are installed" message at the service
+            # layer is wrong for this path — surface the actual cause
+            # before reaching service.init(). (abby review)
+            raise NothingToInitializeError(
+                "--skip excluded every registered tool; nothing left to initialize"
+            )
+        # Also catch the more common case (Hermes review): --skip excluded
+        # every DETECTED tool, even though target_ids still contains
+        # registered-but-not-installed tools. Without this branch the call
+        # falls through to service.init() and raises the generic
+        # "no requested tools are installed" — accurate for --only, but
+        # misleading for --skip. Surface the real cause here instead.
+        detected_ids = {t.id for t in deps.service.detect_installed()}
+        if not (set(target_ids) & detected_ids):
+            raise NothingToInitializeError(
+                f"--skip excluded every detected tool. Detected: "
+                f"{sorted(detected_ids) or '(none)'}; after skipping "
+                f"{sorted(ids)} nothing remains to initialize."
+            )
+        skipped_via_skip_flag = ids
+    else:
+        target_ids = None
+
+    report = deps.service.init(
+        target_ids,
+        requested_but_not_installed=requested_but_not_installed,
+        skipped_via_skip_flag=skipped_via_skip_flag,
+        skipped_via_interactive=skipped_via_interactive,
+    )
+    _print_init_report(report)
 
 
 @app.command()
@@ -152,10 +383,20 @@ def use(
     only: str | None = typer.Option(
         None,
         "--only",
-        help="Comma-separated tool IDs; default: all tools the profile includes.",
+        help=(
+            "Comma-separated tool IDs; default: all CURRENTLY-MANAGED tools the "
+            "profile includes (= profile.tools intersect active.keys()). Tools "
+            "previously removed via `unmanage` stay unmanaged across profile "
+            "switches."
+        ),
     ),
 ) -> None:
-    """Switch a profile (atomically re-points the live config dirs)."""
+    """Switch a profile for the currently-managed tools.
+
+    Defaults to switching every tool that is BOTH in the profile AND in the
+    active map. After `unmanage X`, subsequent `use` calls leave X alone —
+    the durability fix from v0.1.4. Pass `--only X` to restrict further.
+    """
     if only is None:
         only_list = None
     else:
@@ -164,7 +405,7 @@ def use(
             raise typer.BadParameter("--only must contain at least one tool id")
     get_deps().service.use(name, only_list)
     if only_list is None:
-        console.print(f"Using profile {name!r} for all tools")
+        console.print(f"Using profile {name!r} for all currently-managed tools")
     else:
         console.print(f"Using profile {name!r} for tools: {', '.join(only_list)}")
 
@@ -236,9 +477,9 @@ def uninstall(
     )
     prefix = "would " if dry_run else ""
     for m in report.mappings:
-        if m.state.value == "already_restored":
+        if m.state == UninstallMappingState.ALREADY_RESTORED:
             err_console.print(f"already restored {m.live_path}")
-        elif m.state.value == "missing_live_temp_present":
+        elif m.state == UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
             verb = "would recover" if dry_run else "recovered"
             err_console.print(f"{verb} {m.live_path} from interrupted uninstall")
         else:
@@ -265,30 +506,141 @@ def uninstall(
 
 @app.command()
 @handle_errors
+def unmanage(
+    tool: str = typer.Argument(..., help="Tool ID to unmanage."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview only; no changes."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Drop an orphan tool (no registry entry, no cache) from the "
+        "active map. Refuses if any owned profile subdir for the tool "
+        "still has data on disk — that would be silently lost on a later "
+        "`uninstall --purge`. Does NOT bypass corrupt mappings.",
+    ),
+) -> None:
+    """Restore a single tool's live path and remove it from the active map."""
+    deps = get_deps()
+    report = deps.service.unmanage(tool, dry_run=dry_run, force=force)
+    if dry_run:
+        console.print(f"Would unmanage {report.tool_id!r}:")
+        for m in report.mappings:
+            if report.skipped_orphan:
+                # `--force --dry-run` on an orphan-no-cache tool: the real
+                # run drops the tool from the active map and leaves any
+                # symlinks in place. Don't mislabel that as a no-op
+                # restore (CodeRabbit blocker).
+                verb = "would skip orphan (drop from active map; leave links in place)"
+            elif m.state == UninstallMappingState.SYMLINK:
+                verb = "would restore"
+            elif m.state == UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
+                # A real run renames the sibling temp dir back into the
+                # live position — that's a recovery, NOT a no-op. (abby review)
+                verb = "would recover from interrupted uninstall"
+            else:  # ALREADY_RESTORED (CORRUPT refused by pre-flight)
+                verb = "no-op (already restored)"
+            # `soft_wrap=True` keeps the verb token together. Without it,
+            # Rich wraps long Windows paths and splits "would recover"
+            # across a hard newline, breaking substring assertions and
+            # making the preview harder to grep.
+            console.print(f"  {m.live_path}  ({m.state.name} -> {verb})", soft_wrap=True)
+        if report.skipped_orphan and not report.mappings:
+            # Orphan-no-cache produces zero mappings — surface the would-skip
+            # explicitly so the dry-run output isn't an empty body.
+            console.print(f"  (orphan {report.tool_id!r}: no mappings; would drop from active map)")
+        console.print("(dry-run; no changes made)")
+    elif report.skipped_orphan:
+        console.print(
+            f"Skipped orphan tool {report.tool_id!r}: removed from active map; "
+            f"symlinks left in place"
+        )
+    else:
+        console.print(f"Unmanaged {report.tool_id!r}")
+
+
+@app.command()
+@handle_errors
 def rescan(
     only: str | None = typer.Option(None, "--only", help="Comma-separated tool ids."),
     into: str | None = typer.Option(None, "--into", help="Capture into an existing profile."),
+    all_: bool = typer.Option(
+        False,
+        "--all",
+        help="Capture all detected unmanaged tools without prompting. "
+        "Mutually exclusive with --only.",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print plan; make no changes."),
 ) -> None:
-    """Pick up tools installed after init."""
+    """Pick up tools installed after init.
+
+    With no flags, on a TTY: prompt per detected unmanaged tool (default-Y).
+    Off-TTY: print a stderr warning and capture every detected unmanaged
+    tool. Use --all to suppress the warning, or --only to be selective.
+    --dry-run never prompts regardless of TTY.
+    """
+    if all_ and only is not None:
+        raise typer.BadParameter("--all and --only are mutually exclusive")
+
+    deps = get_deps()
+
+    # Preflight: surface StateNotInitializedError BEFORE the new prompt /
+    # warning logic touches the user (Hermes review). Otherwise bare
+    # rescan on an uninitialized machine prints capture-all warnings or
+    # prompts the user, then fails inside service.rescan() with "switcher
+    # has not been initialized" — misleading UX.
+    if not deps.store.list():
+        raise StateNotInitializedError("switcher has not been initialized; run 'switcher init'")
+
     # Mirror `use --only`: an explicitly empty `--only ""` is invalid input,
     # not "no filter". Without this the CLI silently bypasses the
     # service-layer guard at service.rescan (`--only requires at least one
     # tool id`), making `--only ""` behave like bare `rescan`.
-    if only is None:
-        only_list = None
-    else:
+    if only is not None:
         only_list = [s.strip() for s in only.split(",") if s.strip()]
         if not only_list:
             raise typer.BadParameter("--only must contain at least one tool id")
-    deps = get_deps()
-    report = deps.service.rescan(only=only_list, into=into, dry_run=dry_run)
+        report = deps.service.rescan(only=only_list, into=into, dry_run=dry_run)
+    elif all_:
+        report = deps.service.rescan(only=None, into=into, dry_run=dry_run)
+    elif dry_run:
+        # --dry-run alone: preview-all, never prompt regardless of TTY.
+        report = deps.service.rescan(only=None, into=into, dry_run=True)
+    else:
+        # Bare rescan: TTY prompt per tool; non-TTY warn-and-capture-all.
+        # Detection mirrors service.rescan's candidate set so the prompt
+        # only lists what would actually be captured.
+        unmanaged_detected = [
+            t for t in deps.service.detect_installed() if t.id not in deps.store.get_active()
+        ]
+        if not unmanaged_detected:
+            err_console.print("no new tools detected")
+            return
+        if _stdin_is_tty():
+            console.print("Detected unmanaged tools:")
+            accepted: list[str] = []
+            for tool in unmanaged_detected:
+                answer = input(f"  Capture {tool.id}? [Y/n] ").strip().lower()
+                if answer.startswith("n"):
+                    continue
+                accepted.append(tool.id)
+            if not accepted:
+                console.print("Nothing accepted; nothing captured.")
+                return
+            report = deps.service.rescan(only=accepted, into=into, dry_run=False)
+        else:
+            ids = [t.id for t in unmanaged_detected]
+            err_console.print(
+                f"warning: capturing all detected unmanaged tools without prompt: "
+                f"{', '.join(ids)}. Use --only to be selective, or --all to "
+                f"suppress this warning."
+            )
+            report = deps.service.rescan(only=None, into=into, dry_run=False)
+
     if not report.captured:
         err_console.print("no new tools detected")
         return
-    prefix = "would " if dry_run else ""
+    verb = "would capture" if dry_run else "captured"
     for tool_id, target in report.captured:
-        err_console.print(f"{prefix}captured {tool_id} into {target}")
+        err_console.print(f"{verb} {tool_id} into {target}")
 
 
 @app.command()
@@ -356,6 +708,81 @@ def tools_scaffold(
     console.print(f"Wrote scaffold to {target}")
 
 
+@dataclass(frozen=True)
+class _ToolsTableRow:
+    tool_id: str
+    name: str
+    installed: bool
+    managed: bool
+    paths: list[str]
+    pathological: bool  # True when managed AND NOT installed (any owned live path missing)
+    is_orphan: bool = False  # True when in active map but has no registry entry
+
+
+def _build_tools_table_rows(deps: Deps) -> list[_ToolsTableRow]:
+    """Pure: registry → list of rows. Used by tools_main to populate the
+    Rich table; also a clean assertion target for tests.
+
+    `deps.store.get_active()` returns `{}` when config.json doesn't exist
+    yet (pre-init), so no try/except is needed for the uninit case.
+    A real StorageError (corrupt / unreadable config.json) intentionally
+    propagates — the broad `except Exception` we used to have masked exactly
+    the failures the rest of the CLI is careful to surface (Hermes review).
+
+    Pathological-state checks are aware of:
+      - Multi-dir tools (Hermes review): a managed tool with `config_dirs[0]`
+        present but a later managed live path missing is still pathological.
+        `detect_installed()` only checks the first config_dir, so the per-row
+        check iterates every `tool_dir(tool, i)` for managed tools.
+      - Orphan active entries (Hermes review): a tool id in the active map
+        but absent from the registry (e.g., after `uninstall --force` left
+        a skipped tool in active). Rendered as a dedicated orphan row so
+        `tools` doesn't silently hide the broken state `unmanage` is meant
+        to repair.
+    """
+    installed_ids = {t.id for t in deps.service.detect_installed()}
+    managed_ids = set(deps.store.get_active().keys())
+    registry_ids = {t.id for t in deps.registry}
+    rows: list[_ToolsTableRow] = []
+    for tool in deps.registry:
+        first_dir_installed = tool.id in installed_ids
+        managed = tool.id in managed_ids
+        paths = [(dm.windows_path if IS_WINDOWS else dm.posix_path) for dm in tool.config_dirs]
+        if managed:
+            # Multi-dir-aware: every owned live path must exist for the tool
+            # to count as fully installed. Catches the case where the first
+            # dir is fine but a later managed dir was deleted.
+            all_live_present = deps.service.all_live_paths_present(tool)
+        else:
+            all_live_present = first_dir_installed
+        rows.append(
+            _ToolsTableRow(
+                tool_id=tool.id,
+                name=tool.name,
+                installed=all_live_present,
+                managed=managed,
+                paths=paths,
+                pathological=(managed and not all_live_present),
+            )
+        )
+    # Orphan rows: in active but no registry entry. Render at the end so
+    # registered tools' rows don't shift when an orphan appears, and so the
+    # orphan footer below has something to anchor on.
+    for tid in sorted(managed_ids - registry_ids):
+        rows.append(
+            _ToolsTableRow(
+                tool_id=tid,
+                name="(no registry entry)",
+                installed=False,
+                managed=True,
+                paths=[],
+                pathological=True,
+                is_orphan=True,
+            )
+        )
+    return rows
+
+
 @tools_app.callback(invoke_without_command=True)
 @handle_errors
 def tools_main(ctx: typer.Context) -> None:
@@ -363,13 +790,34 @@ def tools_main(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is not None:
         return
     deps = get_deps()
+    rows = _build_tools_table_rows(deps)
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID")
     table.add_column("Name")
+    table.add_column("Installed", justify="center")
+    table.add_column("Managed", justify="center")
     table.add_column("Paths" + (" (Windows)" if IS_WINDOWS else " (POSIX)"))
-    for tool in deps.registry:
-        paths = "\n".join(
-            (dm.windows_path if IS_WINDOWS else dm.posix_path) for dm in tool.config_dirs
+    for row in rows:
+        installed_cell = "⚠" if row.pathological else ("✓" if row.installed else "—")
+        managed_cell = "✓" if row.managed else "—"
+        table.add_row(
+            row.tool_id,
+            row.name,
+            installed_cell,
+            managed_cell,
+            "\n".join(row.paths),
         )
-        table.add_row(tool.id, tool.name, paths)
     console.print(table)
+    for row in rows:
+        if row.is_orphan:
+            console.print(
+                f"[yellow]⚠ {row.tool_id!r} is in active map but has no registry "
+                f"entry (orphan).[/yellow]\n  Restore the registry TOML, or run "
+                f"'switcher unmanage {row.tool_id} --force' once any leftover "
+                f"profile data is cleared."
+            )
+        elif row.pathological:
+            console.print(
+                f"[yellow]⚠ {row.tool_id!r} is in active map but its live path is missing.[/yellow]\n"
+                f"  Run 'switcher unmanage {row.tool_id}' or restore the live path."
+            )

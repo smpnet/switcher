@@ -19,6 +19,8 @@ from pathlib import Path
 
 from switcher.errors import (
     AlreadyLinkedError,
+    NothingToInitializeError,
+    NoToolsManagedError,
     PathNotADirectoryError,
     ProfileExistsError,
     ProfileIsActiveError,
@@ -28,6 +30,7 @@ from switcher.errors import (
     StateNotInitializedError,
     ToolHasNoActiveProfileError,
     ToolNotInProfileError,
+    ToolNotManagedError,
     UninstallPreflightError,
     UnknownProfileError,
     UnknownToolError,
@@ -39,7 +42,7 @@ from switcher.registry import find_tool
 from switcher.store import ProfileStore
 
 
-class _UninstallMappingState(Enum):
+class UninstallMappingState(Enum):
     SYMLINK = "symlink"
     ALREADY_RESTORED = "already_restored"
     MISSING_LIVE_TEMP_PRESENT = "missing_live_temp_present"
@@ -52,7 +55,7 @@ class _UninstallMapping:
     profile_subdir: str
     live_path: Path
     profile_dir_subdir: Path  # <state_dir>/profiles/<active>/<config_subdir>
-    state: _UninstallMappingState
+    state: UninstallMappingState
     corruption_reason: str = ""  # populated when state == CORRUPT
 
 
@@ -63,6 +66,54 @@ def _temp_dir_for_uninstall(live_path: Path) -> Path:
 
 def now() -> datetime:
     return datetime.now(UTC)
+
+
+# v0.1.4 FS-truth migration constants. See spec §4.2.
+#
+# Parents to scan for symlinks during legacy migration, in addition to the
+# current registry's config-dir parents. Hardcoded because a registry-only
+# Per-tool historical profile_subdir names: subdir names a given tool's
+# profile dir may legitimately contain across switcher versions. Union of
+# (current registry) + (historical) gives the expected-subdir set for
+# FS-truth discovery. Sourced from git history of src/switcher/builtins/*.toml.
+_HISTORICAL_PROFILE_SUBDIRS: dict[str, frozenset[str]] = {
+    "copilot": frozenset({"copilot-config", "copilot-auth"}),
+    # claude has always used "claude" — no historical drift to record.
+}
+
+# Per-tool historical (live_path_template, profile_subdir) pairs: exact
+# paths (env-expanded at lookup time) a tool's live config dir may have
+# occupied in prior switcher versions, paired with the profile_subdir they
+# used to be linked into. Union of (current registry tool_dirs) +
+# (historical pair keys) gives the EXACT set of paths discovery considers
+# — NEVER a parent-x-basename cross-product, which historically allowed
+# phantom combinations like `~/github-copilot` to be falsely classified as
+# managed and later mutated by uninstall (Hermes / CodeRabbit blocker
+# post-PR-#5).
+#
+# The pair shape (path → subdir, not just a set of paths) is needed by
+# `_classify_uninstall_mappings`'s resume path: when a cached live path
+# is no longer a link (e.g. a partial uninstall already restored it to a
+# real dir) AND the current registry no longer mentions that path (e.g.
+# the user shrank the tool's config_dirs between uninstalls), we still
+# need to know which profile_subdir the cached path used to be linked
+# into to resume the unwind. Without this we'd misclassify the
+# already-restored mapping as CORRUPT (Hermes blocker post-b621f02).
+#
+# Add a new tool by adding the actual on-disk path strings it has used
+# AND the profile_subdir it was linked into, per platform. Use POSIX-style
+# strings on POSIX (resolver.expand handles `~`) and Windows %VAR%\path
+# strings on Windows (resolver.expand handles env vars). Don't include
+# current registry paths here — those come from the registry directly.
+_HISTORICAL_LIVE_PATH_PAIRS_POSIX: dict[str, dict[str, str]] = {
+    # tool_id → { live_path_template: profile_subdir }
+    "copilot": {"~/.config/github-copilot": "copilot-auth"},
+    # claude has always lived at ~/.claude → "claude"; no historical drift.
+}
+_HISTORICAL_LIVE_PATH_PAIRS_WINDOWS: dict[str, dict[str, str]] = {
+    "copilot": {"%LOCALAPPDATA%\\github-copilot": "copilot-auth"},
+    # claude has always lived at %USERPROFILE%\.claude → "claude".
+}
 
 
 class ProfileService:
@@ -89,6 +140,19 @@ class ProfileService:
                 installed.append(tool)
         return installed
 
+    def all_live_paths_present(self, tool: Tool) -> bool:
+        """True iff EVERY config_dir's resolved live path exists on disk.
+
+        Stricter than `detect_installed` (which only checks `config_dirs[0]`).
+        Used by the `tools` table's pathological-state check for managed
+        multi-dir tools — a tool whose first dir is intact but a later dir
+        was deleted is still in a broken state and must surface as ⚠.
+        """
+        return all(
+            self._resolver.exists(self._resolver.tool_dir(tool, i))
+            for i in range(len(tool.config_dirs))
+        )
+
     def list_profiles(self) -> list[Profile]:
         """Convenience pass-through used by some tests; CLI uses store directly."""
         return self._store.list()
@@ -96,6 +160,18 @@ class ProfileService:
     def _require_initialized(self) -> None:
         if not self._store.list():
             raise StateNotInitializedError("switcher has not been initialized; run 'switcher init'")
+
+    def _require_managed(self) -> None:
+        """Guard for commands that need at least one tool under management.
+
+        Distinct from _require_initialized: a freshly-uninstalled-no-purge
+        state has profiles on disk (passes _require_initialized) but no
+        active map (fails _require_managed).
+        """
+        if not self._store.get_active():
+            raise NoToolsManagedError(
+                "no tools currently managed; run 'switcher rescan' to discover installed tools"
+            )
 
     def _seed_credentials(self, src_profile: str, dst_profile: str, tool: Tool) -> None:
         """Copy a tool's credential files from src_profile into dst_profile.
@@ -149,6 +225,13 @@ class ProfileService:
         the same transaction. Validation is performed against the proposed
         active map (which determines the expected profile_subdir target),
         not the on-disk one.
+
+        v0.1.4: tries filesystem-truth discovery first (handles legacy drift
+        where the current registry no longer mentions paths still managed on
+        disk). Falls back to the v0.1.3 strict registry-derived path only
+        when discovery returns empty for a registered tool. Orphan tools
+        with empty discovery emit a migration warning (matches v0.1.3
+        no-derivation-possible behavior, but now visible to the user).
         """
         cached_on_disk = self._store.get_active_live_paths()
         result: dict[str, list[str]] = {}
@@ -158,9 +241,33 @@ class ProfileService:
                 # Trust an already-validated cache entry.
                 result[tool_id] = existing
                 continue
+
+            # 1. FS-truth discovery (spec §4.2).
+            discovered = self._discover_live_paths_for_active(tool_id, profile_name)
+            if discovered:
+                result[tool_id] = discovered
+                # Consistency warning: registry promises N config_dirs but
+                # discovery returned M ≠ N — suggests user-side reconciliation.
+                tool = find_tool(self._registry, tool_id)
+                if tool is not None and len(tool.config_dirs) != len(discovered):
+                    self._warn_migration(
+                        tool_id,
+                        (
+                            f"registry has {len(tool.config_dirs)} config_dir(s), "
+                            f"but {len(discovered)} live path(s) resolve into the "
+                            f"profile dir. Recorded all discovered paths — "
+                            f"consider 'switcher unmanage {tool_id}' then "
+                            f"'switcher rescan --only {tool_id}' to reconcile."
+                        ),
+                    )
+                continue
+
+            # 2. Fallback: v0.1.3 registry-strict derivation. Reached when
+            # discovery found nothing AND the tool is still registered.
             tool = find_tool(self._registry, tool_id)
             if tool is None:
-                continue  # orphan tool — no derivation possible
+                self._warn_migration(tool_id, "no registry entry and no live symlinks found")
+                continue
             try:
                 result[tool_id] = self._derive_live_paths_strict(tool, profile_name)
             except _MigrationValidationError as e:
@@ -192,6 +299,134 @@ class ProfileService:
                 )
             derived.append(str(live))
         return derived
+
+    def _expected_subdirs_for(self, tool_id: str) -> frozenset[str]:
+        """Profile-subdir names this tool may legitimately own on disk.
+
+        Union of (a) the tool's current registry subdirs and (b) historical
+        subdirs from prior switcher versions. Used by FS-truth migration
+        discovery (spec §4.2) to bound which symlinks count for which tool
+        and prevent cross-tool misattribution in multi-tool profiles.
+        """
+        tool = find_tool(self._registry, tool_id)
+        current: frozenset[str] = (
+            frozenset(dm.profile_subdir for dm in tool.config_dirs)
+            if tool is not None
+            else frozenset()
+        )
+        historical = _HISTORICAL_PROFILE_SUBDIRS.get(tool_id, frozenset())
+        return current | historical
+
+    def _candidate_live_paths_for(self, tool_id: str) -> set[Path]:
+        """EXACT live paths this tool may legitimately own on disk.
+
+        Union of (a) the tool's current registry tool_dirs and (b) historical
+        full-path templates expanded through the resolver. Returns concrete
+        Path objects — NOT a (parents x basenames) cross-product.
+
+        The cross-product approach the v0.1.4 RC originally shipped allowed
+        phantom paths like `~/github-copilot` (parent ~ from registry,
+        basename github-copilot from history) to be classified as managed.
+        Hermes / CodeRabbit flagged that as a destructive-false-positive
+        path: a user-created symlink at one of those phantom paths whose
+        target happened to resolve into an owned profile subdir would be
+        recorded in active_live_paths and later mutated by uninstall.
+
+        Switching to exact paths eliminates that class of false positive
+        entirely while preserving legacy migration coverage — the
+        historical paths still come along, just as concrete entries
+        instead of as (parent, basename) factors.
+        """
+        paths: set[Path] = set()
+        tool = find_tool(self._registry, tool_id)
+        if tool is not None:
+            for i in range(len(tool.config_dirs)):
+                paths.add(self._resolver.tool_dir(tool, i))
+        historical_pairs = (
+            _HISTORICAL_LIVE_PATH_PAIRS_WINDOWS if IS_WINDOWS else _HISTORICAL_LIVE_PATH_PAIRS_POSIX
+        )
+        for raw in historical_pairs.get(tool_id, {}):
+            # resolver.expand handles `~` (POSIX) and %ENV% (Windows) and
+            # routes ~ against the resolver's configured home so injected
+            # tmp_home in tests works correctly.
+            paths.add(self._resolver.expand(raw))
+        return paths
+
+    def _subdir_for_historical_live_path(self, tool_id: str, live: Path) -> str | None:
+        """Recover a `profile_subdir` for a cached live path that is no
+        longer in the current registry (registry-drift resume path).
+
+        Used by `_classify_uninstall_mappings` when a cached live path
+        is a real dir / missing (i.e., not a link anymore) AND the current
+        registry doesn't mention it — typically a partial uninstall
+        followed by a registry rewrite that removed the path's config_dir.
+        Without this fallback we'd misclassify the already-restored
+        mapping as CORRUPT and refuse the resume (Hermes blocker
+        post-b621f02).
+
+        Returns the historical subdir if the live path matches a
+        historical entry for the tool, else None.
+        """
+        historical_pairs = (
+            _HISTORICAL_LIVE_PATH_PAIRS_WINDOWS if IS_WINDOWS else _HISTORICAL_LIVE_PATH_PAIRS_POSIX
+        )
+        for raw, subdir in historical_pairs.get(tool_id, {}).items():
+            if self._resolver.expand(raw) == live:
+                return subdir
+        return None
+
+    def _discover_live_paths_for_active(self, tool_id: str, profile_name: str) -> list[str]:
+        """Walk the FS for symlinks resolving into this tool's owned subdirs.
+
+        Trusts the filesystem over the registry. Used during legacy migration
+        when active_live_paths is unpopulated (spec §4.2). The per-tool subdir
+        map prevents misattribution in multi-tool profiles.
+
+        Each candidate path comes from either (a) the current registry's
+        tool_dirs or (b) the historical exact-path table — never a
+        cross-product. The path must (a) exist as a link, (b) resolve into
+        an owned profile subdir for THIS tool. User-created symlinks at
+        unrelated paths (`~/copilot-backup`) and at phantom cross-product
+        paths (`~/github-copilot` after the v0.1.4 builtin rewrite) are
+        both excluded by construction.
+
+        Returns the discovered live paths as string-form absolute paths.
+        Empty list means "no symlinks resolve into a subdir this tool owns";
+        callers fall back to _derive_live_paths_strict or emit a migration
+        warning per the orphan-tool path.
+        """
+        profile_dir = self._store.profile_dir(profile_name)
+        if not profile_dir.is_dir():
+            return []
+
+        expected_subdirs = self._expected_subdirs_for(tool_id)
+        if not expected_subdirs:
+            return []
+
+        # Resolve only those expected subdirs that actually exist on disk;
+        # non-existent ones can't be the target of any symlink anyway.
+        owned_targets: set[Path] = set()
+        for sub in expected_subdirs:
+            candidate = profile_dir / sub
+            if candidate.is_dir():
+                owned_targets.add(candidate.resolve())
+        if not owned_targets:
+            return []
+
+        discovered: list[Path] = []
+        for live in self._candidate_live_paths_for(tool_id):
+            if not self._resolver.is_link(live):
+                # Real dir, regular file, or absent — not a managed link.
+                continue
+            try:
+                resolved = live.resolve()
+            except (OSError, RuntimeError):
+                # Broken/dangling/cyclic link — skip silently.
+                continue
+            if resolved in owned_targets:
+                discovered.append(live)
+        # Deterministic order: cached + warnings should be platform-stable.
+        return sorted(str(p) for p in discovered)
 
     @staticmethod
     def _warn_migration(tool_id: str, reason: str) -> None:
@@ -253,7 +488,7 @@ class ProfileService:
                                     profile_subdir="<unresolvable>",
                                     live_path=live,
                                     profile_dir_subdir=profile_dir,
-                                    state=_UninstallMappingState.CORRUPT,
+                                    state=UninstallMappingState.CORRUPT,
                                     corruption_reason=(
                                         f"cached live path {live} resolves outside "
                                         f"the profile dir or cannot be resolved: {e}"
@@ -267,8 +502,13 @@ class ProfileService:
                         # Match the cached path against a current registry
                         # config_dir by exact path — works for in-registry
                         # resume even when other config_dirs in the same tool
-                        # drifted. Falls through to CORRUPT for orphan resume
-                        # OR registry-drifted resume on this specific mapping.
+                        # drifted. Falls back to historical pair table for
+                        # registry-drift resume (Hermes blocker post-b621f02:
+                        # a partial uninstall already restored this path,
+                        # then the user shrank the registry to drop the
+                        # config_dir → without the historical fallback the
+                        # mapping mis-classifies as CORRUPT and the resume
+                        # wedges).
                         matched_subdir: str | None = None
                         if tool is not None:
                             for i, dm in enumerate(tool.config_dirs):
@@ -276,13 +516,15 @@ class ProfileService:
                                     matched_subdir = dm.profile_subdir
                                     break
                         if matched_subdir is None:
+                            matched_subdir = self._subdir_for_historical_live_path(tool_id, live)
+                        if matched_subdir is None:
                             result.append(
                                 _UninstallMapping(
                                     tool_id=tool_id,
                                     profile_subdir="<unknown>",
                                     live_path=live,
                                     profile_dir_subdir=profile_dir,
-                                    state=_UninstallMappingState.CORRUPT,
+                                    state=UninstallMappingState.CORRUPT,
                                     corruption_reason=(
                                         f"cached live path {live} is not a link "
                                         f"and no matching registry config_dir was "
@@ -310,7 +552,7 @@ class ProfileService:
                         profile_subdir="<unknown>",
                         live_path=Path("<unknown>"),
                         profile_dir_subdir=profile_dir,
-                        state=_UninstallMappingState.CORRUPT,
+                        state=UninstallMappingState.CORRUPT,
                         corruption_reason="orphan tool: no registry entry and no cached live_paths",
                     )
                 )
@@ -333,25 +575,30 @@ class ProfileService:
 
     def _classify_one_mapping(
         self, live: Path, profile_target: Path
-    ) -> tuple[_UninstallMappingState, str]:
+    ) -> tuple[UninstallMappingState, str]:
         """Classify a single DirMapping. See spec §3.2."""
         # SYMLINK? Verify link target matches expected profile subdir.
         if self._resolver.is_link(live):
-            if not profile_target.exists():
+            if not profile_target.is_dir():
+                # `is_dir` is stricter than `exists` — a regular file at
+                # `profile_target` would have passed `exists()` but then
+                # crashed `copytree()` mid-uninstall (CodeRabbit Major).
+                # Either way (missing OR not a directory) the mapping is
+                # unsafe to execute; classify as CORRUPT in pre-flight.
                 return (
-                    _UninstallMappingState.CORRUPT,
-                    f"link target profile dir {profile_target} missing",
+                    UninstallMappingState.CORRUPT,
+                    f"link target profile dir {profile_target} missing or not a directory",
                 )
             try:
                 actual = live.resolve()
             except OSError as e:
                 return (
-                    _UninstallMappingState.CORRUPT,
+                    UninstallMappingState.CORRUPT,
                     f"could not resolve link {live}: {e}",
                 )
             if actual != profile_target.resolve():
                 return (
-                    _UninstallMappingState.CORRUPT,
+                    UninstallMappingState.CORRUPT,
                     f"live link {live} points to {actual}, expected {profile_target}",
                 )
             # Pre-flight collision check: a sibling temp dir at this point
@@ -361,11 +608,11 @@ class ProfileService:
             temp = _temp_dir_for_uninstall(live)
             if temp.exists():
                 return (
-                    _UninstallMappingState.CORRUPT,
+                    UninstallMappingState.CORRUPT,
                     f"sibling temp dir {temp} exists alongside live link "
                     f"{live}; refusing to overwrite. Inspect/remove {temp} manually.",
                 )
-            return (_UninstallMappingState.SYMLINK, "")
+            return (UninstallMappingState.SYMLINK, "")
 
         # MISSING_LIVE_TEMP_PRESENT?
         if not live.exists():
@@ -377,24 +624,24 @@ class ProfileService:
             # guard: real directory only.
             temp_is_link = temp.is_symlink() or (IS_WINDOWS and os.path.isjunction(temp))
             if temp.is_dir() and not temp_is_link and self._dirs_match(temp, profile_target):
-                return (_UninstallMappingState.MISSING_LIVE_TEMP_PRESENT, "")
+                return (UninstallMappingState.MISSING_LIVE_TEMP_PRESENT, "")
             return (
-                _UninstallMappingState.CORRUPT,
+                UninstallMappingState.CORRUPT,
                 f"live path missing and no recoverable temp dir at {temp}",
             )
 
         # ALREADY_RESTORED?
         if live.is_dir():
             if self._dirs_match(live, profile_target):
-                return (_UninstallMappingState.ALREADY_RESTORED, "")
+                return (UninstallMappingState.ALREADY_RESTORED, "")
             return (
-                _UninstallMappingState.CORRUPT,
+                UninstallMappingState.CORRUPT,
                 f"real dir at {live} does not match profile contents at {profile_target}",
             )
 
         # Regular file or other — CORRUPT.
         return (
-            _UninstallMappingState.CORRUPT,
+            UninstallMappingState.CORRUPT,
             f"unexpected non-link non-dir entry at {live}",
         )
 
@@ -439,10 +686,45 @@ class ProfileService:
 
     # Operations ------------------------------------------------------------
 
-    def init(self) -> str:
+    def init(
+        self,
+        target_ids: Sequence[str] | None = None,
+        *,
+        requested_but_not_installed: Sequence[str] = (),
+        skipped_via_skip_flag: Sequence[str] = (),
+        skipped_via_interactive: Sequence[str] = (),
+    ) -> InitReport:
+        """v0.1.4: target_ids filters which detected tools to capture.
+
+        target_ids:
+          None — capture every detected tool (v0.1.3 default-path behavior,
+            including the empty-detect-warn case).
+          Non-empty list — capture only the intersection of target_ids and
+            detect_installed(). If intersection is empty AND the caller
+            asked for a specific filter, raise NothingToInitializeError.
+
+        The three keyword-only diff lists are pass-through informational
+        fields populated by the CLI (which knows user intent). The service
+        layer doesn't compute them; it echoes them back in the report.
+        """
         if self._store.list():
             raise StateAlreadyInitializedError("switcher is already initialized")
         installed = self.detect_installed()
+        if target_ids is not None:
+            requested = set(target_ids)
+            installed = [t for t in installed if t.id in requested]
+            if not installed:
+                raise NothingToInitializeError(
+                    "no requested tools are installed; nothing to initialize"
+                )
+        elif not installed:
+            # Bare init with empty detect: preserve v0.1.3 warn-and-empty.
+            print(
+                "warning: no installed tools detected; switcher initialized "
+                "with empty profiles. Run 'switcher rescan' after installing "
+                "a managed tool.",
+                file=sys.stderr,
+            )
         # Pre-flight: every detected live path must be a (real) directory or a
         # plain non-existent path. Two pathological shapes need to fail BEFORE
         # the first _store.create() call — otherwise the dated profile gets
@@ -473,21 +755,70 @@ class ProfileService:
         # set_active_live_paths separately (crash window).
         active = {t.id: current_name for t in installed}
         self._store.set_active_state(active, live_paths_cache)
-        return current_name
+        return InitReport(
+            profile_name=current_name,
+            captured=[t.id for t in installed],
+            requested_but_not_installed=list(requested_but_not_installed),
+            skipped_via_skip_flag=list(skipped_via_skip_flag),
+            skipped_via_interactive=list(skipped_via_interactive),
+        )
 
     def use(self, profile_name: str, only: list[str] | None = None) -> None:
         self._require_initialized()
+        # v0.1.4 §3.1/§3.5: empty active map → loud failure rather than
+        # a silent no-op switch.
+        self._require_managed()
         profile = self._store.get(profile_name)
         active = self._store.get_active()
+        managed = set(active.keys())
+        registered = {t.id for t in self._registry}
         if only is not None:
             for tid in only:
                 if tid not in profile.tools:
                     raise ToolNotInProfileError(
                         f"profile {profile_name!r} does not include {tid!r}"
                     )
+                if tid not in managed:
+                    # v0.1.4 §3.1 durability: --only must intersect the
+                    # managed set, or the explicit request quietly re-
+                    # adopts an unmanaged tool's live dir.
+                    raise ToolNotManagedError(
+                        f"tool {tid!r} is not currently managed. "
+                        f"To add it: switcher rescan --only {tid}"
+                    )
+                if tid not in registered:
+                    # Hermes blocker: explicit --only of an orphan id (in
+                    # active map but no registry entry, e.g. left behind by
+                    # `uninstall --force` non-purge) used to surface the
+                    # generic "unknown tool" mid-loop. Surface the orphan
+                    # framing up-front with the right remediation.
+                    raise UnknownToolError(
+                        f"tool {tid!r} is in active map but has no registry entry "
+                        f"(orphan); cannot switch. Restore the registry TOML, or "
+                        f"run 'switcher unmanage {tid} --force' to drop it."
+                    )
             target_ids = list(only)
         else:
-            target_ids = sorted(profile.tools.keys())
+            # v0.1.4 §3.1 durability: the default switches only the
+            # managed subset of the profile, not every tool in
+            # profile.tools. Without this filter, use(other_profile)
+            # re-activates a tool the user just unmanaged.
+            #
+            # Hermes blocker: also drop orphan ids (managed but not in
+            # registry). create() carries them into profile.tools for
+            # consistency, but use()'s find_tool resolve hard-errors on
+            # them. Filtering here keeps the default switch usable on
+            # an orphan-bearing active map; the user still sees the
+            # orphan in `switcher tools` and can fix it via unmanage.
+            target_ids = sorted(profile.tools.keys() & managed & registered)
+        # v0.1.4 §3.1 consultant finding: _require_managed already
+        # passed (active is non-empty) but this profile contributes
+        # zero managed tools. Hard-error rather than silent no-op
+        # (matches spec's "Hard error. Preferred." decision).
+        if not target_ids:
+            raise NoToolsManagedError(
+                f"profile {profile_name!r} contains no currently managed tools; nothing to switch"
+            )
         # Pre-flight 1: resolve every tool BEFORE mutating any link. A stale
         # tool id in profile.tools (registry drift, plugin removed, hand-edited
         # state) would otherwise surface partway through the swap loop and
@@ -523,17 +854,42 @@ class ProfileService:
     def save(self, name: str) -> None:
         """Snapshot live config into a new profile.
 
-        Only currently-installed tools are snapshotted. A tool that's in the
-        active map but no longer installed live is intentionally skipped:
-        save's contract is "snapshot live state", and a uninstalled-but-
-        persisted-in-store flow doesn't fit that contract cleanly. If the
-        user wants that data preserved, the active profile already holds it
-        and `use(other_profile)` won't disturb it.
+        Only currently-managed AND currently-installed tools are snapshotted.
+
+        v0.1.4 §3.2: filtered by active.keys(). Two affected scenarios:
+          1. Pre-v0.1.4 env_override workaround users stop seeing
+             intentionally-excluded tools captured under unrelated
+             profile names.
+          2. A tool installed live AFTER init (so it's not in active)
+             is no longer implicitly added to new snapshots. Run
+             `switcher rescan --only <tool>` first to bring it under
+             management.
+
+        Tool-in-active-but-no-longer-installed-live is still intentionally
+        skipped: save's contract is "snapshot live state", and that data is
+        already preserved under the active profile — `use(other_profile)`
+        won't disturb it.
         """
         self._require_initialized()
+        # v0.1.4 §3.5: empty active map → fail loud rather than create
+        # an empty profile silently.
+        self._require_managed()
         if self._store.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
-        installed = self.detect_installed()
+        managed = set(self._store.get_active().keys())
+        installed = [t for t in self.detect_installed() if t.id in managed]
+        # v0.1.4 §3.5: closing the second silent-empty-profile hole.
+        # _require_managed already passed (active is non-empty), but if every
+        # managed tool was uninstalled outside switcher (or the registry was
+        # reshuffled so no managed id resolves), `installed` is empty and the
+        # downstream loop would persist a profile with no tools dict entries
+        # and no captured data. Fail loud, with a hint that mirrors the spec's
+        # advice for the empty-active-map case.
+        if not installed:
+            raise NoToolsManagedError(
+                "no managed tools are currently installed live; nothing to snapshot. "
+                "reinstall the tools or run 'switcher uninstall' to drop stale entries"
+            )
         # Pre-flight: every live path that detect_installed surfaced must be
         # a real directory. Two pathological shapes slip through if we use
         # plain `live.exists()` here: a regular file (exists True, is_dir
@@ -596,6 +952,9 @@ class ProfileService:
         save()'s rollback discipline.
         """
         self._require_initialized()
+        # v0.1.4 §3.5: empty active map → fail loud rather than create
+        # an empty-tools profile that looks valid until first use.
+        self._require_managed()
         if self._store.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
         active = self._store.get_active()
@@ -797,7 +1156,7 @@ class ProfileService:
         # via --force per §3.4) for tools that aren't in skipped_tools.
         skipped_ids = {t for t, _ in skipped_tools}
         for m in mappings:
-            if m.state == _UninstallMappingState.CORRUPT and m.tool_id not in skipped_ids:
+            if m.state == UninstallMappingState.CORRUPT and m.tool_id not in skipped_ids:
                 raise UninstallPreflightError(
                     f"tool {m.tool_id!r} mapping {m.profile_subdir!r}: {m.corruption_reason}"
                 )
@@ -864,6 +1223,114 @@ class ProfileService:
         shutil.rmtree(self._store.state_dir())
         report.purged = True
         return report
+
+    # Unmanage ---------------------------------------------------------------
+
+    def unmanage(
+        self,
+        tool_id: str,
+        *,
+        dry_run: bool = False,
+        force: bool = False,
+    ) -> UnmanageReport:
+        """Single-tool uninstall. Spec §2.2.
+
+        Restores the tool's live path(s) and removes it from active +
+        active_live_paths. Mirrors v0.1.3 uninstall's per-DirMapping
+        atomicity (classification + automatic resume via
+        _execute_uninstall_mapping). CORRUPT mappings always refuse
+        regardless of --force; --force handles only the orphan-no-cache
+        case (matches uninstall --force at service.py's pre-flight).
+        """
+        self._require_initialized()
+        self._require_managed()
+        active = self._store.get_active()
+        if tool_id not in active:
+            raise ToolNotManagedError(
+                f"tool {tool_id!r} is not managed; nothing to unmanage. "
+                f"To add it: switcher rescan --only {tool_id}"
+            )
+
+        # Orphan-no-cache check (mirrors uninstall pre-flight).
+        live_paths_cache = self.get_active_live_paths()
+        has_cache = bool(live_paths_cache.get(tool_id))
+        has_registry = find_tool(self._registry, tool_id) is not None
+        skipped_orphan = False
+        if not has_cache and not has_registry:
+            if not force:
+                raise UninstallPreflightError(
+                    f"orphan tool {tool_id!r}: no registry entry and no cached "
+                    f"live_paths. Restore the registry TOML, or pass --force "
+                    f"to skip this tool (its symlinks will remain in place)."
+                )
+            # --force on orphan-no-cache: dropping the active entry while
+            # owned profile data still exists on disk lets a later
+            # `uninstall --purge` silently destroy that data — the tool is
+            # no longer in `active`, so its purge-time skipped-tool guard
+            # at the uninstall pre-flight never fires (Hermes blocker
+            # post-PR-#5).
+            #
+            # Refuse if any owned subdir for this tool exists in the
+            # profile dir (current registry subdirs union historical ones
+            # via `_expected_subdirs_for`). The user's escape: restore
+            # the registry TOML and re-run normal `unmanage`, which
+            # cleans up properly; or delete the subdirs manually first.
+            #
+            # Note on symlinks: derive-on-read in `get_active_live_paths()`
+            # above already catches the case where a live symlink at one of
+            # the tool's known paths points into an owned subdir — that
+            # populates the cache and `has_cache` becomes True, so we
+            # don't even reach here. (For symlinks whose targets DON'T
+            # resolve into owned subdirs anymore, the purge concern shifts
+            # back to the data inside the subdirs, which is what the
+            # subdir check above defends.) For tools / paths entirely
+            # outside our historical tables no auto-detection is possible
+            # and the user is responsible — same as pre-fix.
+            profile_name = active[tool_id]
+            profile_dir = self._store.profile_dir(profile_name)
+            expected_subdirs = self._expected_subdirs_for(tool_id)
+            existing_subdirs = sorted(
+                sub for sub in expected_subdirs if (profile_dir / sub).is_dir()
+            )
+            if existing_subdirs:
+                raise UninstallPreflightError(
+                    f"orphan tool {tool_id!r} still has profile data on disk "
+                    f"(subdir(s) {existing_subdirs} under {profile_name!r}). "
+                    f"Refusing to drop from active map — that data would be "
+                    f"silently lost on a later `switcher uninstall --purge`. "
+                    f"Restore the registry TOML and re-run, or delete the "
+                    f"subdir(s) manually first."
+                )
+            skipped_orphan = True
+
+        # Classify mappings; filter to just this tool.
+        all_mappings = self._classify_uninstall_mappings()
+        mappings = [m for m in all_mappings if m.tool_id == tool_id]
+
+        # CORRUPT mappings always refuse, even with --force.
+        # (Matches uninstall behavior at service.py's pre-flight step 5.)
+        if not skipped_orphan:
+            for m in mappings:
+                if m.state == UninstallMappingState.CORRUPT:
+                    raise UninstallPreflightError(
+                        f"tool {tool_id!r} mapping {m.profile_subdir!r}: {m.corruption_reason}"
+                    )
+
+        if dry_run:
+            return UnmanageReport(tool_id=tool_id, mappings=mappings, skipped_orphan=skipped_orphan)
+
+        # Execute per-DirMapping unwind, unless skipping orphan.
+        if not skipped_orphan:
+            for m in mappings:
+                self._execute_uninstall_mapping(m)
+
+        # Atomic state mutation: drop tool_id from active + cache in a
+        # single set_active_state call.
+        new_active = {k: v for k, v in active.items() if k != tool_id}
+        new_cache = {k: v for k, v in live_paths_cache.items() if k != tool_id}
+        self._store.set_active_state(new_active, new_cache)
+
+        return UnmanageReport(tool_id=tool_id, mappings=mappings, skipped_orphan=skipped_orphan)
 
     # Rescan -----------------------------------------------------------------
 
@@ -1248,7 +1715,7 @@ class ProfileService:
         sibling temp path collides with unrelated content; if we still see
         a temp here it's a race condition, so fail loud (do NOT rmtree).
         """
-        if m.state == _UninstallMappingState.SYMLINK:
+        if m.state == UninstallMappingState.SYMLINK:
             temp = _temp_dir_for_uninstall(m.live_path)
             if temp.exists():
                 raise UninstallPreflightError(
@@ -1278,7 +1745,7 @@ class ProfileService:
                 raise
             restore_real_dir(temp, m.live_path)
             return
-        if m.state == _UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
+        if m.state == UninstallMappingState.MISSING_LIVE_TEMP_PRESENT:
             temp = _temp_dir_for_uninstall(m.live_path)
             # Re-check live_path before rename: classification was made from an
             # earlier read; if the live path reappeared (concurrent process,
@@ -1300,11 +1767,32 @@ class ProfileService:
                 )
             temp.rename(m.live_path)
             return
-        if m.state == _UninstallMappingState.ALREADY_RESTORED:
+        if m.state == UninstallMappingState.ALREADY_RESTORED:
             # No-op; already done.
             return
         # CORRUPT shouldn't reach here — pre-flight rejected it.
         raise AssertionError(f"unreachable: {m.state}")
+
+
+@dataclass(frozen=True)
+class InitReport:
+    """Return shape of ProfileService.init() — v0.1.4.
+
+    profile_name: the dated-current profile created.
+    captured: tool ids actually captured into the new profile.
+    requested_but_not_installed: ids the user passed via --only that
+        aren't installed locally (informational; not an error when SOME
+        tools in the --only list were captured).
+    skipped_via_skip_flag: ids excluded via --skip (informational).
+    skipped_via_interactive: ids the user answered No to in
+        --interactive mode (informational).
+    """
+
+    profile_name: str
+    captured: list[str]
+    requested_but_not_installed: list[str]
+    skipped_via_skip_flag: list[str]
+    skipped_via_interactive: list[str]
 
 
 @dataclass
@@ -1312,6 +1800,24 @@ class UninstallReport:
     skipped: list[tuple[str, str]]
     mappings: list[_UninstallMapping]
     purged: bool = False
+
+
+@dataclass(frozen=True)
+class UnmanageReport:
+    """Return shape of ProfileService.unmanage() — v0.1.4.
+
+    tool_id: which tool was unmanaged.
+    mappings: per-DirMapping classifications + execution outcomes.
+        Uses the (still-private) _UninstallMapping dataclass — same
+        shape as UninstallReport.mappings. CLI accesses only the
+        attribute surface (state, live_path, profile_subdir).
+    skipped_orphan: True when the tool was orphan-no-cache AND
+        --force was passed; symlinks were left in place.
+    """
+
+    tool_id: str
+    mappings: list[_UninstallMapping]
+    skipped_orphan: bool = False
 
 
 @dataclass

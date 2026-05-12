@@ -142,6 +142,15 @@ reviews:
         subprocess. Assert disk state across full lifecycles, not
         just return values. Extend per-tool invariants when adding
         tools.
+    - path: "tests/unit/**"
+      instructions: >-
+        Treat `assert result.exit_code == 0` (or equivalent CLI outcome
+        assertion) as a precondition, not behavior under review. Multiple
+        post-invocation assertions in one test are fine when they probe
+        a single coherent outcome of the same call.
+    - path: "tests/integration/**"
+      instructions: >-
+        Same precondition-vs-behavior rule as tests/unit/**.
     - path: "src/switcher/builtins/*.toml"
       instructions: >
         Builtin tool definitions. Each must round-trip through

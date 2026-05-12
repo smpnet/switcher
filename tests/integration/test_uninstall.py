@@ -21,6 +21,8 @@ from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
+from .conftest import install_two_dir_copilot_override
+
 pytestmark = pytest.mark.integration
 
 
@@ -241,16 +243,18 @@ def test_uninstall_processes_all_cached_paths_when_registry_shrinks(
     one. Uninstall must process ALL cached paths (driving from the cache),
     not silently drop the extras and leave a dangling symlink behind.
     """
+    # Start with the legacy two-dir copilot shape so init captures both
+    # config dirs into the cache. Then simulate the registry shrinking.
+    install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     s.init()
-    # Pre-condition: copilot's cache has 2 entries (its two builtin config_dirs).
+    # Pre-condition: copilot's cache has 2 entries (the override's two config_dirs).
     assert len(s._store.get_active_live_paths()["copilot"]) == 2
 
-    # Simulate registry drift: shrink copilot to a single config_dir via a
-    # user TOML override. The cached entries are unchanged (cache writes
-    # only on capture/rescan).
+    # Simulate registry drift: shrink copilot to a single config_dir by
+    # rewriting the user override. The cached entries are unchanged (cache
+    # writes only on capture/rescan).
     registry_d = tmp_state / "registry.d"
-    registry_d.mkdir(parents=True, exist_ok=True)
     (registry_d / "copilot.toml").write_text(
         'id = "copilot"\n'
         'name = "GitHub Copilot CLI (shrunk)"\n'
@@ -364,6 +368,8 @@ def test_uninstall_after_config_dirs_reorder(tmp_state: Path, tmp_home: Path) ->
     mappings to be classified CORRUPT (target-mismatch) and blocked
     uninstall.
     """
+    # Start with the legacy two-dir copilot shape so init captures both.
+    install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     s.init()
     # Pre-condition: copilot's cache has 2 entries.
@@ -374,7 +380,6 @@ def test_uninstall_after_config_dirs_reorder(tmp_state: Path, tmp_home: Path) ->
     # uninstall. The subdirs and live paths stay the same, only the order
     # within `config_dirs` swaps.
     registry_d = tmp_state / "registry.d"
-    registry_d.mkdir(parents=True, exist_ok=True)
     (registry_d / "copilot.toml").write_text(
         'id = "copilot"\n'
         'name = "GitHub Copilot CLI (reordered)"\n'
@@ -461,3 +466,80 @@ def test_uninstall_dry_run_purge_bypasses_non_tty_guard(
     assert tmp_state.exists()
     # Live paths still symlinks (dry run = no mutation).
     assert _is_link(tmp_home / ".claude")
+
+
+def test_uninstall_resume_after_partial_uninstall_and_registry_drift(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """Hermes blocker post-b621f02: an interrupted uninstall on the legacy
+    two-dir Copilot, followed by a registry rewrite to the new single-dir
+    shape, used to wedge the resume — the cached path was no longer a
+    link AND the current registry didn't mention it, so
+    `_classify_uninstall_mappings` defaulted to CORRUPT and the pre-flight
+    refused. The historical-pair table now provides the missing
+    profile_subdir so the resume completes cleanly.
+
+    Repro flow:
+      1. init with the legacy two-dir copilot override
+         (~/.config/github-copilot + ~/.copilot)
+      2. execute only the first uninstall mapping (simulate
+         crash/interruption mid-uninstall)
+      3. rewrite the registry to drop the github-copilot config_dir
+      4. re-run uninstall — must succeed (resumes the second mapping
+         and treats the first as ALREADY_RESTORED).
+    """
+    install_two_dir_copilot_override(tmp_state)
+    s = _service(tmp_state, tmp_home)
+    s.init()
+
+    # Pre-conditions: both copilot live paths are symlinks; cache has both.
+    # The legacy path differs by platform — POSIX uses ~/.config/github-copilot,
+    # Windows uses %LOCALAPPDATA%\github-copilot (see install_two_dir_copilot_override
+    # in tests/integration/conftest.py). The conftest tmp_home fixture sets
+    # LOCALAPPDATA to <home>/AppData/Local on Windows.
+    legacy_link = (
+        tmp_home / "AppData" / "Local" / "github-copilot"
+        if IS_WINDOWS
+        else tmp_home / ".config" / "github-copilot"
+    )
+    new_link = tmp_home / ".copilot"
+    assert _is_link(legacy_link)
+    assert _is_link(new_link)
+    assert len(s._store.get_active_live_paths()["copilot"]) == 2
+
+    # Step 2: simulate partial uninstall — restore ONLY the legacy mapping.
+    profile_name = s._store.get_active()["copilot"]
+    profile_dir = s._store.profile_dir(profile_name)
+    legacy_target = profile_dir / "copilot-auth"
+    _drop_link(legacy_link)
+    shutil.copytree(legacy_target, legacy_link)
+    # Cache untouched — still claims both paths are managed.
+
+    # Step 3: rewrite registry to drop github-copilot. Now the registry
+    # only mentions ~/.copilot.
+    registry_d = tmp_state / "registry.d"
+    (registry_d / "copilot.toml").write_text(
+        'id = "copilot"\n'
+        'name = "GitHub Copilot CLI (shrunk)"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.copilot"\n'
+        'windows_path = "%USERPROFILE%\\\\.copilot"\n'
+        'profile_subdir = "copilot-config"\n'
+    )
+
+    # Step 4: re-run uninstall — must NOT wedge on CORRUPT classification.
+    shrunk = _service(tmp_state, tmp_home)
+    report = shrunk.uninstall(dry_run=True)
+    copilot_mappings = [m for m in report.mappings if m.tool_id == "copilot"]
+    assert len(copilot_mappings) == 2, [
+        (m.profile_subdir, m.state.value, m.corruption_reason) for m in copilot_mappings
+    ]
+    # Neither mapping CORRUPT — historical pair provided the missing subdir.
+    assert all(m.state.value != "corrupt" for m in copilot_mappings), [
+        (m.profile_subdir, m.state.value, m.corruption_reason) for m in copilot_mappings
+    ]
+
+    # Real uninstall completes — second link is unwound, first is no-op.
+    shrunk.uninstall()
+    assert (tmp_home / ".copilot").is_dir() and not _is_link(tmp_home / ".copilot")
+    assert legacy_link.is_dir() and not _is_link(legacy_link)

@@ -54,7 +54,7 @@ def test_list_empty_when_uninitialized(runner: CliRunner, tmp_state: Path) -> No
 def test_status_no_active_when_uninitialized(runner: CliRunner, tmp_state: Path) -> None:
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
-    assert "no active profiles" in result.stdout
+    assert "no tools currently managed" in result.stdout.lower()
 
 
 def test_init_run_succeeds(runner: CliRunner, tmp_home: Path, tmp_state: Path) -> None:

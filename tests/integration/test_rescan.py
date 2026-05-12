@@ -25,6 +25,8 @@ from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
+from .conftest import install_two_dir_copilot_override
+
 pytestmark = pytest.mark.integration
 
 # Copilot's two config dirs differ between platforms — see
@@ -180,6 +182,7 @@ def test_rescan_into_collision_refused(tmp_state: Path, tmp_home: Path) -> None:
 
 def test_rescan_seeds_missing_secondary_config_dir(tmp_state: Path, tmp_home: Path) -> None:
     """Mirror init's move_or_seed_dir behavior for missing secondary dirs."""
+    install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only
@@ -216,6 +219,7 @@ def test_rescan_rolls_back_on_partial_capture_failure(
 ) -> None:
     """Spec §4.4 / §6.4: if mapping N+1 fails after 0..N captured, undo 0..N."""
     frozen = _freeze_now(monkeypatch)
+    install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     # Suppress copilot at init so it ends up as the rescan target.
     _suppress_copilot(tmp_home)
@@ -528,6 +532,7 @@ def test_rescan_default_rollback_fails_closed_when_restore_fails(
     profile dir.
     """
     frozen = _freeze_now(monkeypatch)
+    install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only
@@ -581,6 +586,7 @@ def test_rescan_into_rollback_fails_closed_when_restore_fails(
 ) -> None:
     """Spec §4.4: `--into` rollback must also fail closed if the restore
     call fails — leave the captured sub on disk rather than silent rmtree."""
+    install_two_dir_copilot_override(tmp_state)
     s = _service(tmp_state, tmp_home)
     _suppress_copilot(tmp_home)
     s.init()  # claude only

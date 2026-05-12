@@ -16,7 +16,7 @@ from switcher.links import _create_junction
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService, _temp_dir_for_uninstall
-from switcher.service import _UninstallMappingState as State
+from switcher.service import UninstallMappingState as State
 from switcher.store import FileProfileStore
 
 
@@ -248,3 +248,34 @@ def test_classify_corrupt_when_temp_dir_collides_with_live_link(
     )
     assert re_classified.state == State.CORRUPT
     assert "temp dir" in re_classified.corruption_reason
+
+
+def test_classify_corrupt_when_profile_target_is_a_regular_file(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """CodeRabbit Major: a regular file at `profile_target` used to pass
+    the SYMLINK branch's `exists()` guard and crash mid-uninstall inside
+    `copytree()`. The pre-flight now requires `is_dir()`, classifying
+    file-at-target as CORRUPT so the corrupt-state refusal at the orchestrator
+    catches it before any mutation runs.
+
+    Calls `_classify_one_mapping` directly: the surrounding cached-paths
+    walker resolves the live link before reaching this code, and on Windows
+    junction resolution funnels the file-at-target case into a different
+    CORRUPT branch (`<unresolvable>`). Calling the unit under test directly
+    keeps coverage portable and pinpoints the exact `is_dir()` change.
+    """
+    service = _build_initialized(tmp_state, tmp_home)
+    mappings = service._classify_uninstall_mappings()
+    m = mappings[0]  # link still in place; its profile_target is a real dir
+    live = m.live_path
+    profile_target = m.profile_dir_subdir
+    assert profile_target.is_dir(), "fixture invariant: classifier's target should be a dir"
+
+    # Replace the profile-side target dir with a regular file.
+    shutil.rmtree(profile_target)
+    profile_target.write_text("intentionally not a directory")
+
+    state, reason = service._classify_one_mapping(live, profile_target)
+    assert state == State.CORRUPT
+    assert "missing or not a directory" in reason

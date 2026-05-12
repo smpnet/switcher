@@ -155,6 +155,60 @@ destructive procedure:
 Run `switcher status -v` to see which tools have cached `live_paths`
 (used by `uninstall` to recover even when the registry has drifted).
 
+### Managing the tool lifecycle
+
+`init` is one-shot. To change which tools switcher manages after init:
+
+- **Initialize with a subset of detected tools:**
+
+  ```bash
+  switcher init --only copilot              # manage Copilot only
+  switcher init --skip claude               # manage everything detected except Claude
+  switcher init --interactive               # per-tool yes/no prompt (requires a TTY)
+  ```
+
+- **Add a tool after init:** `switcher rescan --only <tool>` — the canonical
+  way to bring a single tool under management.
+
+- **Remove a single tool:** `switcher unmanage <tool>` — restores the live
+  path and drops the tool from the active map. Subsequent `use` calls won't
+  re-activate it (durability is enforced by filtering profile tools against
+  the active set).
+
+- **Remove everything:** `switcher uninstall` (relink-only) or
+  `switcher uninstall --purge` (also wipe state).
+
+After `unmanage <tool>`, running `rescan` (no flags) on a TTY prompts you
+per-tool — answering No keeps the tool excluded for that session. Use
+`rescan --only <tool>` to re-add a single tool deterministically.
+
+### Migrating from the legacy two-dir Copilot builtin
+
+v0.1.4 rewrites the bundled `copilot` builtin to target the standalone
+`copilot` binary's single config dir (`~/.copilot`). Profiles created
+before v0.1.4 — when the builtin captured both `~/.copilot` AND
+`~/.config/github-copilot` (POSIX) / `%LOCALAPPDATA%\github-copilot`
+(Windows) — keep working: their cached live paths still resolve and the
+`copilot-auth/` subdir under each profile is harmless dead data
+(switcher no longer visits it).
+
+If you want to fully migrate to the single-dir shape and drop the
+legacy `copilot-auth/` subdir from new profiles:
+
+```bash
+switcher unmanage copilot                  # restores both legacy live paths
+switcher rescan --only copilot             # captures just ~/.copilot
+```
+
+The unmanage step's pre-flight uses cached live paths, so registry
+drift doesn't break it. After `rescan`, new profiles created from
+the standalone Copilot CLI's data carry only `copilot-config/`.
+
+If you use the deprecated `gh copilot` extension instead, see
+[Adding a tool](#adding-a-tool) below — register it as a user-local
+tool with the explicit two-dir shape rather than re-using the `copilot`
+id.
+
 ## How it works
 
 `switcher init` performs a one-time setup:
@@ -404,6 +458,39 @@ profile_subdir = "foocli-xdg"
 config_dir = "foocli-xdg"        # matches the second config_dirs entry
 path = "auth.json"
 ```
+
+### Worked example: deprecated `gh copilot` extension
+
+The bundled `copilot` builtin targets the standalone `copilot` binary
+(single config dir at `~/.copilot`). The deprecated `gh copilot`
+extension uses two dirs and is **not** bundled — register it as a
+user-local tool at `<state_dir>/registry.d/gh-copilot.toml` with a
+distinct id so it doesn't collide with the standalone builtin:
+
+```toml
+id = "gh-copilot"
+name = "GitHub Copilot (gh extension, deprecated)"
+
+[[config_dirs]]
+posix_path = "~/.config/github-copilot"
+windows_path = "%LOCALAPPDATA%\\github-copilot"
+profile_subdir = "gh-copilot-auth"
+
+[[config_dirs]]
+posix_path = "~/.copilot"
+windows_path = "%USERPROFILE%\\.copilot"
+profile_subdir = "gh-copilot-config"
+
+[[credentials]]
+config_dir = "gh-copilot-auth"
+path = "apps.json"
+```
+
+> **Conflict with the standalone CLI.** Both products use `~/.copilot`.
+> If you have both installed, complete the migration to the standalone
+> CLI first (uninstall the deprecated extension, install standalone),
+> then run `switcher rescan --only copilot`. Running both side-by-side
+> against the same `~/.copilot` will produce confused state.
 
 ## Development
 

@@ -70,7 +70,7 @@ def test_detect_installed_skips_missing(
 def test_init_creates_dated_current_and_vanilla(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     assert name.endswith("-current")
     profiles = sorted(p.name for p in service.list_profiles())
     assert "vanilla" in profiles
@@ -86,7 +86,7 @@ def test_init_replaces_live_dirs_with_links(service: ProfileService, tmp_home: P
 def test_init_active_map_uses_dated_name(
     service: ProfileService, tmp_state: Path, tmp_home: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     store = FileProfileStore(tmp_state)
     active = store.get_active()
     assert active  # not empty
@@ -160,7 +160,7 @@ def test_use_switches_active_to_target(service: ProfileService, tmp_state: Path)
 def test_use_with_only_targets_subset(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     service.use("vanilla", only=["claude"])
     active = FileProfileStore(tmp_state).get_active()
     assert active["claude"] == "vanilla"
@@ -193,26 +193,63 @@ def test_use_is_idempotent(service: ProfileService, tmp_state: Path) -> None:
         assert v == "vanilla"
 
 
-def test_use_pre_validates_tools_before_mutating(
+def test_use_default_silently_filters_orphan_active_entries(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    """A profile with a stale tool id must fail before any live link changes.
+    """Default `use()` tolerates orphan ids in the active map (Hermes
+    blocker post-b621f02 follow-up).
 
-    Without pre-flight validation, the swap loop would process tools in
-    sorted order: 'claude' would switch successfully, then 'ghost' would
-    raise UnknownToolError, leaving the filesystem half-switched. Pre-flight
-    must reject the call without touching any live link.
+    `create()` keeps orphan ids in `profile.tools` per spec §3.5 so the
+    management surface stays accurate, but the resolve loop in `use()`
+    used to crash on `find_tool(orphan) → None`. The fix filters
+    `target_ids` by `profile.tools ∩ active ∩ registered`, so the
+    registered tools still switch and the orphan stays untouched.
+
+    This test was originally `test_use_pre_validates_tools_before_mutating`
+    asserting the OLD "use crashes on orphans" contract. Rewritten to
+    pin the new tolerance contract: registered tools switch normally;
+    the orphan keeps its prior active-map entry.
     """
     service.init()
     store = FileProfileStore(tmp_state)
-    # Hand-craft a profile dir that references a tool not in the registry.
+    # Profile metadata references 'ghost' (unknown to registry).
     store.create("stale", {"claude": True, "ghost": True})
     (store.profile_dir("stale") / "claude").mkdir()
-    claude_link = tmp_home / ".claude"
-    original_target = claude_link.resolve()
-    with pytest.raises(UnknownToolError):
-        service.use("stale")
-    assert claude_link.resolve() == original_target
+    # Simulate registry drift after init: 'ghost' was managed once, then
+    # the registry entry was removed. v0.1.3 service.init() never put a
+    # 'ghost' here, so inject it manually to model the post-drift state.
+    active_before = store.get_active()
+    ghost_profile = "stale"
+    cache = service.get_active_live_paths()
+    store.set_active_state({**active_before, "ghost": ghost_profile}, cache)
+
+    service.use("stale")
+
+    active_after = store.get_active()
+    # Registered tool switched.
+    assert active_after["claude"] == "stale"
+    # Orphan untouched — still pointing at its previous profile.
+    assert active_after["ghost"] == ghost_profile
+
+
+def test_use_only_orphan_in_active_raises_clear_orphan_error(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes blocker counterpart: explicit `--only orphan` must not
+    silently no-op. Surface the orphan framing with the right
+    remediation hint, not the generic `UnknownToolError` that the
+    resolve loop used to emit deep in the stack.
+    """
+    service.init()
+    store = FileProfileStore(tmp_state)
+    store.create("stale", {"claude": True, "ghost": True})
+    (store.profile_dir("stale") / "claude").mkdir()
+    active = store.get_active()
+    cache = service.get_active_live_paths()
+    store.set_active_state({**active, "ghost": "stale"}, cache)
+
+    with pytest.raises(UnknownToolError, match="orphan"):
+        service.use("stale", only=["ghost"])
 
 
 def test_use_pre_validates_target_subdirs_before_mutating(
@@ -347,7 +384,7 @@ def test_save_rejects_dangling_symlink_live_path(
 def test_create_makes_profile_with_credentials_seeded(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     store = FileProfileStore(tmp_state)
     cred_src = store.profile_dir(name) / "claude" / ".credentials.json"
     cred_src.write_text('{"token": "abc"}')
@@ -396,10 +433,9 @@ def test_create_includes_uninstalled_active_tools(
     # a symbolic link" because os.path.islink returns True for both classic
     # symlinks and (per Python 3.13's ntpath) Windows junctions. Use the
     # link-aware removal path on each platform.
-    if IS_WINDOWS:
-        copilot_live = tmp_home / "AppData" / "Local" / "github-copilot"
-    else:
-        copilot_live = tmp_home / ".copilot"
+    # Single-dir copilot builtin: `~/.copilot` on POSIX, `%USERPROFILE%\.copilot`
+    # on Windows (expands to `~/.copilot` under tmp_home).
+    copilot_live = tmp_home / ".copilot"
 
     # Pre-assert: the simulated "uninstall" must actually have something to
     # remove, otherwise the test stops proving the "uninstalled active tool"
@@ -483,7 +519,7 @@ def test_create_before_init_raises(service: ProfileService) -> None:
 
 
 def test_which_returns_active_profile(service: ProfileService) -> None:
-    name = service.init()
+    name = service.init().profile_name
     assert service.which("claude") == name
 
 
@@ -524,7 +560,7 @@ def test_which_before_init_raises(service: ProfileService) -> None:
 def test_rename_active_profile_relinks(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    name = service.init()
+    name = service.init().profile_name
     service.rename(name, "client-A")
     store = FileProfileStore(tmp_state)
     active = store.get_active()
@@ -558,7 +594,7 @@ def test_rename_repoints_orphan_active_entries(service: ProfileService, tmp_stat
     reference to the renamed-away ``old``, which no longer exists in the
     store — a silent inconsistency that surfaces on the next use()/which().
     """
-    name = service.init()
+    name = service.init().profile_name
     store = FileProfileStore(tmp_state)
     active = store.get_active()
     active["ghost"] = name  # orphan: not in the registry
@@ -583,7 +619,7 @@ def test_rename_remains_recoverable_when_swap_link_fails(
     ``rename(old, new)`` would raise UnknownProfileError, leaving the user
     with no programmatic recovery.
     """
-    name = service.init()
+    name = service.init().profile_name
 
     call_count = {"n": 0}
 
@@ -630,7 +666,7 @@ def test_rename_pre_validates_live_paths_are_links(
     refuse with IsADirectoryError on the first affected tool, leaving the
     rename half-applied (profile dir moved, live links stale).
     """
-    name = service.init()
+    name = service.init().profile_name
     # Replace the claude symlink with a real directory
     claude = tmp_home / ".claude"
     if claude.is_symlink() or (IS_WINDOWS and os.path.isjunction(claude)):
@@ -648,14 +684,14 @@ def test_rename_pre_validates_live_paths_are_links(
 
 
 def test_delete_inactive_profile_succeeds(service: ProfileService) -> None:
-    name = service.init()
+    name = service.init().profile_name
     service.use("vanilla")  # switch off `name`, freeing it for delete
     service.delete(name)
     assert name not in [p.name for p in service.list_profiles()]
 
 
 def test_delete_active_profile_refuses(service: ProfileService) -> None:
-    name = service.init()  # name is active for everything
+    name = service.init().profile_name  # name is active for everything
     with pytest.raises(ProfileIsActiveError):
         service.delete(name)
 
@@ -663,7 +699,7 @@ def test_delete_active_profile_refuses(service: ProfileService) -> None:
 def test_delete_active_profile_error_wording_locked_in(service: ProfileService) -> None:
     """Spec §7.3 audit: lock in the delete error wording so it stays
     consistent with prune's vocabulary across future changes."""
-    name = service.init()
+    name = service.init().profile_name
     with pytest.raises(ProfileIsActiveError) as exc:
         service.delete(name)
     msg = str(exc.value)

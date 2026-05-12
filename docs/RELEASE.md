@@ -2,6 +2,45 @@
 
 Operational doc for cutting a release. Recipe-first; rationale below.
 
+## Release notes
+
+### v0.1.4 — 2026-05-11
+
+**Added**
+
+- `switcher init --only <ids>` / `--skip <ids>` / `--interactive` — declare which tools switcher should manage at init time.
+- `switcher unmanage <tool>` — restore a single tool's live path(s) and remove it from the active map.
+- `switcher tools` now shows `INSTALLED` and `MANAGED` columns alongside ID / Name / Paths. Pathological "managed but live path missing" rows render as `⚠` with a footer pointer to `unmanage` or restore.
+- `switcher rescan` (no flags) is now per-tool interactive on a TTY; new `--all` flag forces non-interactive capture-all (suppresses the non-TTY warning).
+
+**Changed**
+
+- `switcher use <profile>` now defaults to switching only currently-managed tools (`profile.tools ∩ active.keys()`). Makes `unmanage` durable across profile switches.
+- `switcher save` now snapshots only managed tools. Tools installed AFTER `init` are no longer implicitly added to new snapshots — run `switcher rescan --only <tool>` first.
+- The bundled `copilot` builtin now targets the standalone `copilot` binary (single `~/.copilot` config dir, no credentials block). Existing profile data carrying the legacy `copilot-auth` subdir keeps working — the subdir is dead data, not visited. To migrate a legacy profile fully to the new shape, run `switcher unmanage copilot` then `switcher rescan --only copilot`.
+- `switcher status` on an empty active map now distinguishes the two reachable empty-states. After init, when every tool has been unmanaged (or after `uninstall` without `--purge`), it prints `"No tools currently managed. Run 'switcher rescan' to discover installed tools."` Pre-init (no profiles on disk yet) it prints `"No tools currently managed. Run 'switcher init' to set up switcher."` — the previous wording recommended `rescan` even when `rescan` would error with `StateNotInitializedError`.
+
+**Fixed**
+
+- Legacy state migration (v0.1.0–v0.1.2 → v0.1.3+) now uses filesystem inspection over the current registry, bounded by per-tool historical metadata (a `_HISTORICAL_PROFILE_SUBDIRS` map of subdir names plus per-platform `_HISTORICAL_LIVE_PATHS_POSIX` / `_HISTORICAL_LIVE_PATHS_WINDOWS` tables of EXACT full live-path templates). Fixes the orphan-symlink data-loss path from v0.1.3 PR #4 review.
+- `rescan --dry-run` output grammar: "would capture X" (was: "would captured X").
+- `unmanage <tool> --force` on an orphan-no-cache tool (no registry entry, no cached live_paths) now refuses when any owned profile subdir for the tool still has data on disk. The previous behavior dropped the tool from the active map, hiding it from `uninstall --purge`'s skipped-tool guard — and the subsequent purge silently destroyed the data. The user's escape: restore the registry TOML and re-run normal `unmanage`, or delete the subdir(s) manually first.
+- `_classify_uninstall_mapping` SYMLINK branch tightened: a regular file at the link's `profile_target` is now classified as CORRUPT in pre-flight instead of being passed through to `copytree()` (which would crash mid-uninstall).
+
+**Internal**
+
+- `UninstallMappingState` enum renamed from `_UninstallMappingState`. CLI switches from `.value` string compares to enum compares.
+- `.coderabbit.yaml` `path_instructions` added for `tests/unit/**` and `tests/integration/**`.
+- FS-truth discovery uses EXACT candidate paths instead of a (parents × basenames) cross-product: replaced `_candidate_parents_for` + `_candidate_live_basenames_for` with a single `_candidate_live_paths_for` returning concrete `Path` objects. Eliminates a destructive false-positive class where a user-created symlink at one of the phantom cross-product paths (e.g. `~/github-copilot`) whose target resolved into an owned profile subdir would be classified as managed and later mutated by `uninstall`.
+- New sentinel tests (`tests/unit/test_migration_metadata_sentinel.py`) keep the historical-metadata tables in sync with the bundled builtins: every current `profile_subdir` must be representable in `_HISTORICAL_PROFILE_SUBDIRS`, and every entry in the per-platform full-path tables must expand cleanly AND not duplicate a current registry path. Future builtin path rewrites surface here.
+- CLI (`switcher.cli`) reconfigures `sys.stdout` / `sys.stderr` to UTF-8 (`errors="replace"`) at import time so the tools-table glyphs (`✓ — ⚠`) and Rich's box-drawing characters survive Windows' default cp1252 stdout encoding without `UnicodeEncodeError`.
+
+**Schema**
+
+- **No state-file schema change.** v0.1.4 reads and writes the v0.1.3 shape unchanged.
+
+---
+
 ## How to cut a release
 
 Sync local `main` first, then tag and push:
