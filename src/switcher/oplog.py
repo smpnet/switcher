@@ -200,6 +200,17 @@ class _RenameOp(_BaseOp):
         _check_unique_tool_id_list("_RenameOp", "affected_ids", self.affected_ids)
         return self
 
+    @model_validator(mode="after")
+    def _check_from_not_equal_to(self) -> Self:
+        """A rename to the same name is either a no-op (nothing to do)
+        or corruption (something else mutated the record). Either way
+        the journal should refuse it rather than carry a record that
+        would route through compensation logic for no purpose.
+        """
+        if self.from_ == self.to:
+            raise ValueError(f"_RenameOp: from and to are both {self.from_!r}; rename is a no-op")
+        return self
+
 
 class _RescanOp(_BaseOp):
     op: Literal["rescan"]
@@ -280,17 +291,25 @@ _record_adapter: TypeAdapter[OpLogRecord] = TypeAdapter(OpLogRecord)
 _records_adapter: TypeAdapter[list[OpLogRecord]] = TypeAdapter(list[OpLogRecord])
 
 
-def parse_record(blob: dict[str, Any]) -> OpLogRecord:
-    """Parse one JSON dict into the right op record subclass.
+def parse_record(blob: Any) -> OpLogRecord:
+    """Parse one JSON value into the right op record subclass.
 
-    Raises pydantic.ValidationError on malformed input — caller wraps
-    that into OpLogCorruptError when reading the on-disk log.
+    The parameter is typed `Any` rather than `dict[str, Any]` because
+    callers feed this from json.loads() and the runtime value may be
+    any JSON shape; Pydantic raises ValidationError on every shape
+    other than the expected dict-of-fields, and the caller wraps that
+    into OpLogCorruptError when reading the on-disk log.
     """
     return _record_adapter.validate_python(blob)
 
 
-def parse_records(data: list[dict[str, Any]]) -> list[OpLogRecord]:
-    """Parse a JSON array into a list of op records."""
+def parse_records(data: Any) -> list[OpLogRecord]:
+    """Parse a JSON value into a list of op records.
+
+    Like parse_record, this accepts `Any` so a top-level non-list value
+    (object, string, null) surfaces through Pydantic's own
+    ValidationError rather than as a TypeError at the boundary.
+    """
     return _records_adapter.validate_python(data)
 
 

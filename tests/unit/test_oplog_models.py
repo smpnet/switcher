@@ -341,6 +341,23 @@ def test_rescan_op_rejects_duplicate_target_ids():
         )
 
 
+def test_rename_op_rejects_from_equals_to():
+    """A rename to the same name is either a no-op or corruption;
+    either way the journal should refuse it rather than route through
+    compensation for no purpose.
+    """
+    with pytest.raises(ValidationError):
+        _RenameOp.model_validate(
+            {
+                "op": "rename",
+                "started_at": _now(),
+                "from": "experiment",
+                "to": "experiment",
+                "affected_ids": ["claude"],
+            }
+        )
+
+
 def test_rename_op_rejects_duplicate_affected_ids():
     with pytest.raises(ValidationError):
         _RenameOp.model_validate(
@@ -659,20 +676,20 @@ def test_parse_records_rejects_non_list_top_level():
     rather than slip through as a one-element coerced list.
     """
     with pytest.raises(ValidationError):
-        parse_records({"not": "a list"})  # pyright: ignore[reportArgumentType]
+        parse_records({"not": "a list"})
     with pytest.raises(ValidationError):
-        parse_records("string")  # pyright: ignore[reportArgumentType]
+        parse_records("string")
     with pytest.raises(ValidationError):
-        parse_records(None)  # pyright: ignore[reportArgumentType]
+        parse_records(None)
 
 
 def test_parse_records_rejects_list_of_non_objects():
     with pytest.raises(ValidationError):
-        parse_records(["just a string"])  # pyright: ignore[reportArgumentType]
+        parse_records(["just a string"])
     with pytest.raises(ValidationError):
-        parse_records([42])  # pyright: ignore[reportArgumentType]
+        parse_records([42])
     with pytest.raises(ValidationError):
-        parse_records([None])  # pyright: ignore[reportArgumentType]
+        parse_records([None])
 
 
 def test_storage_path_round_trip_preserves_aliases_across_record_types():
