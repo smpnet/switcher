@@ -14,6 +14,7 @@ from switcher.oplog import (
     _RenameOp,
     _RescanOp,
     dump_records,
+    mark_completed,
     parse_record,
     parse_records,
 )
@@ -492,10 +493,11 @@ def test_records_are_frozen():
         intent.original_kind = "missing"  # pyright: ignore[reportAttributeAccessIssue]
 
 
-def test_model_copy_produces_completed_record():
-    """The documented `model_copy(update=...)` path is how OpLogIO
-    transitions an in-flight record to completed without violating
-    frozen=True.
+def test_mark_completed_produces_validated_completed_record():
+    """mark_completed is the documented transition path because it
+    re-runs validation; model_copy(update=...) in pydantic v2 would
+    silently bypass validators and let a corrupt completed_at slip
+    into the journal.
     """
     op = _InitOp(
         op="init",
@@ -504,10 +506,68 @@ def test_model_copy_produces_completed_record():
         profile_name="2026-05-12-current",
         mappings=[],
     )
-    completed = op.model_copy(update={"completed_at": _now()})
-    assert op.completed_at is None
-    assert completed.completed_at == _now()
+    when = datetime(2026, 5, 12, 10, 31, tzinfo=UTC)
+    completed = mark_completed(op, when)
+    assert op.completed_at is None  # original untouched
+    assert completed.completed_at == when
     assert completed is not op
+
+
+def test_mark_completed_rejects_naive_timestamp():
+    """The write path must be as strict as the read path —
+    AwareDatetime guards parse_record; mark_completed must guard the
+    completion transition the same way (model_copy would have
+    silently accepted a naive datetime).
+    """
+    op = _InitOp(
+        op="init",
+        started_at=_now(),
+        target_ids=["claude"],
+        profile_name="2026-05-12-current",
+        mappings=[],
+    )
+    naive = datetime(2026, 5, 12, 10, 31)
+    with pytest.raises(ValidationError):
+        mark_completed(op, naive)
+
+
+def test_mark_completed_rejects_backdated_timestamp():
+    """Same reasoning: _check_completion_ordering guards parse_record,
+    and mark_completed must re-validate so a backdated completed_at
+    can't reach disk via the write path.
+    """
+    op = _InitOp(
+        op="init",
+        started_at=datetime(2026, 5, 12, 10, 30, tzinfo=UTC),
+        target_ids=["claude"],
+        profile_name="2026-05-12-current",
+        mappings=[],
+    )
+    backdated = datetime(2026, 5, 12, 10, 29, tzinfo=UTC)
+    with pytest.raises(ValidationError):
+        mark_completed(op, backdated)
+
+
+def test_mark_completed_preserves_rename_alias_field():
+    """Sanity check the round-trip: _RenameOp's from_ field has a
+    JSON alias, and the validate-after-dump pattern in mark_completed
+    must preserve it (model_dump emits 'from' due to
+    serialize_by_alias=True; parse_record reads it back via
+    populate_by_name=True).
+    """
+    op = _RenameOp.model_validate(
+        {
+            "op": "rename",
+            "started_at": _now(),
+            "from": "experiment",
+            "to": "client-A",
+            "affected_ids": ["claude"],
+        }
+    )
+    completed = mark_completed(op, datetime(2026, 5, 12, 10, 31, tzinfo=UTC))
+    assert isinstance(completed, _RenameOp)
+    assert completed.from_ == "experiment"
+    assert completed.to == "client-A"
 
 
 def test_completed_at_before_started_at_rejected():

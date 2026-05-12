@@ -8,12 +8,16 @@ Records are immutable: `frozen=True` on every model rejects in-place
 mutation, and `extra="forbid"` rejects unknown fields so schema drift
 surfaces as ValidationError (mapped to OpLogCorruptError by OpLogIO)
 rather than being silently discarded. Transitioning a record to
-"completed" therefore produces a fresh instance via `model_copy(
-update={"completed_at": ...})` instead of in-place assignment.
+"completed" therefore produces a fresh instance via `mark_completed`,
+which re-runs validation so a corrupt timestamp (naive, backdated)
+can't slip into the journal through the write path —
+`model_copy(update={...})` would bypass validation and is intentionally
+not used here.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, model_validator
@@ -65,8 +69,9 @@ class _BaseOp(BaseModel):
       format uses aliases; making it the default removes the chance of
       a future single-record write accidentally emitting `from_`.
     - `frozen=True` enforces the module-level immutability contract.
-      Transitioning to "completed" uses `model_copy(update={...})`
-      to produce a new record rather than mutating in place.
+      Transitioning to "completed" goes through `mark_completed` (which
+      re-validates) rather than the lower-level `model_copy(update={...})`,
+      which silently bypasses validators in Pydantic v2.
     - `extra="forbid"` surfaces schema drift in oplog.json as
       ValidationError (mapped to OpLogCorruptError by OpLogIO) rather
       than silently discarding unknown fields and proceeding on
@@ -297,3 +302,18 @@ def dump_records(records: list[OpLogRecord]) -> str:
     need to pass `by_alias=True` explicitly.
     """
     return _records_adapter.dump_json(records).decode("utf-8")
+
+
+def mark_completed(record: OpLogRecord, when: datetime) -> OpLogRecord:
+    """Return a copy of `record` with `completed_at=when`, re-validated.
+
+    Pydantic v2's `model_copy(update={...})` silently bypasses validators
+    on updated fields — using it for this transition could let a naive
+    or backdated `completed_at` slip into the journal even though
+    parse_record/parse_records would have rejected the same payload on
+    read. We round-trip through the validator to keep the write path
+    just as strict as the read path.
+    """
+    payload = record.model_dump()
+    payload["completed_at"] = when
+    return parse_record(payload)
