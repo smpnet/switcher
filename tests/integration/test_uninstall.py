@@ -493,7 +493,15 @@ def test_uninstall_resume_after_partial_uninstall_and_registry_drift(
     s.init()
 
     # Pre-conditions: both copilot live paths are symlinks; cache has both.
-    legacy_link = tmp_home / ".config" / "github-copilot"
+    # The legacy path differs by platform — POSIX uses ~/.config/github-copilot,
+    # Windows uses %LOCALAPPDATA%\github-copilot (see install_two_dir_copilot_override
+    # in tests/integration/conftest.py). The conftest tmp_home fixture sets
+    # LOCALAPPDATA to <home>/AppData/Local on Windows.
+    legacy_link = (
+        tmp_home / "AppData" / "Local" / "github-copilot"
+        if IS_WINDOWS
+        else tmp_home / ".config" / "github-copilot"
+    )
     new_link = tmp_home / ".copilot"
     assert _is_link(legacy_link)
     assert _is_link(new_link)

@@ -288,3 +288,30 @@ def test_init_interactive_eof_exits_cleanly(
     result = runner.invoke(app, ["init", "--interactive"])
     assert result.exit_code == 130, _combined(result)
     assert "Traceback" not in _combined(result)
+
+
+def test_init_interactive_zero_detected_distinct_wording(
+    tmp_path: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hermes nit: when --interactive is invoked on a machine with no
+    installed tools, the error wording must NOT say 'every detected tool
+    was skipped' (there were no detected tools to skip). The CLI now
+    distinguishes the zero-detected case with its own message.
+    """
+    # Empty home — no .claude, no .copilot, no github-copilot.
+    home = tmp_path / "home"
+    home.mkdir()
+    if IS_WINDOWS:
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
+    else:
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
+    result = runner.invoke(app, ["init", "--interactive"])
+    assert result.exit_code != 0
+    out = _combined(result).lower()
+    assert "no installed tools detected" in out
+    # And the misleading "every detected tool was skipped" wording must NOT fire.
+    assert "every detected tool was skipped" not in out

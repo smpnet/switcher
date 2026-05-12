@@ -308,6 +308,12 @@ def init(
             )
         accepted, declined = _resolve_init_targets_interactive(deps)
         if not accepted:
+            # Distinguish "no installed tools to prompt for" from "user
+            # declined every prompt" (Hermes nit). Without this branch
+            # the zero-detected case shows the misleading "every detected
+            # tool was skipped" message.
+            if not declined:
+                raise NothingToInitializeError("no installed tools detected; nothing to initialize")
             raise NothingToInitializeError("every detected tool was skipped; nothing to initialize")
         target_ids = accepted
         skipped_via_interactive = declined
