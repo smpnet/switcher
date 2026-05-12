@@ -17,7 +17,10 @@ not used here.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
+from enum import Enum
+from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
@@ -391,3 +394,103 @@ def mark_completed(record: OpLogRecord, when: datetime) -> OpLogRecord:
     payload = record.model_dump()
     payload["completed_at"] = when
     return parse_record(payload)
+
+
+class MappingDiskState(Enum):
+    """Per-mapping on-disk state for op-log compensation (spec §2.1.1).
+
+    Four states partition the (live, target) shape space:
+
+    - COMPLETE: live is a symlink resolving to target — nothing to do.
+    - MOVE_DONE_LINK_MISSING: target populated, live absent — the
+      SIGKILL window between move_or_seed_dir and swap_link. A two-state
+      "captured or not" predicate would misclassify this as untouched.
+    - UNTOUCHED: target absent, live matches `original_kind` — abort
+      is a no-op for this mapping.
+    - AMBIGUOUS: any other shape — refuse to compensate; surface to the
+      user. Includes data-in-two-places, link-to-wrong-target, and live
+      drifted to a shape that doesn't match the recorded original_kind.
+    """
+
+    COMPLETE = "complete"
+    MOVE_DONE_LINK_MISSING = "move_done_link_missing"
+    UNTOUCHED = "untouched"
+    AMBIGUOUS = "ambiguous"
+
+
+def _is_link(path: Path) -> bool:
+    """Treat symlinks and Windows directory junctions as links.
+
+    POSIX has only symlinks. Windows additionally has junctions, which
+    `Path.is_symlink` returns False for; junctions are how this codebase
+    falls back to "link-like" semantics when the user lacks the symlink
+    privilege. Without this check, a junction-rooted live_path would
+    classify as AMBIGUOUS even when it correctly resolves to target.
+    """
+    if path.is_symlink():
+        return True
+    if os.name == "nt":
+        return os.path.isjunction(str(path))
+    return False
+
+
+def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskState:
+    """Classify the on-disk state of (live, target) for one mapping.
+
+    Pure read; no mutations. The same classifier drives both --continue
+    (where MOVE_DONE_LINK_MISSING means "finish the swap") and --abort
+    (where MOVE_DONE_LINK_MISSING means "restore live from target")
+    in spec §2.2 and §2.4. AMBIGUOUS is the catch-all the caller maps
+    to AbortPreflightError / a user-facing refusal.
+
+    Args:
+        intent: the per-mapping intent record (`original_kind`, paths).
+        profile_dir: the resolved <state_dir>/profiles/<profile_name>
+            directory the op was targeting. Passed in explicitly so the
+            classifier does not need to take a Store reference.
+    """
+    live = Path(intent.live_path)
+    target = profile_dir / intent.profile_subdir
+    live_is_link = _is_link(live)
+    target_is_dir = target.is_dir()
+
+    # State 1: COMPLETE — live is a link resolving to target.
+    # A link that fails to resolve, or resolves to anything other than
+    # target, is AMBIGUOUS rather than UNTOUCHED: original_kind is
+    # restricted to {"missing", "real-dir"} at intent-write time, so a
+    # link at live_path is always drift relative to the recorded shape.
+    if live_is_link:
+        try:
+            resolved = live.resolve()
+        except (OSError, RuntimeError):
+            return MappingDiskState.AMBIGUOUS
+        if target_is_dir:
+            try:
+                if resolved == target.resolve():
+                    return MappingDiskState.COMPLETE
+            except (OSError, RuntimeError):
+                return MappingDiskState.AMBIGUOUS
+        return MappingDiskState.AMBIGUOUS
+
+    # State 2: MOVE_DONE_LINK_MISSING — target populated, live absent.
+    # `live.exists()` follows symlinks; we already excluded the symlink
+    # branch above so this check is correct for a regular path.
+    if target_is_dir and not live.exists():
+        return MappingDiskState.MOVE_DONE_LINK_MISSING
+
+    # State 3: UNTOUCHED — target absent, live matches the recorded
+    # original_kind exactly. Any deviation from the recorded shape (a
+    # regular file where a directory was expected, a directory where
+    # nothing was expected) is AMBIGUOUS — refusing to compensate is
+    # safer than guessing intent.
+    if not target_is_dir:
+        if intent.original_kind == "missing" and not live.exists():
+            return MappingDiskState.UNTOUCHED
+        if intent.original_kind == "real-dir" and live.is_dir() and not live_is_link:
+            return MappingDiskState.UNTOUCHED
+        return MappingDiskState.AMBIGUOUS
+
+    # State 4: AMBIGUOUS — target populated AND live also present as a
+    # non-link shape (data in two places), or any other combination not
+    # covered above.
+    return MappingDiskState.AMBIGUOUS
