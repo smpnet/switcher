@@ -92,6 +92,20 @@ class _BaseOp(BaseModel):
     started_at: AwareDatetime
     completed_at: AwareDatetime | None = None
 
+    @model_validator(mode="after")
+    def _check_completion_ordering(self) -> Self:
+        """A record that completes before it started is corrupt — but
+        without this check, the failure would only surface much later
+        in ordering / recency logic where it's indistinguishable from
+        external state drift. Refuse at validation time.
+        """
+        if self.completed_at is not None and self.completed_at < self.started_at:
+            raise ValueError(
+                f"{type(self).__name__}: completed_at ({self.completed_at.isoformat()}) "
+                f"precedes started_at ({self.started_at.isoformat()})"
+            )
+        return self
+
 
 def _check_unique_tool_id_list(op_name: str, field_name: str, ids: list[str]) -> None:
     """Reject duplicate IDs in a tool-id list.

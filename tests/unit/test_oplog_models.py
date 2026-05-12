@@ -510,6 +510,60 @@ def test_model_copy_produces_completed_record():
     assert completed is not op
 
 
+def test_completed_at_before_started_at_rejected():
+    """Timestamp inversion = corrupt record. Without the validator
+    the failure would surface much later in ordering/recency logic
+    where it's hard to distinguish from external drift.
+    """
+    with pytest.raises(ValidationError):
+        _InitOp(
+            op="init",
+            started_at=datetime(2026, 5, 12, 10, 30, tzinfo=UTC),
+            completed_at=datetime(2026, 5, 12, 10, 29, tzinfo=UTC),
+            target_ids=[],
+            profile_name="x",
+            mappings=[],
+        )
+
+
+def test_completed_at_equal_to_started_at_allowed():
+    """The check is strict ordering, not strict inequality: a record
+    that starts and completes within the same clock tick is legal.
+    """
+    ts = datetime(2026, 5, 12, 10, 30, tzinfo=UTC)
+    op = _InitOp(
+        op="init",
+        started_at=ts,
+        completed_at=ts,
+        target_ids=[],
+        profile_name="x",
+        mappings=[],
+    )
+    assert op.completed_at == op.started_at
+
+
+def test_parse_records_rejects_non_list_top_level():
+    """parse_records is the file-level entry point — a top-level
+    object/string/null in oplog.json must surface as ValidationError
+    rather than slip through as a one-element coerced list.
+    """
+    with pytest.raises(ValidationError):
+        parse_records({"not": "a list"})  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ValidationError):
+        parse_records("string")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ValidationError):
+        parse_records(None)  # pyright: ignore[reportArgumentType]
+
+
+def test_parse_records_rejects_list_of_non_objects():
+    with pytest.raises(ValidationError):
+        parse_records(["just a string"])  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ValidationError):
+        parse_records([42])  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ValidationError):
+        parse_records([None])  # pyright: ignore[reportArgumentType]
+
+
 def test_storage_path_round_trip_preserves_aliases_across_record_types():
     """The on-disk format is a JSON array, written via dump_records and
     read back via parse_records. Round-tripping through that path is
