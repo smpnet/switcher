@@ -236,10 +236,10 @@ One-page map of the codebase:
   `status` / `tools` hit the store directly. v0.1.5 adds the
   `_detect_or_compensate_oplog` helper at the top of every command.
 
-Cross-link: `.coderabbit.yaml` `path_instructions` (lines 83-159)
-documents the per-module review pointers — those ARE the
-architectural invariants for each module and they evolve with
-the code.
+Cross-link: the `reviews.path_instructions` block in
+`.coderabbit.yaml` documents the per-module review pointers —
+those ARE the architectural invariants for each module and they
+evolve with the code.
 
 ## Release flow
 

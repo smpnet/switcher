@@ -90,7 +90,8 @@ with a `git clone`-style auth error, that's a GitHub auth problem, not a
 > **⚠ Run `switcher init` only after the tools you want to manage are
 > already installed.** `init` captures whichever tools exist at the moment
 > you run it; tools installed later are picked up by `switcher rescan`
-> (see "Add another tool later").
+> (see "Add another tool later"). `init` is one-shot — re-running it
+> fails with `StateAlreadyInitialized`.
 
 ```bash
 # Capture every detected tool into a dated-current profile:
