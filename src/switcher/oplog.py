@@ -307,13 +307,26 @@ def dump_records(records: list[OpLogRecord]) -> str:
 def mark_completed(record: OpLogRecord, when: datetime) -> OpLogRecord:
     """Return a copy of `record` with `completed_at=when`, re-validated.
 
-    Pydantic v2's `model_copy(update={...})` silently bypasses validators
-    on updated fields — using it for this transition could let a naive
-    or backdated `completed_at` slip into the journal even though
-    parse_record/parse_records would have rejected the same payload on
-    read. We round-trip through the validator to keep the write path
-    just as strict as the read path.
+    Two contracts:
+
+    - Pydantic v2's `model_copy(update={...})` silently bypasses
+      validators on updated fields — using it for this transition could
+      let a naive or backdated `completed_at` slip into the journal even
+      though parse_record/parse_records would have rejected the same
+      payload on read. This helper round-trips through the validator so
+      the write path is as strict as the read path.
+
+    - The record is immutable from intent-write through mark_completed.
+      Re-completing an already-completed record would rewrite its
+      timestamp and undermine that audit guarantee, so we refuse instead
+      — vacuum_completed is the only legitimate way for a completed
+      record to leave the log.
     """
+    if record.completed_at is not None:
+        raise ValueError(
+            f"{type(record).__name__}: already completed at "
+            f"{record.completed_at.isoformat()}; mark_completed cannot rewrite it"
+        )
     payload = record.model_dump()
     payload["completed_at"] = when
     return parse_record(payload)

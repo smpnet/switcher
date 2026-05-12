@@ -580,6 +580,25 @@ def test_mark_completed_rejects_backdated_timestamp():
         mark_completed(op, backdated)
 
 
+def test_mark_completed_refuses_to_recomplete():
+    """The audit contract says records are immutable from intent-write
+    through completion. Re-marking an already-completed record would
+    rewrite its timestamp; refuse instead so vacuum_completed remains
+    the only legitimate way for a completed record to leave the log.
+    """
+    op = _InitOp(
+        op="init",
+        started_at=_now(),
+        target_ids=["claude"],
+        profile_name="2026-05-12-current",
+        mappings=[],
+    )
+    once = mark_completed(op, datetime(2026, 5, 12, 10, 31, tzinfo=UTC))
+    assert once.completed_at is not None
+    with pytest.raises(ValueError, match="already completed"):
+        mark_completed(once, datetime(2026, 5, 12, 10, 32, tzinfo=UTC))
+
+
 def test_mark_completed_preserves_rename_alias_field():
     """Sanity check the round-trip: _RenameOp's from_ field has a
     JSON alias, and the validate-after-dump pattern in mark_completed
