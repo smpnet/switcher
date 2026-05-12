@@ -457,6 +457,16 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
     target = profile_dir / intent.profile_subdir
     live_is_link = _is_link(live)
     target_is_dir = target.is_dir()
+    # `target_missing` distinguishes "the target path has nothing at all"
+    # from "the target path has something but it's not a directory" (a
+    # regular file, a broken symlink, a link to an unrelated location).
+    # Collapsing those two cases into `not target_is_dir` would let
+    # UNTOUCHED fire when a corrupted target artifact is sitting there,
+    # which is exactly the silent miscompensation the classifier exists
+    # to refuse. `Path.exists()` returns False for broken symlinks and
+    # for missing paths alike, so we check `_is_link(target)` too — a
+    # broken symlink IS present, just dangling.
+    target_missing = not target.exists() and not _is_link(target)
 
     # State 1: COMPLETE — live is a link resolving to target.
     # A link that fails to resolve, or resolves to anything other than
@@ -482,21 +492,22 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
     if target_is_dir and not live.exists():
         return MappingDiskState.MOVE_DONE_LINK_MISSING
 
-    # State 3: UNTOUCHED — target absent, live matches the recorded
-    # original_kind exactly. Any deviation from the recorded shape (a
-    # regular file where a directory was expected, a directory where
-    # nothing was expected) is AMBIGUOUS — refusing to compensate is
-    # safer than guessing intent.
-    if not target_is_dir:
+    # State 3: UNTOUCHED — target TRULY absent (not just "not a dir"),
+    # and live matches the recorded original_kind exactly. Any deviation
+    # from the recorded shape (a regular file where a directory was
+    # expected, a directory where nothing was expected) is AMBIGUOUS —
+    # refusing to compensate is safer than guessing intent.
+    if target_missing:
         if intent.original_kind == "missing" and not live.exists():
             return MappingDiskState.UNTOUCHED
         if intent.original_kind == "real-dir" and live.is_dir() and not live_is_link:
             return MappingDiskState.UNTOUCHED
         return MappingDiskState.AMBIGUOUS
 
-    # State 4: AMBIGUOUS — target populated AND live also present as a
-    # non-link shape (data in two places), or any other combination not
-    # covered above.
+    # State 4: AMBIGUOUS — target is a real dir AND live also present as
+    # a non-link shape (data in two places), OR target exists in some
+    # shape that is not a directory (regular file, broken/redirected
+    # link). Both are corruption from the journal's perspective.
     return MappingDiskState.AMBIGUOUS
 
 
@@ -599,14 +610,28 @@ class OpLogIO:
         avoided here. ValidationError from the helper is mapped to
         OpLogCorruptError to match the read-path failure shape.
 
+        Enforces the single-in-flight invariant directly here (in
+        addition to ``read_in_flight``): without it, this method would
+        happily complete the first matching record in a hand-edited
+        2-in-flight journal and leave the second one dangling — partial
+        "healing" that hides corruption from the user instead of
+        surfacing it. Same failure shape as ``read_in_flight``.
+
         Raises:
-            OpLogCorruptError: no in-flight record on disk matches
-                ``op`` + ``started_at``, or the completion timestamp
-                fails re-validation. A caller holding a stale record
-                reference is treated as corruption rather than as a
-                silent no-op.
+            OpLogCorruptError: more than one record is in-flight on
+                disk (single-in-flight invariant violated), no in-flight
+                record matches ``op`` + ``started_at``, or the
+                completion timestamp fails re-validation. A caller
+                holding a stale record reference is treated as
+                corruption rather than as a silent no-op.
         """
         records = self.read_records()
+        in_flight_count = sum(1 for r in records if r.completed_at is None)
+        if in_flight_count > 1:
+            raise OpLogCorruptError(
+                f"oplog at {self._path}: {in_flight_count} records are in-flight; "
+                f"single-in-flight invariant violated. Manual recovery required."
+            )
         completed_at = datetime.now(UTC)
         matched = False
         new_records: list[OpLogRecord] = []

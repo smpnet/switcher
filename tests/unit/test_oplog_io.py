@@ -181,6 +181,41 @@ def test_read_in_flight_ignores_completed_records(tmp_path: Path):
     assert io.read_in_flight() is None
 
 
+def test_mark_completed_raises_corrupt_on_multiple_uncompleted(tmp_path: Path):
+    """Single-in-flight is the journal-wide invariant, not just a
+    property of read_in_flight. mark_completed reads the raw record
+    list, so without an explicit check it would happily complete the
+    first match in a corrupt 2-in-flight journal and leave the second
+    record dangling — partial "healing" that hides the corruption from
+    the user. Refuse instead, matching read_in_flight's behavior.
+    """
+    payload = json.dumps(
+        [
+            {
+                "op": "rename",
+                "from": "a",
+                "to": "b",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "affected_ids": [],
+            },
+            {
+                "op": "rename",
+                "from": "c",
+                "to": "d",
+                "started_at": "2026-05-12T10:31:00+00:00",
+                "affected_ids": [],
+            },
+        ]
+    )
+    (tmp_path / "oplog.json").write_text(payload, encoding="utf-8")
+    io = OpLogIO(tmp_path)
+    # Caller holds a reference to the first record — but the journal
+    # itself is corrupt; mark_completed must refuse instead of operating.
+    first = _make_rename_op("a", "b")
+    with pytest.raises(OpLogCorruptError):
+        io.mark_completed(first)
+
+
 def test_mark_completed_sets_timestamp(tmp_path: Path):
     io = OpLogIO(tmp_path)
     record = _make_rename_op()

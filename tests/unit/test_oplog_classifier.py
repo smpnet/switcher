@@ -122,6 +122,59 @@ def test_ambiguous_state_untouched_with_wrong_original_kind(tmp_path: Path):
     assert state is MappingDiskState.AMBIGUOUS
 
 
+def test_ambiguous_state_target_is_regular_file_live_missing(tmp_path: Path):
+    """A regular file at the target path is "present but wrong shape",
+    not "absent". Collapsing it with target-missing would let abort
+    treat a corrupted target artifact as UNTOUCHED and proceed as if
+    nothing happened — exactly the kind of silent miscompensation the
+    classifier exists to refuse.
+    """
+    profile_dir = tmp_path / "profiles" / "2026-05-12-current"
+    profile_dir.mkdir(parents=True)
+    target = profile_dir / "claude"
+    target.write_text("not a directory")  # regular file at target path
+    live = tmp_path / ".claude"  # absent
+    intent = _make_intent(live_path=live, original_kind="missing")
+    state = classify_mapping(intent, profile_dir)
+    assert state is MappingDiskState.AMBIGUOUS
+
+
+def test_ambiguous_state_target_is_regular_file_live_real_dir(tmp_path: Path):
+    """Same as above, but with live in its recorded "real-dir" shape.
+    The classifier must still refuse: target is present in the wrong
+    shape, so the safe state is unknowable from this snapshot.
+    """
+    profile_dir = tmp_path / "profiles" / "2026-05-12-current"
+    profile_dir.mkdir(parents=True)
+    target = profile_dir / "claude"
+    target.write_text("not a directory")
+    live = tmp_path / ".claude"
+    live.mkdir()  # live matches original_kind="real-dir"
+    intent = _make_intent(live_path=live, original_kind="real-dir")
+    state = classify_mapping(intent, profile_dir)
+    assert state is MappingDiskState.AMBIGUOUS
+
+
+def test_ambiguous_state_target_is_link_to_unrelated_dir(tmp_path: Path):
+    """A link at the target path is reparse-point drift, not a real
+    directory. ``target.is_dir()`` follows the link and returns True if
+    the link resolves to a directory, so without separate
+    target-missing logic this could be misclassified as a normal target
+    dir. Cover the case explicitly.
+    """
+    profile_dir = tmp_path / "profiles" / "2026-05-12-current"
+    profile_dir.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    target = profile_dir / "claude"
+    _make_link(target, elsewhere)  # symlink/junction to an unrelated dir
+    live = tmp_path / ".claude"
+    live.mkdir()  # live also exists as a real dir
+    intent = _make_intent(live_path=live, original_kind="real-dir")
+    state = classify_mapping(intent, profile_dir)
+    assert state is MappingDiskState.AMBIGUOUS
+
+
 def test_classifier_pure_read_no_mutations(tmp_path: Path):
     """Classifier must not mutate the filesystem."""
     profile_dir = tmp_path / "profiles" / "2026-05-12-current"
