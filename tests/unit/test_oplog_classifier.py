@@ -155,6 +155,29 @@ def test_ambiguous_state_target_is_regular_file_live_real_dir(tmp_path: Path):
     assert state is MappingDiskState.AMBIGUOUS
 
 
+def test_ambiguous_state_target_is_link_to_unrelated_dir_and_live_links_to_target(
+    tmp_path: Path,
+):
+    """``target.is_dir()`` follows symlinks/junctions, so a target path
+    that is itself a link to an unrelated dir resolves to a directory
+    and equality with ``live.resolve()`` succeeds — the COMPLETE
+    branch would silently accept reparse-point drift at the target as
+    a healthy mapping. Per the state model, a link at the target is
+    AMBIGUOUS; the journal owns a real directory, not a link to one.
+    """
+    profile_dir = tmp_path / "profiles" / "2026-05-12-current"
+    profile_dir.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    target = profile_dir / "claude"
+    _make_link(target, elsewhere)  # target is a link to an unrelated dir
+    live = tmp_path / ".claude"
+    _make_link(live, target)  # live → target → elsewhere
+    intent = _make_intent(live_path=live, original_kind="real-dir")
+    state = classify_mapping(intent, profile_dir)
+    assert state is MappingDiskState.AMBIGUOUS
+
+
 def test_ambiguous_state_target_is_link_to_unrelated_dir(tmp_path: Path):
     """A link at the target path is reparse-point drift, not a real
     directory. ``target.is_dir()`` follows the link and returns True if

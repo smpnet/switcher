@@ -456,11 +456,21 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
     live = Path(intent.live_path)
     target = profile_dir / intent.profile_subdir
     live_is_link = _is_link(live)
-    target_is_dir = target.is_dir()
+    # `target_is_real_dir` requires the target path to be a *real*
+    # directory owned by the profile, not a directory-shaped link.
+    # `Path.is_dir()` follows symlinks and junctions, so without the
+    # `_is_link` guard a target path that has been replaced by a link
+    # to an unrelated directory would resolve through to `True` — and
+    # if `live` resolves to the same place, the COMPLETE branch below
+    # would silently accept reparse-point drift at the target as a
+    # healthy mapping. The journal contract is "target is a directory",
+    # not "target resolves to a directory"; treat the difference as
+    # corruption and route through AMBIGUOUS.
+    target_is_real_dir = target.is_dir() and not _is_link(target)
     # `target_missing` distinguishes "the target path has nothing at all"
     # from "the target path has something but it's not a directory" (a
     # regular file, a broken symlink, a link to an unrelated location).
-    # Collapsing those two cases into `not target_is_dir` would let
+    # Collapsing those two cases into `not target_is_real_dir` would let
     # UNTOUCHED fire when a corrupted target artifact is sitting there,
     # which is exactly the silent miscompensation the classifier exists
     # to refuse. `Path.exists()` returns False for broken symlinks and
@@ -468,7 +478,7 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
     # broken symlink IS present, just dangling.
     target_missing = not target.exists() and not _is_link(target)
 
-    # State 1: COMPLETE — live is a link resolving to target.
+    # State 1: COMPLETE — live is a link resolving to a real target dir.
     # A link that fails to resolve, or resolves to anything other than
     # target, is AMBIGUOUS rather than UNTOUCHED: original_kind is
     # restricted to {"missing", "real-dir"} at intent-write time, so a
@@ -478,7 +488,7 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
             resolved = live.resolve()
         except (OSError, RuntimeError):
             return MappingDiskState.AMBIGUOUS
-        if target_is_dir:
+        if target_is_real_dir:
             try:
                 if resolved == target.resolve():
                     return MappingDiskState.COMPLETE
@@ -486,10 +496,13 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
                 return MappingDiskState.AMBIGUOUS
         return MappingDiskState.AMBIGUOUS
 
-    # State 2: MOVE_DONE_LINK_MISSING — target populated, live absent.
+    # State 2: MOVE_DONE_LINK_MISSING — target is a real dir, live absent.
     # `live.exists()` follows symlinks; we already excluded the symlink
-    # branch above so this check is correct for a regular path.
-    if target_is_dir and not live.exists():
+    # branch above so this check is correct for a regular path. Gating
+    # on `target_is_real_dir` (not just `is_dir`) keeps reparse-point
+    # drift at the target from being silently treated as a recoverable
+    # mid-op state.
+    if target_is_real_dir and not live.exists():
         return MappingDiskState.MOVE_DONE_LINK_MISSING
 
     # State 3: UNTOUCHED — target TRULY absent (not just "not a dir"),
@@ -506,8 +519,9 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
 
     # State 4: AMBIGUOUS — target is a real dir AND live also present as
     # a non-link shape (data in two places), OR target exists in some
-    # shape that is not a directory (regular file, broken/redirected
-    # link). Both are corruption from the journal's perspective.
+    # shape that is not a real directory (regular file, link/junction
+    # of any kind, broken symlink). All are corruption from the
+    # journal's perspective.
     return MappingDiskState.AMBIGUOUS
 
 
