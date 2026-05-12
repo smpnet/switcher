@@ -315,3 +315,63 @@ def test_init_interactive_zero_detected_distinct_wording(
     assert "no installed tools detected" in out
     # And the misleading "every detected tool was skipped" wording must NOT fire.
     assert "every detected tool was skipped" not in out
+
+
+def test_init_skip_after_init_raises_already_initialized_not_skip_error(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes blocker: `init --skip claude` on an already-initialized
+    repo used to error with `--skip excluded every detected tool` —
+    misleading because the real cause is that switcher is already
+    initialized. The CLI now preflights state-already-initialized
+    BEFORE any flag-specific detection / prompting runs.
+    """
+    first = runner.invoke(app, ["init"])
+    assert first.exit_code == 0, _combined(first)
+    second = runner.invoke(app, ["init", "--skip", "claude"])
+    assert second.exit_code != 0
+    out = _combined(second).lower()
+    assert "already initialized" in out
+    # The misleading flag-specific wording must NOT appear.
+    assert "every detected tool" not in out
+
+
+def test_init_interactive_after_init_does_not_prompt_and_errors(
+    tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hermes blocker: `init --interactive` on an already-initialized repo
+    used to prompt the user (and exit with the misleading
+    'every detected tool was skipped' if all were declined). The CLI
+    preflight must short-circuit before any input() call fires.
+
+    Repro: stub input() to fail loudly so we'd notice if the prompt
+    actually ran.
+    """
+    first = runner.invoke(app, ["init"])
+    assert first.exit_code == 0, _combined(first)
+
+    monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
+
+    def must_not_run(_prompt: str) -> str:
+        raise AssertionError(
+            "input() must NOT be called: state-already-initialized "
+            "preflight should short-circuit before the prompt loop"
+        )
+
+    monkeypatch.setattr("builtins.input", must_not_run)
+
+    result = runner.invoke(app, ["init", "--interactive"])
+    assert result.exit_code != 0
+    out = _combined(result).lower()
+    assert "already initialized" in out
+
+
+def test_init_only_after_init_raises_already_initialized(tmp_home: Path, tmp_state: Path) -> None:
+    """Symmetric to the --skip case: `init --only` after init must also
+    surface already-initialized, not the per-flag detection error."""
+    first = runner.invoke(app, ["init"])
+    assert first.exit_code == 0, _combined(first)
+    second = runner.invoke(app, ["init", "--only", "copilot"])
+    assert second.exit_code != 0
+    out = _combined(second).lower()
+    assert "already initialized" in out

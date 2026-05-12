@@ -206,3 +206,87 @@ def test_status_pre_init_suggests_init(tmp_home: Path, tmp_state: Path) -> None:
     assert "init" in out
     # Don't tell users to `rescan` before init exists.
     assert "rescan" not in out
+
+
+def test_tools_renders_orphan_row_with_dedicated_footer(tmp_home: Path, tmp_state: Path) -> None:
+    """Hermes blocker: an orphan id in the active map (no registry entry)
+    used to be invisible to `tools` because the row builder iterated the
+    registry only. After `uninstall --force` non-purge leaves an orphan
+    skipped tool in active, `tools` must surface it as a dedicated row
+    AND a footer telling the user how to repair it."""
+    init_result = runner.invoke(app, ["init"])
+    assert init_result.exit_code == 0, _combined(init_result)
+    deps = get_deps()
+    active = deps.store.get_active()
+    profile_name = next(iter(active.values()))
+    active["orphan_tool"] = profile_name
+    deps.store.set_active_state(active, deps.store.get_active_live_paths())
+
+    rows = _build_tools_table_rows(get_deps())
+    by_id = {r.tool_id: r for r in rows}
+    assert "orphan_tool" in by_id, "orphan id in active map must appear as its own table row"
+    orphan_row = by_id["orphan_tool"]
+    assert orphan_row.is_orphan is True
+    assert orphan_row.managed is True
+    assert orphan_row.installed is False
+    assert orphan_row.pathological is True
+
+    result = runner.invoke(app, ["tools"])
+    assert result.exit_code == 0
+    assert "orphan_tool" in result.output
+    # Orphan footer wording — distinct from the missing-live-path footer.
+    assert "no registry entry" in result.output.lower()
+    assert "switcher unmanage orphan_tool --force" in result.output
+
+
+def test_tools_pathological_when_managed_multi_dir_partially_present(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes blocker: a multi-dir managed tool whose first config_dir
+    still exists but a later config_dir is missing must render
+    pathological (= ⚠) — `detect_installed()` only checks the FIRST
+    config_dir, so without a per-row multi-dir check the broken state
+    looks healthy.
+
+    Repro uses the legacy two-dir Copilot override so both paths exist
+    after init, then deletes only `~/.copilot` (the SECOND config_dir
+    in the override; the first is `~/.config/github-copilot`).
+    """
+    # Install the two-dir override directly under registry.d. Both halves
+    # of each config_dir entry use platform-appropriate templates so the
+    # registry resolves to the same paths the conftest tmp_home pre-seeds.
+    registry_d = tmp_state / "registry.d"
+    registry_d.mkdir(parents=True, exist_ok=True)
+    (registry_d / "copilot.toml").write_text(
+        'id = "copilot"\n'
+        'name = "GitHub Copilot CLI (test two-dir override)"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.config/github-copilot"\n'
+        'windows_path = "%LOCALAPPDATA%\\\\github-copilot"\n'
+        'profile_subdir = "copilot-auth"\n'
+        "[[config_dirs]]\n"
+        'posix_path = "~/.copilot"\n'
+        'windows_path = "%USERPROFILE%\\\\.copilot"\n'
+        'profile_subdir = "copilot-config"\n'
+    )
+
+    init_result = runner.invoke(app, ["init"])
+    assert init_result.exit_code == 0, _combined(init_result)
+
+    # Delete only the SECOND config_dir's symlink (~/.copilot). The first
+    # (.config/github-copilot or %LOCALAPPDATA%\github-copilot) still exists,
+    # so first-dir-only detection still reports copilot as installed.
+    # `~/.copilot` on POSIX and `%USERPROFILE%\.copilot` on Windows both
+    # resolve to `tmp_home / ".copilot"` under the conftest fixture.
+    _drop_link_or_dir(tmp_home / ".copilot")
+
+    rows = _build_tools_table_rows(get_deps())
+    by_id = {r.tool_id: r for r in rows}
+    copilot_row = by_id["copilot"]
+    assert copilot_row.managed is True
+    # The whole point: even though detect_installed (first-dir-only) still
+    # returns True, the per-row multi-dir check must classify pathological.
+    assert copilot_row.pathological is True, (
+        "managed multi-dir tool with one missing live path must be pathological"
+    )
+    assert copilot_row.installed is False

@@ -17,6 +17,7 @@ from rich.table import Table
 
 from switcher.errors import (
     NothingToInitializeError,
+    StateAlreadyInitializedError,
     StateNotInitializedError,
     SwitcherError,
     UnknownToolError,
@@ -296,6 +297,18 @@ def init(
         raise typer.BadParameter("--only and --skip are mutually exclusive")
 
     deps = get_deps()
+    # Hermes blocker: surface StateAlreadyInitializedError BEFORE any
+    # flag-specific detection / prompting runs. Without this preflight,
+    # `init --skip claude` on an already-initialized repo reaches the
+    # service layer's StateAlreadyInitialized check ONLY if the
+    # CLI-level "every detected tool" / "nothing to initialize" guards
+    # don't fire first — and `init --interactive` would even prompt
+    # the user before failing. The state-invariant takes priority over
+    # filter validation; emitting the same error for every init variant
+    # keeps the CLI surface consistent.
+    if deps.store.list():
+        raise StateAlreadyInitializedError("switcher is already initialized")
+
     requested_but_not_installed: list[str] = []
     skipped_via_skip_flag: list[str] = []
     skipped_via_interactive: list[str] = []
@@ -702,7 +715,8 @@ class _ToolsTableRow:
     installed: bool
     managed: bool
     paths: list[str]
-    pathological: bool  # True when managed AND NOT installed
+    pathological: bool  # True when managed AND NOT installed (any owned live path missing)
+    is_orphan: bool = False  # True when in active map but has no registry entry
 
 
 def _build_tools_table_rows(deps: Deps) -> list[_ToolsTableRow]:
@@ -714,22 +728,56 @@ def _build_tools_table_rows(deps: Deps) -> list[_ToolsTableRow]:
     A real StorageError (corrupt / unreadable config.json) intentionally
     propagates — the broad `except Exception` we used to have masked exactly
     the failures the rest of the CLI is careful to surface (Hermes review).
+
+    Pathological-state checks are aware of:
+      - Multi-dir tools (Hermes review): a managed tool with `config_dirs[0]`
+        present but a later managed live path missing is still pathological.
+        `detect_installed()` only checks the first config_dir, so the per-row
+        check iterates every `tool_dir(tool, i)` for managed tools.
+      - Orphan active entries (Hermes review): a tool id in the active map
+        but absent from the registry (e.g., after `uninstall --force` left
+        a skipped tool in active). Rendered as a dedicated orphan row so
+        `tools` doesn't silently hide the broken state `unmanage` is meant
+        to repair.
     """
     installed_ids = {t.id for t in deps.service.detect_installed()}
     managed_ids = set(deps.store.get_active().keys())
+    registry_ids = {t.id for t in deps.registry}
     rows: list[_ToolsTableRow] = []
     for tool in deps.registry:
-        installed = tool.id in installed_ids
+        first_dir_installed = tool.id in installed_ids
         managed = tool.id in managed_ids
         paths = [(dm.windows_path if IS_WINDOWS else dm.posix_path) for dm in tool.config_dirs]
+        if managed:
+            # Multi-dir-aware: every owned live path must exist for the tool
+            # to count as fully installed. Catches the case where the first
+            # dir is fine but a later managed dir was deleted.
+            all_live_present = deps.service.all_live_paths_present(tool)
+        else:
+            all_live_present = first_dir_installed
         rows.append(
             _ToolsTableRow(
                 tool_id=tool.id,
                 name=tool.name,
-                installed=installed,
+                installed=all_live_present,
                 managed=managed,
                 paths=paths,
-                pathological=(managed and not installed),
+                pathological=(managed and not all_live_present),
+            )
+        )
+    # Orphan rows: in active but no registry entry. Render at the end so
+    # registered tools' rows don't shift when an orphan appears, and so the
+    # orphan footer below has something to anchor on.
+    for tid in sorted(managed_ids - registry_ids):
+        rows.append(
+            _ToolsTableRow(
+                tool_id=tid,
+                name="(no registry entry)",
+                installed=False,
+                managed=True,
+                paths=[],
+                pathological=True,
+                is_orphan=True,
             )
         )
     return rows
@@ -761,7 +809,14 @@ def tools_main(ctx: typer.Context) -> None:
         )
     console.print(table)
     for row in rows:
-        if row.pathological:
+        if row.is_orphan:
+            console.print(
+                f"[yellow]⚠ {row.tool_id!r} is in active map but has no registry "
+                f"entry (orphan).[/yellow]\n  Restore the registry TOML, or run "
+                f"'switcher unmanage {row.tool_id} --force' once any leftover "
+                f"profile data is cleared."
+            )
+        elif row.pathological:
             console.print(
                 f"[yellow]⚠ {row.tool_id!r} is in active map but its live path is missing.[/yellow]\n"
                 f"  Run 'switcher unmanage {row.tool_id}' or restore the live path."

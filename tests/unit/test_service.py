@@ -193,17 +193,22 @@ def test_use_is_idempotent(service: ProfileService, tmp_state: Path) -> None:
         assert v == "vanilla"
 
 
-def test_use_pre_validates_tools_before_mutating(
+def test_use_default_silently_filters_orphan_active_entries(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    """A managed tool removed from the registry must fail before any swap.
+    """Default `use()` tolerates orphan ids in the active map (Hermes
+    blocker post-b621f02 follow-up).
 
-    v0.1.4 use() filters target_ids by active.keys() — so a stale tool in
-    profile.tools but NOT in active is silently filtered out (durability
-    for the unmanage flow). Pre-flight only needs to guard the case where
-    a tool was managed (in active) and the registry has since dropped it.
-    Without pre-flight, sorted swap order would process 'claude' before
-    'ghost' raised UnknownToolError, leaving the filesystem half-switched.
+    `create()` keeps orphan ids in `profile.tools` per spec §3.5 so the
+    management surface stays accurate, but the resolve loop in `use()`
+    used to crash on `find_tool(orphan) → None`. The fix filters
+    `target_ids` by `profile.tools ∩ active ∩ registered`, so the
+    registered tools still switch and the orphan stays untouched.
+
+    This test was originally `test_use_pre_validates_tools_before_mutating`
+    asserting the OLD "use crashes on orphans" contract. Rewritten to
+    pin the new tolerance contract: registered tools switch normally;
+    the orphan keeps its prior active-map entry.
     """
     service.init()
     store = FileProfileStore(tmp_state)
@@ -213,14 +218,38 @@ def test_use_pre_validates_tools_before_mutating(
     # Simulate registry drift after init: 'ghost' was managed once, then
     # the registry entry was removed. v0.1.3 service.init() never put a
     # 'ghost' here, so inject it manually to model the post-drift state.
+    active_before = store.get_active()
+    ghost_profile = "stale"
+    cache = service.get_active_live_paths()
+    store.set_active_state({**active_before, "ghost": ghost_profile}, cache)
+
+    service.use("stale")
+
+    active_after = store.get_active()
+    # Registered tool switched.
+    assert active_after["claude"] == "stale"
+    # Orphan untouched — still pointing at its previous profile.
+    assert active_after["ghost"] == ghost_profile
+
+
+def test_use_only_orphan_in_active_raises_clear_orphan_error(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes blocker counterpart: explicit `--only orphan` must not
+    silently no-op. Surface the orphan framing with the right
+    remediation hint, not the generic `UnknownToolError` that the
+    resolve loop used to emit deep in the stack.
+    """
+    service.init()
+    store = FileProfileStore(tmp_state)
+    store.create("stale", {"claude": True, "ghost": True})
+    (store.profile_dir("stale") / "claude").mkdir()
     active = store.get_active()
     cache = service.get_active_live_paths()
     store.set_active_state({**active, "ghost": "stale"}, cache)
-    claude_link = tmp_home / ".claude"
-    original_target = claude_link.resolve()
-    with pytest.raises(UnknownToolError):
-        service.use("stale")
-    assert claude_link.resolve() == original_target
+
+    with pytest.raises(UnknownToolError, match="orphan"):
+        service.use("stale", only=["ghost"])
 
 
 def test_use_pre_validates_target_subdirs_before_mutating(

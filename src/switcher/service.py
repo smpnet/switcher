@@ -140,6 +140,19 @@ class ProfileService:
                 installed.append(tool)
         return installed
 
+    def all_live_paths_present(self, tool: Tool) -> bool:
+        """True iff EVERY config_dir's resolved live path exists on disk.
+
+        Stricter than `detect_installed` (which only checks `config_dirs[0]`).
+        Used by the `tools` table's pathological-state check for managed
+        multi-dir tools — a tool whose first dir is intact but a later dir
+        was deleted is still in a broken state and must surface as ⚠.
+        """
+        return all(
+            self._resolver.exists(self._resolver.tool_dir(tool, i))
+            for i in range(len(tool.config_dirs))
+        )
+
     def list_profiles(self) -> list[Profile]:
         """Convenience pass-through used by some tests; CLI uses store directly."""
         return self._store.list()
@@ -758,6 +771,7 @@ class ProfileService:
         profile = self._store.get(profile_name)
         active = self._store.get_active()
         managed = set(active.keys())
+        registered = {t.id for t in self._registry}
         if only is not None:
             for tid in only:
                 if tid not in profile.tools:
@@ -772,13 +786,31 @@ class ProfileService:
                         f"tool {tid!r} is not currently managed. "
                         f"To add it: switcher rescan --only {tid}"
                     )
+                if tid not in registered:
+                    # Hermes blocker: explicit --only of an orphan id (in
+                    # active map but no registry entry, e.g. left behind by
+                    # `uninstall --force` non-purge) used to surface the
+                    # generic "unknown tool" mid-loop. Surface the orphan
+                    # framing up-front with the right remediation.
+                    raise UnknownToolError(
+                        f"tool {tid!r} is in active map but has no registry entry "
+                        f"(orphan); cannot switch. Restore the registry TOML, or "
+                        f"run 'switcher unmanage {tid} --force' to drop it."
+                    )
             target_ids = list(only)
         else:
             # v0.1.4 §3.1 durability: the default switches only the
             # managed subset of the profile, not every tool in
             # profile.tools. Without this filter, use(other_profile)
             # re-activates a tool the user just unmanaged.
-            target_ids = sorted(profile.tools.keys() & managed)
+            #
+            # Hermes blocker: also drop orphan ids (managed but not in
+            # registry). create() carries them into profile.tools for
+            # consistency, but use()'s find_tool resolve hard-errors on
+            # them. Filtering here keeps the default switch usable on
+            # an orphan-bearing active map; the user still sees the
+            # orphan in `switcher tools` and can fix it via unmanage.
+            target_ids = sorted(profile.tools.keys() & managed & registered)
         # v0.1.4 §3.1 consultant finding: _require_managed already
         # passed (active is non-empty) but this profile contributes
         # zero managed tools. Hard-error rather than silent no-op

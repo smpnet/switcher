@@ -102,3 +102,50 @@ def test_use_with_profile_containing_no_managed_tools_raises(
 
     with pytest.raises(NoToolsManagedError):
         service.use("claude-only")
+
+
+def test_use_default_skips_orphan_active_entries(
+    service_with_both_tools: ProfileService,
+) -> None:
+    """Hermes blocker: an orphan id in the active map (no registry entry,
+    e.g. left by `uninstall --force` non-purge) used to crash `use()`
+    mid-resolve with UnknownToolError. The default switch path now drops
+    orphan ids (they're managed but not switchable without their TOML),
+    so a `use(profile)` after an orphan-bearing `create()` succeeds.
+    """
+    service = service_with_both_tools
+    # Inject an orphan into active. Pair it with the same profile every
+    # other tool uses so create()/use() don't barf on a missing entry.
+    active = service._store.get_active()
+    profile_name = next(iter(active.values()))
+    active["orphan_tool"] = profile_name
+    service._store.set_active_state(active, service.get_active_live_paths())
+
+    # create() must keep the orphan id in profile.tools per spec; use()
+    # must then tolerate it.
+    service.create("backup")
+    service.use("backup")
+
+    # Both registered tools now point at backup; orphan is left alone.
+    assert service._store.get_active().get("claude") == "backup"
+    assert service._store.get_active().get("copilot") == "backup"
+    assert service._store.get_active().get("orphan_tool") == profile_name
+
+
+def test_use_only_orphan_raises_clear_error(
+    service_with_both_tools: ProfileService,
+) -> None:
+    """Hermes blocker: explicit `--only orphan_tool` should surface the
+    orphan framing with the right remediation, not the generic
+    'unknown tool' from the resolve loop."""
+    from switcher.errors import UnknownToolError
+
+    service = service_with_both_tools
+    active = service._store.get_active()
+    profile_name = next(iter(active.values()))
+    active["orphan_tool"] = profile_name
+    service._store.set_active_state(active, service.get_active_live_paths())
+    service.create("backup")
+
+    with pytest.raises(UnknownToolError, match="orphan"):
+        service.use("backup", only=["orphan_tool"])
