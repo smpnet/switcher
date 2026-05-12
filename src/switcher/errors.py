@@ -94,6 +94,20 @@ class NoToolsManagedError(SwitcherError):
     to do; better to fail loud than create empty profiles silently."""
 
 
+# --- Op-log compensation errors ------------------------------------------
+# Asymmetry note: init and rescan both have InProgress / NoInProgress
+# pairs because their recovery is explicit-flag (`--continue` /
+# `--abort`); rename does NOT have RenameInProgressError because its
+# recovery is fully automatic — the CLI hook calls
+# _detect_or_compensate_oplog at the top of every command callback, and
+# rename compensation is deterministic (idempotent swap_link + a
+# possible store.rename roll-forward) with no user input needed. There
+# is no flag to surface and no in-flight CLI prompt to drive, so a
+# dedicated exception type would have no caller. The op-log read path
+# still routes a corrupt rename record through OpLogCorruptError. See
+# spec §2.3 and the design-decision table.
+
+
 class OpLogCorruptError(SwitcherError):
     """Raised when oplog.json is unreadable: malformed JSON, empty file,
     fails Pydantic validation, or describes an in-flight op whose disk

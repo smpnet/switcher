@@ -326,20 +326,25 @@ def dump_records(records: list[OpLogRecord]) -> str:
 def mark_completed(record: OpLogRecord, when: datetime) -> OpLogRecord:
     """Return a copy of `record` with `completed_at=when`, re-validated.
 
-    Two contracts:
+    Two contracts, two failure shapes:
 
     - Pydantic v2's `model_copy(update={...})` silently bypasses
       validators on updated fields — using it for this transition could
       let a naive or backdated `completed_at` slip into the journal even
       though parse_record/parse_records would have rejected the same
       payload on read. This helper round-trips through the validator so
-      the write path is as strict as the read path.
+      the write path is as strict as the read path. A bad `when`
+      surfaces as **ValidationError**, the same shape OpLogIO already
+      wraps into OpLogCorruptError at the storage boundary.
 
     - The record is immutable from intent-write through mark_completed.
       Re-completing an already-completed record would rewrite its
       timestamp and undermine that audit guarantee, so we refuse instead
       — vacuum_completed is the only legitimate way for a completed
-      record to leave the log.
+      record to leave the log. This case raises **ValueError**, not
+      ValidationError, because it's API misuse by an in-memory caller
+      rather than corruption of on-disk data; the journal-storage layer
+      never sees it.
     """
     if record.completed_at is not None:
         raise ValueError(
