@@ -39,15 +39,20 @@ class _MappingIntent(BaseModel):
     `original_kind == "missing"` ("real-dir" implies a move). Not stored
     separately.
 
-    The `original_kind` literal includes `"link"` and `"file"` even
-    though init/rescan pre-flight reject both shapes at intent time
-    (so they should never be written to the log in normal operation).
-    They remain representable so the deserialized record can carry an
-    accurate post-hoc snapshot of pre-op state when external drift has
-    occurred between intent-write and abort; the abort-time classifier
-    then raises AbortPreflightError on either value rather than
-    guessing. Narrowing the literal would force abort to lose this
-    diagnostic information.
+    `original_kind` is narrow on purpose: init/rescan pre-flight
+    explicitly reject `"link"` and `"file"` shapes at the live_path
+    BEFORE a record is ever written, so the only values the journal can
+    legitimately carry are `"missing"` and `"real-dir"`. Admitting
+    `"link"` / `"file"` would let a hand-edited or corrupted journal
+    file pass validation and defer the failure to abort time — exactly
+    the "fail-fast at the corruption boundary" property the rest of
+    this module is designed around.
+
+    Detection of a live_path that has become a link or file *between*
+    intent-write and abort is the four-state classifier's job (it
+    raises AbortPreflightError on either shape); that observation comes
+    from the live filesystem at abort time, not from the persisted
+    snapshot.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -55,7 +60,7 @@ class _MappingIntent(BaseModel):
     mapping_index: int
     live_path: str
     profile_subdir: str
-    original_kind: Literal["missing", "link", "file", "real-dir"]
+    original_kind: Literal["missing", "real-dir"]
 
 
 class _BaseOp(BaseModel):

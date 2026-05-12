@@ -144,14 +144,23 @@ def test_unknown_op_value_raises_validation_error():
         parse_record({"op": "vacuum", "started_at": "2026-05-12T10:30:00+00:00"})
 
 
-def test_invalid_original_kind_rejected():
+@pytest.mark.parametrize("bogus", ["hardlink", "link", "file", "directory", ""])
+def test_invalid_original_kind_rejected(bogus: str):
+    """original_kind is narrow on purpose: only the values
+    init/rescan pre-flight actually admits — `missing` and `real-dir` —
+    are accepted. `link` and `file` are explicitly rejected so a
+    hand-edited or corrupted journal fails fast at the corruption
+    boundary instead of deferring the failure to abort time.
+    """
     with pytest.raises(ValidationError):
-        _MappingIntent(
-            tool_id="claude",
-            mapping_index=0,
-            live_path="/home/u/.claude",
-            profile_subdir="claude",
-            original_kind="hardlink",  # pyright: ignore[reportArgumentType]
+        _MappingIntent.model_validate(
+            {
+                "tool_id": "claude",
+                "mapping_index": 0,
+                "live_path": "/home/u/.claude",
+                "profile_subdir": "claude",
+                "original_kind": bogus,
+            }
         )
 
 

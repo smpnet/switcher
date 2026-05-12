@@ -136,7 +136,9 @@ class NoInProgressRescanError(SwitcherError):
 
 
 class AbortPreflightError(SwitcherError):
-    """Raised by op-log abort when a mapping's pre-op state was a link
-    or file (which init/rescan pre-flight rejects). Reaching this state
-    at abort time means external drift since intent-write; refuse
-    defensively rather than guess."""
+    """Raised by op-log abort when the runtime classifier observes that
+    a mapping's live_path is currently a link or file. Init/rescan
+    pre-flight rejects both shapes at intent time, so the persisted
+    `_MappingIntent.original_kind` snapshot can only be `"missing"` or
+    `"real-dir"` — a link/file at abort time means external drift since
+    intent-write. Refuse defensively rather than guess."""
