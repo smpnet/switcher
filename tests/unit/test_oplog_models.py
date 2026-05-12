@@ -187,6 +187,52 @@ def test_unknown_field_in_mapping_intent_rejected():
         )
 
 
+def test_naive_started_at_rejected_for_every_record_type():
+    """A recovery journal must use timezone-aware timestamps so that a
+    record serialized on one host can't be misordered against aware
+    datetimes elsewhere in the codebase after a round trip. Pydantic's
+    AwareDatetime enforces this at validation time on both started_at
+    and completed_at across all three op subclasses.
+    """
+    naive = datetime(2026, 5, 12, 10, 30)  # intentionally naive for the test
+
+    for op_name, extra in [
+        ("init", {"target_ids": [], "profile_name": "x", "mappings": []}),
+        ("rename", {"from": "a", "to": "b", "affected_ids": []}),
+        (
+            "rescan",
+            {
+                "target_ids": [],
+                "target_profiles": {},
+                "into_mode": False,
+                "previous_tools": None,
+                "mappings": [],
+            },
+        ),
+    ]:
+        payload: dict[str, Any] = {
+            "op": op_name,
+            "started_at": naive.isoformat(),  # naive ISO string, no offset
+            **extra,
+        }
+        with pytest.raises(ValidationError):
+            parse_record(payload)
+
+
+def test_naive_completed_at_rejected():
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "init",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "completed_at": "2026-05-12T10:31:00",  # naive
+                "target_ids": [],
+                "profile_name": "x",
+                "mappings": [],
+            }
+        )
+
+
 def test_records_are_frozen():
     """`frozen=True` enforces the documented immutability contract —
     callers can't accidentally mutate a record between intent-write

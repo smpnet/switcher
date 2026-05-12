@@ -14,10 +14,9 @@ update={"completed_at": ...})` instead of in-place assignment.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter
 
 
 class _MappingIntent(BaseModel):
@@ -76,8 +75,13 @@ class _BaseOp(BaseModel):
     """
 
     model_config = ConfigDict(populate_by_name=True, frozen=True, extra="forbid")
-    started_at: datetime
-    completed_at: datetime | None = None
+    # AwareDatetime rejects naive timestamps at validation time. A
+    # recovery journal that accepted naive values would risk
+    # cross-timezone ordering bugs: ts serialized on one host and
+    # deserialized on another could compare incorrectly against aware
+    # datetimes elsewhere in the codebase. Better to refuse at the door.
+    started_at: AwareDatetime
+    completed_at: AwareDatetime | None = None
 
 
 class _InitOp(_BaseOp):
