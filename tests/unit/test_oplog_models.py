@@ -144,6 +144,72 @@ def test_unknown_op_value_raises_validation_error():
         parse_record({"op": "vacuum", "started_at": "2026-05-12T10:30:00+00:00"})
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["tool_id", "live_path", "profile_subdir"],
+)
+def test_mapping_intent_string_fields_reject_empty(field: str):
+    """min_length=1 on every persisted string keeps an obviously corrupt
+    entry (empty tool_id, empty path) from passing validation.
+    """
+    payload = {
+        "tool_id": "claude",
+        "mapping_index": 0,
+        "live_path": "/home/u/.claude",
+        "profile_subdir": "claude",
+        "original_kind": "real-dir",
+    }
+    payload[field] = ""
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(payload)
+
+
+def test_init_op_rejects_empty_profile_name_and_target_id():
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "init",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": [""],
+                "profile_name": "x",
+                "mappings": [],
+            }
+        )
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "init",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": ["claude"],
+                "profile_name": "",
+                "mappings": [],
+            }
+        )
+
+
+def test_rename_op_rejects_empty_from_or_to():
+    with pytest.raises(ValidationError):
+        _RenameOp.model_validate(
+            {
+                "op": "rename",
+                "started_at": _now(),
+                "from": "",
+                "to": "client-A",
+                "affected_ids": [],
+            }
+        )
+    with pytest.raises(ValidationError):
+        _RenameOp.model_validate(
+            {
+                "op": "rename",
+                "started_at": _now(),
+                "from": "experiment",
+                "to": "",
+                "affected_ids": [],
+            }
+        )
+
+
 def test_mapping_index_str_not_coerced_to_int():
     """Pydantic's default int coercion would accept "0" → 0, which
     would let a hand-edited journal slip past the corruption boundary.

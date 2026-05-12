@@ -32,6 +32,14 @@ from pydantic import (
     model_validator,
 )
 
+# StrictStr blocks str/int/bool coercion; Field(min_length=1) rejects
+# the empty string. Together they ensure an empty `tool_id`,
+# `profile_name`, `live_path`, etc. can't slip past validation as a
+# valid (but obviously corrupt) journal entry. Used as an Annotated
+# alias because Pydantic v2's StrictStr is a class, not a constraint
+# container.
+NonEmptyStr = Annotated[StrictStr, Field(min_length=1)]
+
 
 class _MappingIntent(BaseModel):
     """Per-DirMapping original state — seed metadata for abort.
@@ -69,14 +77,15 @@ class _MappingIntent(BaseModel):
     # Strict* types reject Pydantic's default str↔int / str↔bool / etc.
     # coercion: a hand-edited oplog.json with `mapping_index: "0"` would
     # otherwise validate as 0 and slip past the corruption boundary the
-    # rest of this module is designed around. AwareDatetime is left as
-    # the regular pydantic type because the on-disk format stores
-    # timestamps as ISO strings — JSON has no native datetime — and
-    # AwareDatetime is itself strict about the tzinfo invariant.
-    tool_id: StrictStr
+    # rest of this module is designed around. NonEmptyStr additionally
+    # rejects the empty string. AwareDatetime is left as the regular
+    # pydantic type because the on-disk format stores timestamps as
+    # ISO strings — JSON has no native datetime — and AwareDatetime is
+    # itself strict about the tzinfo invariant.
+    tool_id: NonEmptyStr
     mapping_index: StrictInt
-    live_path: StrictStr
-    profile_subdir: StrictStr
+    live_path: NonEmptyStr
+    profile_subdir: NonEmptyStr
     original_kind: Literal["missing", "real-dir"]
 
 
@@ -196,8 +205,8 @@ def _check_mappings_against_target_ids(
 
 class _InitOp(_BaseOp):
     op: Literal["init"]
-    target_ids: list[StrictStr]
-    profile_name: StrictStr
+    target_ids: list[NonEmptyStr]
+    profile_name: NonEmptyStr
     mappings: list[_MappingIntent]
 
     @model_validator(mode="after")
@@ -213,9 +222,9 @@ class _InitOp(_BaseOp):
 
 class _RenameOp(_BaseOp):
     op: Literal["rename"]
-    from_: StrictStr = Field(alias="from")
-    to: StrictStr
-    affected_ids: list[StrictStr]
+    from_: NonEmptyStr = Field(alias="from")
+    to: NonEmptyStr
+    affected_ids: list[NonEmptyStr]
 
     @model_validator(mode="after")
     def _check_affected_ids_unique(self) -> Self:
@@ -236,10 +245,10 @@ class _RenameOp(_BaseOp):
 
 class _RescanOp(_BaseOp):
     op: Literal["rescan"]
-    target_ids: list[StrictStr]
-    target_profiles: dict[StrictStr, StrictStr]
+    target_ids: list[NonEmptyStr]
+    target_profiles: dict[NonEmptyStr, NonEmptyStr]
     into_mode: StrictBool
-    previous_tools: dict[StrictStr, dict[StrictStr, StrictBool]] | None = None
+    previous_tools: dict[NonEmptyStr, dict[NonEmptyStr, StrictBool]] | None = None
     mappings: list[_MappingIntent]
 
     @model_validator(mode="after")
