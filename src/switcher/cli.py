@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import functools
 import sys
@@ -25,6 +26,27 @@ from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
 from switcher.service import InitReport, ProfileService, UninstallMappingState
 from switcher.store import FileProfileStore, ProfileStore
+
+# Reconfigure stdout/stderr to UTF-8 so the v0.1.4 tools table can emit its
+# ✓ / — / ⚠ glyphs without UnicodeEncodeError on Windows consoles whose
+# default codepage is cp1252 / cp437. Modern Windows Terminal handles UTF-8
+# natively; legacy cmd.exe sessions degrade to "?" via errors="replace"
+# rather than crashing. POSIX terminals are already UTF-8 — the reconfigure
+# is a no-op there.
+#
+# Done at module import time (NOT lazily) so any code path that reaches
+# `console.print(...)` is covered, including subprocess invocations from
+# tests that read stdout via PIPE (the default subprocess.PIPE encoding on
+# Windows is cp1252, which is what surfaced this).
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is None:
+        continue
+    encoding = getattr(_stream, "encoding", None)
+    if encoding and encoding.lower().replace("-", "") != "utf8":
+        # Older Python or non-text stream falls through silently and lets
+        # Rich's default encode-error handling kick in.
+        with contextlib.suppress(AttributeError, OSError):
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 
 app = typer.Typer(
     no_args_is_help=True,

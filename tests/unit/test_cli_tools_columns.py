@@ -157,6 +157,42 @@ def test_tools_command_propagates_storage_error_on_corrupt_config(
     assert "config.json" in err.lower() or "malformed" in err.lower()
 
 
+def test_tools_subprocess_does_not_crash_on_cp1252_stdout(tmp_home: Path, tmp_state: Path) -> None:
+    """Regression for the v0.1.4 Windows CI break: the new tools table
+    emits ✓ / — / ⚠ glyphs that crash with UnicodeEncodeError if stdout
+    is cp1252 / cp437 (Windows-cmd default). cli.py reconfigures stdout
+    to UTF-8 (errors='replace') at import time so the command degrades
+    gracefully on legacy consoles instead of crashing.
+
+    Repro the Windows-encoding scenario portably by spawning `python -m
+    switcher tools` with PYTHONIOENCODING=cp1252 (and an argv-injected
+    init dir). If the encoding fix regresses, the subprocess's stdout
+    encoder will raise on the first `✓` and the exit code will be 1.
+    """
+    import subprocess
+    import sys
+
+    init_result = runner.invoke(app, ["init"])
+    assert init_result.exit_code == 0, _combined(init_result)
+
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "cp1252:replace"
+    env["SWITCHER_STATE_DIR"] = str(tmp_state)
+    if IS_WINDOWS:
+        env["USERPROFILE"] = str(tmp_home)
+        env["LOCALAPPDATA"] = str(tmp_home / "AppData" / "Local")
+    else:
+        env["HOME"] = str(tmp_home)
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "switcher", "tools"],
+        env=env,
+        capture_output=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"tools crashed under cp1252 stdout: {proc.stderr!r}"
+
+
 def test_status_pre_init_suggests_init(tmp_home: Path, tmp_state: Path) -> None:
     """Uninitialized → suggest init, NOT rescan (Hermes review).
 
