@@ -85,176 +85,128 @@ GitHub auth that worked at install time (SSH key in your agent, or
 with a `git clone`-style auth error, that's a GitHub auth problem, not a
 `switcher` bug — refresh the SSH agent or re-run `gh auth login`.
 
-## Usage
+## Start using switcher
 
 > **⚠ Run `switcher init` only after the tools you want to manage are
-> already installed.** `init` is one-shot — it captures whichever tools
-> exist at the moment you run it, then refuses to run again. Tools
-> installed *after* `init` are picked up by `switcher rescan` (see
-> "Recovery commands" below). To remove `switcher` and restore your
-> live config directories to real directories, use `switcher uninstall`.
+> already installed.** `init` captures whichever tools exist at the moment
+> you run it; tools installed later are picked up by `switcher rescan`
+> (see "Add another tool later"). `init` is one-shot — re-running it
+> fails with `StateAlreadyInitialized`.
 
 ```bash
-# One-time setup: detect installed tools, MOVE each tool's live config dir
-# into the state store, and replace the original path with a symlink (or
-# junction on Windows) pointing into the snapshot. Then create vanilla.
+# Capture every detected tool into a dated-current profile:
 switcher init
 
-# Show what's active for each tool
-switcher status
-
-# List every profile (active ones marked with *)
-switcher list
-
-# Switch all tools to vanilla
-switcher use vanilla
-
-# Switch only Claude
-switcher use vanilla --only claude
-
-# Snapshot whatever is live right now
-switcher save before-experiment
-
-# Create an empty profile that inherits credentials from the active profile
-switcher create experiment
-switcher use experiment
-
-# See which profile a tool uses
-switcher which claude
-
-# Rename (auto-relinks if active)
-switcher rename experiment client-A
-
-# Delete a profile. Active profiles are always refused — switch them with
-# `switcher use <other>` first. The --force flag only suppresses the
-# interactive y/N prompt; it does not bypass the active-profile check.
-switcher delete old-profile
-switcher delete old-profile --force
-
-# List supported tools and per-OS config paths
-switcher tools
-
-# Print version
-switcher version
+# Restrict to a subset:
+switcher init --only copilot              # manage Copilot only
+switcher init --skip claude               # manage everything detected except Claude
+switcher init --interactive               # per-tool yes/no prompt (TTY required)
 ```
 
-## Recovery commands
+> **Recovery (forthcoming in v0.1.5; not in earlier releases):**
+> if `init` is interrupted by a process kill or transient FS error,
+> `switcher status` will report it and point you at
+> `switcher init --continue` (resume the partial capture) or
+> `switcher init --abort` (restore the pre-init state). Pre-v0.1.5,
+> an interrupted `init` requires manual intervention — see
+> "Maintenance and recovery".
 
-Three commands cover post-`init` recovery without resorting to the
-destructive procedure:
-
-- **`switcher uninstall`** — inverse of `init`. Replaces every active
-  symlink with a real directory restored from each tool's currently-active
-  profile. State dir is preserved by default; `--purge` also removes it.
-- **`switcher rescan`** — picks up tools installed after `init`,
-  capturing each into a fresh profile (`<today>-rescan-N`). Pass
-  `--into <profile>` to consolidate into an existing profile.
-- **`switcher prune`** — removes profiles that aren't active for any
-  tool. Shows sizes; `--force` skips the confirmation prompt.
-
-Run `switcher status -v` to see which tools have cached `live_paths`
-(used by `uninstall` to recover even when the registry has drifted).
-
-### Managing the tool lifecycle
-
-`init` is one-shot. To change which tools switcher manages after init:
-
-- **Initialize with a subset of detected tools:**
-
-  ```bash
-  switcher init --only copilot              # manage Copilot only
-  switcher init --skip claude               # manage everything detected except Claude
-  switcher init --interactive               # per-tool yes/no prompt (requires a TTY)
-  ```
-
-- **Add a tool after init:** `switcher rescan --only <tool>` — the canonical
-  way to bring a single tool under management.
-
-- **Remove a single tool:** `switcher unmanage <tool>` — restores the live
-  path and drops the tool from the active map. Subsequent `use` calls won't
-  re-activate it (durability is enforced by filtering profile tools against
-  the active set).
-
-- **Remove everything:** `switcher uninstall` (relink-only) or
-  `switcher uninstall --purge` (also wipe state).
-
-After `unmanage <tool>`, running `rescan` (no flags) on a TTY prompts you
-per-tool — answering No keeps the tool excluded for that session. Use
-`rescan --only <tool>` to re-add a single tool deterministically.
-
-### Migrating from the legacy two-dir Copilot builtin
-
-v0.1.4 rewrites the bundled `copilot` builtin to target the standalone
-`copilot` binary's single config dir (`~/.copilot`). Profiles created
-before v0.1.4 — when the builtin captured both `~/.copilot` AND
-`~/.config/github-copilot` (POSIX) / `%LOCALAPPDATA%\github-copilot`
-(Windows) — keep working: their cached live paths still resolve and the
-`copilot-auth/` subdir under each profile is harmless dead data
-(switcher no longer visits it).
-
-If you want to fully migrate to the single-dir shape and drop the
-legacy `copilot-auth/` subdir from new profiles:
+## Switch profiles
 
 ```bash
-switcher unmanage copilot                  # restores both legacy live paths
-switcher rescan --only copilot             # captures just ~/.copilot
+switcher use vanilla                  # all currently-managed tools
+switcher use vanilla --only claude    # one tool only
 ```
 
-The unmanage step's pre-flight uses cached live paths, so registry
-drift doesn't break it. After `rescan`, new profiles created from
-the standalone Copilot CLI's data carry only `copilot-config/`.
+`use` switches **only currently-managed tools**. Tools removed via
+`unmanage` stay removed across `use` calls — the durability invariant
+added in v0.1.4. To bring a tool back under management, run
+`switcher rescan --only <tool>`.
 
-If you use the deprecated `gh copilot` extension instead, see
-[Adding a tool](#adding-a-tool) below — register it as a user-local
-tool with the explicit two-dir shape rather than re-using the `copilot`
-id.
+## Save and manage profiles
 
-## How it works
+`save` and `create` are different operations:
 
-`switcher init` performs a one-time setup:
+- `switcher save <name>` snapshots the **current live config** of every
+  managed tool into a new profile.
+- `switcher create <name>` scaffolds a new **empty** profile, seeded
+  with the active profile's credential files. Use this when you want a
+  fresh profile to populate from scratch.
 
-1. Detects which managed tools are installed by looking for an existing
-   configuration directory each tool registers.
-2. Moves each tool's live config dirs into `<state_dir>/profiles/<dated>-current/`.
-3. Creates symlinks (or junctions on Windows) from the original paths back into the profile.
-4. Creates a `vanilla` profile containing only credential files — no plugins, hooks, or extensions.
-5. Records `<dated>-current` as active for every detected tool.
+```bash
+switcher save before-experiment       # capture the moment, then experiment
+switcher create experiment            # empty profile, credentials seeded
+switcher use experiment
 
-After that, `switcher use <name>` re-links each managed dir to the new
-profile — one atomic per-directory swap each.
+switcher rename experiment client-A   # auto-relinks active profiles
+switcher delete old-profile           # refused if active; switch off first
+switcher delete old-profile --force   # suppresses y/N prompt; active still blocks
+```
 
-**`init` is one-shot.** It snapshots whichever managed tools are installed
-at the moment you run it, and then refuses to run again
-(`StateAlreadyInitialized`). Two cases worth knowing:
+## Add another tool later
 
-- *No managed tools installed yet:* `init` still succeeds — but with empty
-  profiles and no active tools, so `status` will show "no active profiles."
-- *Only some managed tools installed:* only those are captured; the rest
-  are simply not in the active map.
+`init` is a one-shot. To bring a newly-installed tool under management:
 
-In both cases, a tool installed *after* `init` is not retroactively picked
-up by `init` itself. Use `switcher rescan` to capture newly-installed
-tools into a fresh profile (see "Recovery commands" above).
+```bash
+switcher rescan --only gemini         # canonical "add a tool" verb
+switcher rescan                       # TTY-interactive: yes/no per detected tool
+switcher rescan --all                 # non-interactive, capture everything
+```
 
-> **⚠ Manual recovery.** When the normal commands can't repair the
-> state — a half-finished `init`, dangling links, registry drift, or a
-> tool installed after `init` — recovery is staged: try the
-> non-destructive commands first, fall through to the destructive wipe
-> only as a last resort.
->
-> **`switcher uninstall` — inverse of `init`.** Replaces every live
-> config symlink with a real directory restored from each tool's
-> currently-active profile. State is preserved by default;
-> `switcher uninstall --purge` also removes `<state_dir>` after the
-> swap. `uninstall` reads the per-tool active profile from cached
-> `live_paths` (visible via `switcher status -v`) so it still works
-> when the registry has drifted. Use this for "I want to remove
-> `switcher`" or "my `init` ended up wedged."
->
-> **`switcher rescan` — for tools installed after `init`.** Captures
-> each newly-detected tool into a fresh `<today>-rescan-N` profile.
-> Pass `switcher rescan --into <profile>` to consolidate into an
-> existing profile.
+> **Recovery (forthcoming in v0.1.5; not in earlier releases):**
+> if `rescan` is interrupted, `switcher status` will report it and
+> you resolve with `switcher rescan --continue` or
+> `switcher rescan --abort`. Pre-v0.1.5, see "Maintenance and
+> recovery".
+
+## Stop managing one tool
+
+```bash
+switcher unmanage copilot             # restores ~/.copilot to a real directory,
+                                       # removes Copilot from the active map
+```
+
+Subsequent `use` calls won't re-activate Copilot. To bring it back,
+run `switcher rescan --only copilot`.
+
+## Stop using switcher entirely
+
+```bash
+switcher uninstall                    # every live symlink → real directory;
+                                       # state directory preserved
+switcher uninstall --purge            # same, plus `rm -rf <state_dir>`
+```
+
+This restores `switcher`-managed config paths to real directories and
+(optionally) removes the state dir. It does **not** uninstall the
+`switcher` Python package — for that, run `pipx uninstall switcher`.
+
+## Inspect and diagnose
+
+```bash
+switcher status                       # active profile per tool
+switcher status -v                    # plus cached live-path state
+switcher which claude                 # which profile a tool is on
+switcher tools                        # registered tools, INSTALLED + MANAGED columns
+switcher list                         # all profiles, active marked with *
+switcher version                      # package version
+```
+
+The `tools` `INSTALLED` column is `✓` when the tool's live config dir
+exists; `MANAGED` is `✓` when the tool is in the active map.
+
+## Maintenance and recovery
+
+```bash
+switcher prune                        # delete profiles not active for any tool
+switcher prune --dry-run
+switcher prune --force                # skip the confirmation prompt
+```
+
+> **⚠ Manual recovery (last resort).** When the normal commands can't
+> repair the state — a half-finished `init` that even `--abort` can't
+> resolve, dangling links after a manual `rm -rf`, registry drift past
+> what `unmanage` handles — fall through to the destructive procedure.
 >
 > ### If everything else fails: destructive recovery
 >
@@ -347,6 +299,60 @@ tools into a fresh profile (see "Recovery commands" above).
 >    that's expected; completing the auth updates the live config dir,
 >    which IS the restored profile while it's active, so the new
 >    credentials persist in that profile.
+
+### Migrating from the legacy two-dir Copilot builtin
+
+v0.1.4 rewrites the bundled `copilot` builtin to target the standalone
+`copilot` binary's single config dir (`~/.copilot`). Profiles created
+before v0.1.4 — when the builtin captured both `~/.copilot` AND
+`~/.config/github-copilot` (POSIX) / `%LOCALAPPDATA%\github-copilot`
+(Windows) — keep working: their cached live paths still resolve and the
+`copilot-auth/` subdir under each profile is harmless dead data
+(switcher no longer visits it).
+
+If you want to fully migrate to the single-dir shape and drop the
+legacy `copilot-auth/` subdir from new profiles:
+
+```bash
+switcher unmanage copilot                  # restores both legacy live paths
+switcher rescan --only copilot             # captures just ~/.copilot
+```
+
+The unmanage step's pre-flight uses cached live paths, so registry
+drift doesn't break it. After `rescan`, new profiles created from
+the standalone Copilot CLI's data carry only `copilot-config/`.
+
+If you use the deprecated `gh copilot` extension instead, see
+[Adding a tool](#adding-a-tool) below — register it as a user-local
+tool with the explicit two-dir shape rather than re-using the `copilot`
+id.
+
+## How it works
+
+`switcher init` performs a one-time setup:
+
+1. Detects which managed tools are installed by looking for an existing
+   configuration directory each tool registers.
+2. Moves each tool's live config dirs into `<state_dir>/profiles/<dated>-current/`.
+3. Creates symlinks (or junctions on Windows) from the original paths back into the profile.
+4. Creates a `vanilla` profile containing only credential files — no plugins, hooks, or extensions.
+5. Records `<dated>-current` as active for every detected tool.
+
+After that, `switcher use <name>` re-links each managed dir to the new
+profile — one atomic per-directory swap each.
+
+**`init` is one-shot.** It snapshots whichever managed tools are installed
+at the moment you run it, and then refuses to run again
+(`StateAlreadyInitialized`). Two cases worth knowing:
+
+- *No managed tools installed yet:* `init` still succeeds — but with empty
+  profiles and no active tools, so `status` will show "no active profiles."
+- *Only some managed tools installed:* only those are captured; the rest
+  are simply not in the active map.
+
+In both cases, a tool installed *after* `init` is not retroactively picked
+up by `init` itself. Use `switcher rescan` to capture newly-installed
+tools into a fresh profile (see "Add another tool later" above).
 
 Profile contents (what `save`/`create`/`use` move around): each profile is
 a directory of full per-tool config trees. Credential files (declared in
@@ -492,20 +498,12 @@ path = "apps.json"
 > then run `switcher rescan --only copilot`. Running both side-by-side
 > against the same `~/.copilot` will produce confused state.
 
-## Development
+## Contributing
 
-This is a [pixi](https://pixi.sh) workspace.
-
-```bash
-pixi install              # one-time setup
-pixi run test             # unit tests
-pixi run test-integration
-pixi run test-e2e
-pixi run lint
-pixi run typecheck
-pixi run ci               # all of the above + verify-windows + build
-pixi run build            # build wheel into dist/
-```
+Bug reports, feature requests, and PRs are welcome. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev environment setup,
+the test layout, the spec→plan→implementation workflow, commit
+conventions, and a walkthrough for adding a built-in tool.
 
 ## License
 

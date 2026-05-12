@@ -1,8 +1,10 @@
-name: Run pixi CI
+name: Run pixi check tasks
 description: >
-  Set up pixi and invoke the `ci` task. The pixi.toml `ci = { depends-on
-  = [...] }` aggregate is the single authoritative task list -- the
-  workflow runs whatever pixi.toml says it runs, end of story. Per-task
+  Set up pixi and invoke the `check` task. The pixi.toml `check =
+  { depends-on = [...] }` aggregate is the single authoritative task
+  list for the test matrix -- the workflow runs whatever pixi.toml says
+  it runs, end of story. Wheel building runs in its own workflow job so
+  the pure-Python artifact isn't rebuilt across the OS matrix. Per-task
   pass/fail visibility comes through pixi's own `✨ Pixi task (X)`
   output in the step log; one click vs. one glance is the trade we make
   for not having a duplicate step list to drift.
@@ -19,12 +21,12 @@ runs:
     # with Windows itself, so it's the most portable Windows shell.
     # On POSIX, plain bash is universal.
 
-    - name: Run CI task list (POSIX)
+    - name: Run check task list (POSIX)
       if: runner.os != 'Windows'
       shell: bash
-      run: pixi run ci
+      run: pixi run check
 
-    - name: Run CI task list (Windows)
+    - name: Run check task list (Windows)
       if: runner.os == 'Windows'
       shell: powershell
-      run: pixi run ci
+      run: pixi run check

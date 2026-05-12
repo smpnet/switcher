@@ -7,7 +7,6 @@
 #
 # Sections deliberately *not* yet populated (added in the same PR that
 # introduces the matching code/invariant, per the CLAUDE.md global standard):
-#   • reviews.pre_merge_checks.custom_checks
 #   • reviews.finishing_touches.custom
 #   • most code_generation.unit_tests.path_instructions
 
@@ -67,6 +66,38 @@ reviews:
   auto_assign_reviewers: false
 
   abort_on_close: true
+
+  # Pre-merge gates for two v0.1.0 ProfileService invariants. The live
+  # CodeRabbit schema (verified at write time) does NOT support a per-item
+  # `path` field on custom_checks -- only name/mode/instructions -- so each
+  # check's instructions text gates itself on the file path. CodeRabbit
+  # evaluates the instructions against the PR diff and treats the check as
+  # passing when the gate file is unchanged.
+  pre_merge_checks:
+    custom_checks:
+      - name: "service.delete refuses active profiles"
+        mode: error
+        instructions: >-
+          This check applies only when the PR diff modifies
+          src/switcher/service.py. If that file is unchanged, the check
+          passes automatically.
+
+          ProfileService.delete MUST raise ProfileIsActiveError when the
+          named profile appears in the active map. The guard around
+          `if active_for: raise ProfileIsActiveError(...)` must stay
+          reachable in any diff. Refactors that split delete into two
+          code paths must keep the guard reachable from both.
+      - name: "service.rename re-points orphan tool ids"
+        mode: error
+        instructions: >-
+          This check applies only when the PR diff modifies
+          src/switcher/service.py. If that file is unchanged, the check
+          passes automatically.
+
+          ProfileService.rename MUST unconditionally update
+          active[tid] = new for every tid in affected_ids -- including
+          tool ids not present in the registry (orphans). The link-fixup
+          loop is registry-dependent, but the active-map update is NOT.
 
   path_filters:
     - "!.pixi/**"
