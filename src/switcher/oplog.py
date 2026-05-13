@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -616,6 +617,15 @@ class OpLogIO:
             blob = self._path.read_text(encoding="utf-8")
         except OSError as e:
             raise OpLogCorruptError(f"oplog at {self._path} could not be read: {e}") from e
+        except UnicodeDecodeError as e:
+            # read_text raises UnicodeDecodeError separately from OSError
+            # for non-UTF-8 bytes; without an explicit branch it would
+            # propagate as a raw traceback and bypass the corruption
+            # boundary the rest of the module is enforcing. Treat invalid
+            # UTF-8 the same as malformed JSON below — the journal is
+            # supposed to be valid UTF-8 JSON, and anything else is
+            # corruption.
+            raise OpLogCorruptError(f"oplog at {self._path} contains invalid UTF-8: {e}") from e
         if not blob.strip():
             raise OpLogCorruptError(f"oplog at {self._path} is empty; manual recovery required")
         try:
@@ -650,12 +660,29 @@ class OpLogIO:
     def append_record(self, record: OpLogRecord) -> None:
         """Append a new intent record and atomically rewrite the file.
 
+        ``record`` must carry ``completed_at = None`` — the journal
+        lifecycle is ``append (intent)`` → ``mark_completed``. A caller
+        passing an already-completed record bypasses the in-flight /
+        audit accounting and is API misuse, same shape as
+        :func:`mark_completed`'s rejection of re-completion;
+        ``ValueError`` matches that contract because it's an in-memory
+        caller bug rather than on-disk corruption.
+
         Raises:
+            ValueError: ``record.completed_at is not None``. Use
+                :meth:`mark_completed` to transition an already-appended
+                intent.
             OpLogCorruptError: another record is already in-flight on
                 disk. The caller must run the appropriate compensation
                 command (``--continue`` or ``--abort``) for the existing
                 op before starting a new one.
         """
+        if record.completed_at is not None:
+            raise ValueError(
+                f"append_record expects an intent (completed_at=None); got a "
+                f"record already completed at {record.completed_at.isoformat()}. "
+                f"Use mark_completed to transition an existing in-flight record."
+            )
         existing = self.read_records()
         if any(r.completed_at is None for r in existing):
             raise OpLogCorruptError(
@@ -778,8 +805,7 @@ class OpLogIO:
         same-filesystem renames; the tmp file shares the parent dir, so
         the rename never crosses filesystems.
 
-        Lock-free, single-process. The tmp suffix is fixed
-        (``oplog.json.tmp``) and ``append_record`` does a lock-free
+        Lock-free, single-process. ``append_record`` does a lock-free
         read/modify/write cycle, so two overlapping switcher processes
         could observe "no in-flight record", both proceed, and the
         later ``replace()`` would clobber the earlier one's intent.
@@ -794,39 +820,49 @@ class OpLogIO:
         Multi-writer safety, if ever wanted, belongs at the command
         level and as a separate story.
 
-        The temp path is defended the same way the journal path is:
-        if ``oplog.json.tmp`` already exists as a symlink or junction,
-        refuse the write. ``Path.write_text`` follows symlinks, so a
-        naive write would clobber the link target with journal JSON
-        and the subsequent ``replace`` would install the link at
-        ``oplog.json`` itself — bypassing read-path symlink rejection
-        and producing the split-brain shape that policy exists to
-        prevent. Fail-fast at the corruption boundary instead.
+        The temp file is created via :func:`tempfile.mkstemp`
+        (``O_CREAT|O_EXCL`` with a random sibling name), not at a
+        fixed path. That structurally defeats the file-clobbering
+        class Hermes' review surfaced: a pre-placed symlink, junction,
+        OR hard link at the old predictable ``oplog.json.tmp`` name is
+        simply not touched — the kernel creates a fresh same-directory
+        file the attacker can't predict, and ``Path.replace`` moves it
+        atomically into place. Hard links are indistinguishable from
+        regular files via metadata checks, so a shape-based pre-check
+        on a predictable name could never have closed that gap;
+        ``O_EXCL`` is the only structural defense. Same-directory
+        placement is what keeps the rename within one filesystem.
 
-        Filesystem failures from ``mkdir`` / ``write_text`` /
+        Filesystem failures from ``mkdir`` / ``mkstemp`` / ``write`` /
         ``replace`` (permission denied, disk full, EXDEV, etc.) are
         wrapped into :class:`StorageError` so the CLI gets a
         user-facing domain error rather than a raw ``OSError``
-        traceback.
+        traceback. If a failure occurs after mkstemp but before
+        ``replace`` succeeds, the partial temp file is unlinked so it
+        doesn't accumulate as garbage across retries.
 
         Raises:
-            StorageError: temp path is a pre-existing symlink/junction,
-                or any of the underlying filesystem ops raises OSError.
+            StorageError: any of the underlying filesystem ops raises
+                ``OSError``.
         """
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        # Defend the temp path the same way read_records defends the
-        # journal path. is_symlink() covers POSIX symlinks and Windows
-        # symlinks; the explicit isjunction() branch catches the
-        # Windows directory-junction shape that is_symlink misses.
-        if tmp.is_symlink() or (os.name == "nt" and os.path.isjunction(str(tmp))):
-            raise StorageError(
-                f"oplog tmp path at {tmp} is a symlink/junction; refusing to "
-                f"write through it. Manual recovery required."
-            )
         payload = dump_records(records)
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(payload, encoding="utf-8")
-            tmp.replace(self._path)
+            fd, tmpname = tempfile.mkstemp(
+                dir=self._path.parent,
+                prefix=self._path.name + ".",
+                suffix=".tmp",
+            )
+            tmp = Path(tmpname)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                tmp.replace(self._path)
+            except OSError:
+                # Anything between mkstemp success and replace failing
+                # leaves the tmp file behind; clean it up so retries
+                # don't accumulate orphans.
+                tmp.unlink(missing_ok=True)
+                raise
         except OSError as e:
             raise StorageError(f"oplog at {self._path} could not be written: {e}") from e

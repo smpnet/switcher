@@ -5,6 +5,7 @@ vacuum (spec §2.1, §2.6)."""
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -129,6 +130,20 @@ def test_read_records_valid_symlink_raises_corrupt(tmp_path: Path):
         io.read_records()
 
 
+def test_read_records_invalid_utf8_raises_corrupt(tmp_path: Path):
+    """``read_text(encoding='utf-8')`` raises ``UnicodeDecodeError`` for
+    non-UTF-8 bytes. The module only catches ``OSError`` around it, so
+    invalid bytes would escape as a raw decode error and bypass the
+    corruption boundary the rest of the module is enforcing. Same
+    failure shape as malformed JSON: refuse, surface as
+    ``OpLogCorruptError``.
+    """
+    (tmp_path / "oplog.json").write_bytes(b"\xff\xfe\xfd")
+    io = OpLogIO(tmp_path)
+    with pytest.raises(OpLogCorruptError):
+        io.read_records()
+
+
 def test_read_records_non_list_top_level_raises_corrupt(tmp_path: Path):
     """A valid JSON value that isn't a list (e.g. an object) is a
     distinct corruption path from malformed JSON — it parses but fails
@@ -171,6 +186,27 @@ def test_append_record_refuses_when_in_flight_present(tmp_path: Path):
     # Second append, no completion of the first — should refuse.
     with pytest.raises(OpLogCorruptError):
         io.append_record(_make_rename_op("c", "d"))
+
+
+def test_append_record_rejects_already_completed_record(tmp_path: Path):
+    """``append_record`` writes an *intent*; the lifecycle is
+    ``append (completed_at=None) → mark_completed``. A caller passing a
+    record that already has ``completed_at`` set is API misuse — same
+    shape as a stale-reference re-completion through ``mark_completed``,
+    which raises ``ValueError`` there. Reject it up front rather than
+    silently appending a finished record and letting it skew the
+    in-flight / audit accounting.
+    """
+    record = _make_rename_op()
+    # mark_completed (module-level helper) returns an immutable copy
+    # with completed_at set — exactly the shape append_record must
+    # refuse.
+    from switcher.oplog import mark_completed
+
+    completed = mark_completed(record, datetime(2026, 5, 12, 11, 0, tzinfo=UTC))
+    io = OpLogIO(tmp_path)
+    with pytest.raises(ValueError):
+        io.append_record(completed)
 
 
 def test_append_record_succeeds_after_prior_completed(tmp_path: Path):
@@ -341,48 +377,71 @@ def test_write_wraps_oserror_into_storage_error(tmp_path: Path, monkeypatch: pyt
     the CLI as a traceback rather than as a domain error. ``_write_records``
     must wrap filesystem failures (permission denied, ENOSPC, EXDEV)
     into :class:`StorageError` so the CLI's error renderer can present
-    them like every other ``SwitcherError`` subclass.
+    them like every other ``SwitcherError`` subclass. Patches
+    ``tempfile.mkstemp`` (a real failure point — disk full at temp-
+    create time) so the wrap path is exercised without needing a
+    deliberately corrupt filesystem.
     """
 
-    def raises_oserror(self: Path, data: str, **_kwargs: object) -> int:
+    def raises_oserror(**_kwargs: object) -> tuple[int, str]:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(Path, "write_text", raises_oserror)
+    monkeypatch.setattr(tempfile, "mkstemp", raises_oserror)
     io = OpLogIO(tmp_path)
     with pytest.raises(StorageError):
         io.append_record(_make_rename_op())
 
 
-@_skip_no_file_symlinks
-def test_write_refuses_pre_existing_tmp_symlink(tmp_path: Path):
-    """The temp path ``oplog.json.tmp`` is fixed and predictable. If a
-    symlink is pre-placed there pointing at a victim file, the naive
-    write would do two harmful things in sequence:
-
-    1. ``tmp.write_text(...)`` follows the symlink and clobbers the
-       victim file with serialized journal JSON.
-    2. ``tmp.replace(self._path)`` then installs the symlink at
-       ``oplog.json`` itself — bypassing the symlink rejection
-       ``read_records`` enforces and producing exactly the
-       split-brain shape that policy exists to prevent.
-
-    Defend the tmp path the same way the journal path is defended:
-    refuse any non-regular file at the temp location, surface as
-    ``StorageError``, and never touch the symlink target.
+def test_write_resists_pre_existing_tmp_hardlink(tmp_path: Path):
+    """Hard links are indistinguishable from regular files via
+    ``is_symlink`` / ``isjunction``, so the previous shape-based
+    pre-check at a fixed ``oplog.json.tmp`` couldn't defend against
+    ``os.link(victim, oplog.json.tmp)`` followed by ``tmp.write_text``
+    — the write would clobber the victim's inode through the
+    hard-link entry. The fix is structural: never write to a
+    predictable name. ``_write_records`` must use
+    ``tempfile.mkstemp`` (O_CREAT|O_EXCL with a random suffix) so any
+    attacker-planted entry at the old ``oplog.json.tmp`` path is
+    simply not touched.
     """
     victim = tmp_path / "victim.txt"
     original_contents = "do not clobber me"
     victim.write_text(original_contents, encoding="utf-8")
-    tmp = tmp_path / "oplog.json.tmp"
-    tmp.symlink_to(victim)
+    # Pre-place a hard link at the old predictable name.
+    os.link(victim, tmp_path / "oplog.json.tmp")
     io = OpLogIO(tmp_path)
-    with pytest.raises(StorageError):
-        io.append_record(_make_rename_op())
+    io.append_record(_make_rename_op())
+    # Victim's inode must not have been written through the hard link.
+    assert victim.read_text(encoding="utf-8") == original_contents
+    # The journal landed at the right path with valid JSON.
+    on_disk: list[dict[str, Any]] = json.loads(
+        (tmp_path / "oplog.json").read_text(encoding="utf-8")
+    )
+    assert len(on_disk) == 1
+    assert on_disk[0]["op"] == "rename"
+
+
+@_skip_no_file_symlinks
+def test_write_resists_pre_existing_tmp_symlink(tmp_path: Path):
+    """Sibling shape to the hard-link test above. A pre-placed symlink
+    at the old fixed ``oplog.json.tmp`` name must not affect the new
+    mkstemp-based write: the actual tmp file lives at a random
+    ``oplog.json.<random>.tmp`` name, so the attacker-planted symlink
+    is irrelevant and its target is untouched.
+    """
+    victim = tmp_path / "victim.txt"
+    original_contents = "do not clobber me"
+    victim.write_text(original_contents, encoding="utf-8")
+    (tmp_path / "oplog.json.tmp").symlink_to(victim)
+    io = OpLogIO(tmp_path)
+    io.append_record(_make_rename_op())
     # Victim file must not have been written through the symlink.
     assert victim.read_text(encoding="utf-8") == original_contents
-    # oplog.json must not have been created — refusing the write means
-    # no journal state was published.
-    assert not (tmp_path / "oplog.json").exists()
+    # The journal landed at the right path with valid JSON.
+    on_disk: list[dict[str, Any]] = json.loads(
+        (tmp_path / "oplog.json").read_text(encoding="utf-8")
+    )
+    assert len(on_disk) == 1
 
 
 def test_atomic_write_uses_tmp_plus_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
