@@ -78,6 +78,34 @@ def validate_credential_path(value: str) -> str:
     return value
 
 
+def validate_absolute_path(value: str) -> str:
+    """Reject relative, tilde-prefixed, or traversal-containing paths.
+
+    The mirror of ``validate_credential_path``: where credential paths
+    must be relative + free of ``..``, absolute paths (e.g. an op-log
+    ``live_path``) must be absolute + free of ``..`` and not start with
+    ``~``. Cross-platform: accepts POSIX absolute (``/...``), Windows
+    absolute (``C:\\...``) and UNC (``\\\\server\\share\\...``)
+    regardless of host OS, so a journal can be inspected from a
+    different platform without false rejection. The intent writer is
+    expected to have already routed values through
+    :meth:`PathResolver.expand` (env vars + ``~`` → host home), so an
+    unexpanded ``~/...`` here is corruption rather than a legitimate
+    shape.
+    """
+    if not value:
+        raise ValueError(f"absolute path must not be empty: {value!r}")
+    if value.startswith("~"):
+        raise ValueError(f"absolute path must be expanded, not tilde-prefixed: {value!r}")
+    pp = PurePosixPath(value)
+    pw = PureWindowsPath(value)
+    if not (pp.is_absolute() or pw.is_absolute()):
+        raise ValueError(f"absolute path must start with a root: {value!r}")
+    if ".." in pp.parts or ".." in pw.parts:
+        raise ValueError(f"absolute path must not contain '..': {value!r}")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # DirMapping
 # ---------------------------------------------------------------------------

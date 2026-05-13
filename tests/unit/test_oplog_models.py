@@ -199,6 +199,70 @@ def test_mapping_intent_tool_id_rejects_unsafe_names(unsafe_id: str):
         _MappingIntent.model_validate(payload)
 
 
+# Paths that ``validate_absolute_path`` rejects for the journal's
+# ``live_path`` field. Mirror of ``_UNSAFE_NAMES`` for the path-shape
+# class of corruption rather than the name-shape class.
+_UNSAFE_LIVE_PATHS = [
+    "foo",  # bare relative
+    "../escape",  # traversal
+    "rel/path",  # relative multi-segment
+    "~/rel",  # unexpanded tilde
+    "~",
+    "~user/rel",  # ~username form (also rejected by expand())
+    "/home/u/../escape",  # traversal in otherwise-absolute path
+    "C:..\\escape",  # Windows drive-relative traversal
+    "",  # empty (also caught by NonEmptyStr, but pinned here too)
+]
+
+
+@pytest.mark.parametrize("unsafe_live_path", _UNSAFE_LIVE_PATHS)
+def test_mapping_intent_live_path_rejects_non_canonical_absolute(unsafe_live_path: str):
+    """``live_path`` is later trusted by ``classify_mapping`` as a real
+    absolute path via ``Path(intent.live_path)``. The intent writer always
+    runs the value through ``PathResolver.expand()`` first, which
+    produces a canonical absolute path (POSIX ``/...`` or Windows
+    ``C:\\...``) — but the journal must enforce that contract at the
+    corruption boundary too. A hand-edited entry like ``"../escape"``,
+    ``"~/rel"``, or ``"foo"`` would otherwise survive validation and let
+    compensation reason about cwd-relative / unintended paths.
+    """
+    payload = {
+        "tool_id": "claude",
+        "mapping_index": 0,
+        "live_path": unsafe_live_path,
+        "profile_subdir": "claude",
+        "original_kind": "real-dir",
+    }
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "good_live_path",
+    [
+        "/home/u/.claude",  # POSIX absolute
+        "/Users/foo/.claude",  # POSIX absolute (macOS)
+        "C:\\Users\\foo\\.claude",  # Windows absolute
+        "C:/Users/foo/.claude",  # Windows absolute, forward slashes
+        "\\\\server\\share\\.claude",  # UNC
+    ],
+)
+def test_mapping_intent_live_path_accepts_canonical_absolute(good_live_path: str):
+    """Cross-platform sanity check: the canonical shapes the writer
+    actually produces (host-dependent, but journal may be inspected
+    cross-platform) must validate cleanly.
+    """
+    payload = {
+        "tool_id": "claude",
+        "mapping_index": 0,
+        "live_path": good_live_path,
+        "profile_subdir": "claude",
+        "original_kind": "real-dir",
+    }
+    intent = _MappingIntent.model_validate(payload)
+    assert intent.live_path == good_live_path
+
+
 @pytest.mark.parametrize(
     "unsafe_subdir",
     _UNSAFE_NAMES,

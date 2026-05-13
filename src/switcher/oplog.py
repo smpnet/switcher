@@ -40,7 +40,7 @@ from pydantic import (
 )
 
 from switcher.errors import OpLogCorruptError, StorageError
-from switcher.models import validate_safe_name
+from switcher.models import validate_absolute_path, validate_safe_name
 
 # StrictStr blocks str/int/bool coercion; Field(min_length=1) rejects
 # the empty string. Together they ensure an empty `tool_id`,
@@ -67,6 +67,19 @@ NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 # `validate_safe_name` rejects traversal segments, path separators,
 # absolute paths, trailing dots and Windows reserved device names.
 SafeName = Annotated[NonEmptyStr, AfterValidator(validate_safe_name)]
+
+# AbsolutePath enforces the shape `live_path` must take when it is
+# eventually trusted by `classify_mapping` as `Path(intent.live_path)`.
+# The intent writer always runs the raw mapping path through
+# `PathResolver.expand()` first, which yields a canonical absolute
+# path (POSIX `/...`, Windows `C:\\...`, UNC `\\\\server\\share\\...`).
+# Without this validator a hand-edited journal entry like `"foo"`,
+# `"../escape"`, or `"~/rel"` would satisfy `NonEmptyStr` and let
+# compensation operate on cwd-relative or unintended targets.
+# `validate_absolute_path` is in `models.py` next to its mirror
+# `validate_credential_path` (which enforces the opposite invariant
+# for credential-file entries).
+AbsolutePath = Annotated[NonEmptyStr, AfterValidator(validate_absolute_path)]
 
 
 class _MappingIntent(BaseModel):
@@ -112,12 +125,13 @@ class _MappingIntent(BaseModel):
     # itself strict about the tzinfo invariant.
     # Path-segment / identifier fields use SafeName so the corruption
     # boundary matches Profile.name / Tool.id / DirMapping.profile_subdir
-    # on the source-of-truth side. live_path is a full absolute path
-    # (the live dotfile location like ~/.claude), not a segment, so it
-    # stays NonEmptyStr.
+    # on the source-of-truth side. live_path uses AbsolutePath — the
+    # writer expands raw mapping paths through PathResolver.expand()
+    # before persisting, so anything that doesn't look like a canonical
+    # absolute path here is corruption.
     tool_id: SafeName
     mapping_index: NonNegativeInt
-    live_path: NonEmptyStr
+    live_path: AbsolutePath
     profile_subdir: SafeName
     original_kind: Literal["missing", "real-dir"]
 
