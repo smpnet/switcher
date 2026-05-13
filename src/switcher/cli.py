@@ -236,7 +236,13 @@ def _detect_or_compensate_oplog(deps: Deps, *, allow_mutation: bool) -> None:
         deps.service._compensate_rename(in_flight)  # pyright: ignore[reportPrivateUsage]
         return
     if not allow_mutation:
-        console.print(_format_in_progress_hint(in_flight))
+        # Hint goes to stderr — exit 3 is an error state, and a read-only
+        # caller's stdout is data for downstream pipelines (e.g.,
+        # `switcher status | grep claude`). Routing the recovery text to
+        # stdout would pollute that stream and break scripts (abby
+        # review). Mutating callers raise SwitcherError subclasses that
+        # handle_errors writes to err_console for the same reason.
+        err_console.print(_format_in_progress_hint(in_flight))
         raise typer.Exit(code=3)
     if isinstance(in_flight, _InitOp):
         raise InitInProgressError(_format_in_progress_hint(in_flight))

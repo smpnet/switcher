@@ -280,7 +280,7 @@ from switcher.cli import app  # noqa: E402
 from switcher.oplog import OpLogIO  # noqa: E402
 
 
-def test_status_with_in_flight_init_exits_3_and_prints_hint(
+def test_status_with_in_flight_init_exits_3_and_prints_hint_on_stderr(
     tmp_home: Path, tmp_state: Path
 ) -> None:
     """End-to-end smoke for spec §2.2 read-only dispatch.
@@ -288,18 +288,31 @@ def test_status_with_in_flight_init_exits_3_and_prints_hint(
     Initializes switcher (no op-log record produced — service.init
     doesn't write _InitOp intent records until Phase 6 / PR4), then
     injects an in-flight `_InitOp` directly into the journal to mimic
-    an interrupted run. `status` must surface the recovery hint and
-    exit 3 — proving the hook is wired in and that typer.Exit
+    an interrupted run. `status` must surface the recovery hint on
+    stderr (an error state — exit 3) and not contaminate stdout, since
+    stdout is the data channel for `switcher status | ...` pipelines
+    (abby review). Proves the hook is wired in and typer.Exit
     propagates through handle_errors.
     """
     runner = CliRunner()
     setup = runner.invoke(app, ["init"])
-    assert setup.exit_code == 0, setup.stdout
+    assert setup.exit_code == 0, setup.output
 
     oplog = OpLogIO(tmp_state)
     oplog.append_record(_init_record())
 
     result = runner.invoke(app, ["status"])
-    assert result.exit_code == 3, result.stdout
-    assert "Interrupted `switcher init`" in result.stdout
-    assert "Manual recovery required" in result.stdout
+    assert result.exit_code == 3, result.output
+    # CliRunner mixes stderr into the combined `output` stream; stdout
+    # exposes only Rich's own writes. Assert against the stderr side
+    # (mix is preserved as the runner default), and assert the hint
+    # text is NOT on the plain stdout — that's the regression guard
+    # the stderr routing is supposed to provide.
+    assert "Interrupted `switcher init`" in result.output
+    assert "Manual recovery required" in result.output
+    # Pipeline-friendliness: stdout stays clean. (Click's CliRunner
+    # exposes `result.stdout` as the stdout-only side when
+    # mix_stderr=False; default mix=True doesn't expose it separately,
+    # so verify via stderr.)
+    assert "Interrupted `switcher init`" in result.stderr
+    assert "Interrupted `switcher init`" not in result.stdout
