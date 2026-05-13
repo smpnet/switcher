@@ -330,19 +330,20 @@ from switcher.cli import app  # noqa: E402
 from switcher.oplog import OpLogIO  # noqa: E402
 
 
-def test_status_with_in_flight_init_exits_3_and_prints_hint_on_stderr(
-    tmp_home: Path, tmp_state: Path
-) -> None:
+def test_status_with_in_flight_init_exits_3_and_emits_hint(tmp_home: Path, tmp_state: Path) -> None:
     """End-to-end smoke for spec §2.2 read-only dispatch.
 
     Initializes switcher (no op-log record produced — service.init
     doesn't write _InitOp intent records until Phase 6 / PR4), then
     injects an in-flight `_InitOp` directly into the journal to mimic
-    an interrupted run. `status` must surface the recovery hint on
-    stderr (an error state — exit 3) and not contaminate stdout, since
-    stdout is the data channel for `switcher status | ...` pipelines
-    (abby review). Proves the hook is wired in and typer.Exit
+    an interrupted run. `status` must surface the recovery hint text
+    and exit 3 — proving the hook is wired in and that typer.Exit
     propagates through handle_errors.
+
+    Stream routing (stderr-not-stdout) is verified separately by
+    test_in_flight_hint_goes_through_err_console — bypassing
+    CliRunner's stream-capture mechanics avoids depending on Click
+    version-specific mix_stderr behavior (abby review).
     """
     runner = CliRunner()
     setup = runner.invoke(app, ["init"])
@@ -353,16 +354,39 @@ def test_status_with_in_flight_init_exits_3_and_prints_hint_on_stderr(
 
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 3, result.output
-    # CliRunner mixes stderr into the combined `output` stream; stdout
-    # exposes only Rich's own writes. Assert against the stderr side
-    # (mix is preserved as the runner default), and assert the hint
-    # text is NOT on the plain stdout — that's the regression guard
-    # the stderr routing is supposed to provide.
+    # Hint text reaches the user. Don't constrain WHICH stream here:
+    # CliRunner's stdout/stderr split depends on Click version and
+    # mix_stderr config. Routing is asserted at the console-call
+    # level in the err_console test below.
     assert "Interrupted `switcher init`" in result.output
     assert "Manual recovery required" in result.output
-    # Pipeline-friendliness: stdout stays clean. (Click's CliRunner
-    # exposes `result.stdout` as the stdout-only side when
-    # mix_stderr=False; default mix=True doesn't expose it separately,
-    # so verify via stderr.)
-    assert "Interrupted `switcher init`" in result.stderr
-    assert "Interrupted `switcher init`" not in result.stdout
+
+
+def test_in_flight_hint_goes_through_err_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Direct routing test: the read-only hook must call err_console
+    (stderr), not console (stdout). Verifying via direct monkeypatch
+    instead of CliRunner stream capture avoids Click 8.2 vs <8.2
+    mix_stderr ambiguity (abby review) — the OS-level stream
+    separation in a real shell is guaranteed regardless of test
+    framework; we just need to confirm the code picked the right
+    Console object.
+    """
+    from switcher import cli as cli_module
+
+    err_calls: list[str] = []
+    console_calls: list[str] = []
+
+    def _capture_err(msg: object, *_: object, **__: object) -> None:
+        err_calls.append(str(msg))
+
+    def _capture_console(msg: object, *_: object, **__: object) -> None:
+        console_calls.append(str(msg))
+
+    monkeypatch.setattr(cli_module.err_console, "print", _capture_err)
+    monkeypatch.setattr(cli_module.console, "print", _capture_console)
+    deps = _FakeDeps.with_in_flight(_init_record())
+    with pytest.raises(typer.Exit):
+        _detect_or_compensate_oplog(deps, allow_mutation=False)
+    # Routing assertion: stderr got the hint, stdout did NOT.
+    assert any("Interrupted `switcher init`" in c for c in err_calls)
+    assert not any("Interrupted `switcher init`" in c for c in console_calls)
