@@ -888,37 +888,51 @@ class OpLogIO:
                 f"oplog at {self._path}: {in_flight_count} records are in-flight; "
                 f"single-in-flight invariant violated. Manual recovery required."
             )
-        matched = False
-        kept: list[OpLogRecord] = []
-        for r in records:
-            if r.op == record.op and r.started_at == record.started_at:
-                if r.completed_at is not None:
-                    # (op, started_at) collides with a previously-completed
-                    # record. Caller is holding a stale reference (their
-                    # intent already finished) — surface as ValueError, not
-                    # OpLogCorruptError, to match the re-completion guard
-                    # in mark_completed.
-                    raise ValueError(
-                        f"cancel_intent: record with op={record.op!r} "
-                        f"started_at={record.started_at!r} is already completed "
-                        f"on disk at {r.completed_at.isoformat()}; cannot cancel"
-                    )
-                if r != record:
-                    raise OpLogCorruptError(
-                        f"oplog at {self._path}: in-flight record on disk "
-                        f"differs from caller's reference (same op + "
-                        f"started_at, differing fields). External rewrite "
-                        f"between read and cancel_intent; manual recovery "
-                        f"required."
-                    )
-                matched = True
-                continue  # drop the record
-            kept.append(r)
-        if not matched:
+        # First collect every record sharing (op, started_at), then dispatch
+        # on the *count* of matches before deciding which classification to
+        # raise. The previous loop short-circuited on the first match,
+        # which misclassified a hand-edited journal carrying BOTH a
+        # completed and an in-flight record with identical (op, started_at)
+        # as caller-misuse "already completed" — the duplicate identity is
+        # corruption, not a stale caller reference (reviewer convergence,
+        # abby + CodeRabbit). started_at is microsecond-precision and the
+        # writer never reuses it, so >1 match is unreachable without
+        # external journal manipulation.
+        identity_matches = [
+            r for r in records if r.op == record.op and r.started_at == record.started_at
+        ]
+        if len(identity_matches) > 1:
+            raise OpLogCorruptError(
+                f"oplog at {self._path}: {len(identity_matches)} records share "
+                f"op={record.op!r} started_at={record.started_at!r}; duplicate "
+                f"identity is corruption (started_at is microsecond-precision and "
+                f"the writer never reuses it). Manual recovery required."
+            )
+        if not identity_matches:
             raise OpLogCorruptError(
                 f"oplog at {self._path}: no matching record for "
                 f"op={record.op!r} started_at={record.started_at!r}"
             )
+        sole = identity_matches[0]
+        if sole.completed_at is not None:
+            # Single match, and it's already completed. Caller is holding a
+            # stale reference (their intent already finished) — surface as
+            # ValueError, not OpLogCorruptError, to match the re-completion
+            # guard in mark_completed.
+            raise ValueError(
+                f"cancel_intent: record with op={record.op!r} "
+                f"started_at={record.started_at!r} is already completed "
+                f"on disk at {sole.completed_at.isoformat()}; cannot cancel"
+            )
+        if sole != record:
+            raise OpLogCorruptError(
+                f"oplog at {self._path}: in-flight record on disk "
+                f"differs from caller's reference (same op + "
+                f"started_at, differing fields). External rewrite "
+                f"between read and cancel_intent; manual recovery "
+                f"required."
+            )
+        kept = [r for r in records if r is not sole]
         self._write_records(kept)
 
     def vacuum_completed(self) -> None:

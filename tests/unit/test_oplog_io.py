@@ -557,6 +557,41 @@ def test_cancel_intent_raises_corrupt_when_no_match(tmp_path: Path):
         io.cancel_intent(record)
 
 
+def test_cancel_intent_raises_corrupt_on_duplicate_op_started_at(tmp_path: Path):
+    """Hand-edited journal with TWO records sharing (op, started_at):
+    one completed, one in-flight. in_flight_count==1 lets the earlier
+    invariant check pass, but the identity is duplicated on disk —
+    that's corruption, not a stale caller reference. Surface as
+    OpLogCorruptError rather than the misleading "already completed"
+    ValueError (reviewer convergence, abby + CodeRabbit). Without this
+    classification, recovery code would treat a real journal-shape
+    violation as caller misuse."""
+    payload = json.dumps(
+        [
+            {
+                "op": "rename",
+                "from": "a",
+                "to": "b",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "completed_at": "2026-05-12T10:30:01+00:00",
+                "affected_ids": [],
+            },
+            {
+                "op": "rename",
+                "from": "a",
+                "to": "b",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "affected_ids": [],
+            },
+        ]
+    )
+    (tmp_path / "oplog.json").write_text(payload, encoding="utf-8")
+    io = OpLogIO(tmp_path)
+    caller_ref = _make_rename_op("a", "b")
+    with pytest.raises(OpLogCorruptError, match="duplicate"):
+        io.cancel_intent(caller_ref)
+
+
 def test_cancel_intent_raises_corrupt_on_multiple_in_flight(tmp_path: Path):
     """Same single-in-flight defense as mark_completed: cancellation
     of the first match in a corrupt 2-in-flight journal would partial-heal
