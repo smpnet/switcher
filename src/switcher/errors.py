@@ -92,3 +92,53 @@ class NoToolsManagedError(SwitcherError):
     The state is valid (after `unmanage` of the last tool, or after
     `uninstall` without purge), but these mutating commands have no work
     to do; better to fail loud than create empty profiles silently."""
+
+
+# --- Op-log compensation errors ------------------------------------------
+# Asymmetry note: init and rescan both have InProgress / NoInProgress
+# pairs because their recovery is explicit-flag (`--continue` /
+# `--abort`); rename does NOT have RenameInProgressError because its
+# recovery is fully automatic — the CLI hook calls
+# _detect_or_compensate_oplog at the top of every command callback, and
+# rename compensation is deterministic (idempotent swap_link + a
+# possible store.rename roll-forward) with no user input needed. There
+# is no flag to surface and no in-flight CLI prompt to drive, so a
+# dedicated exception type would have no caller. The op-log read path
+# still routes a corrupt rename record through OpLogCorruptError. See
+# spec §2.3 and the design-decision table.
+
+
+class OpLogCorruptError(SwitcherError):
+    """Raised when oplog.json is unreadable: malformed JSON, empty file,
+    fails Pydantic validation, or describes an in-flight op whose disk
+    state is unrecognizable. Manual recovery required."""
+
+
+class InitInProgressError(SwitcherError):
+    """Raised when a mutating command runs while an interrupted init is
+    detected in the op-log. The CLI handler surfaces the recovery hint
+    (run `switcher init --continue` or `switcher init --abort`)."""
+
+
+class RescanInProgressError(SwitcherError):
+    """Same shape as InitInProgressError, for an interrupted rescan."""
+
+
+class NoInProgressInitError(SwitcherError):
+    """Raised when `switcher init --continue` or `--abort` is invoked
+    but no in-flight `_InitOp` record is present. Distinct from
+    StateAlreadyInitializedError (the latter means init already
+    finished cleanly)."""
+
+
+class NoInProgressRescanError(SwitcherError):
+    """Same shape as NoInProgressInitError, for rescan."""
+
+
+class AbortPreflightError(SwitcherError):
+    """Raised by op-log abort when the runtime classifier observes that
+    a mapping's live_path is currently a link or file. Init/rescan
+    pre-flight rejects both shapes at intent time, so the persisted
+    `_MappingIntent.original_kind` snapshot can only be `"missing"` or
+    `"real-dir"` — a link/file at abort time means external drift since
+    intent-write. Refuse defensively rather than guess."""
