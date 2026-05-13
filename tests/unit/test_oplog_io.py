@@ -353,6 +353,39 @@ def test_mark_completed_raises_corrupt_on_multiple_uncompleted(tmp_path: Path):
         io.mark_completed(first)
 
 
+def test_mark_completed_raises_corrupt_on_externally_mutated_record(tmp_path: Path):
+    """``mark_completed`` previously matched on disk by ``(op, started_at)``
+    only. If something externally rewrote the in-flight record on disk
+    while preserving that pair (e.g. flipped ``to`` from ``"b"`` to
+    ``"evil"``), the caller's reference and the disk record would
+    silently disagree and mark_completed would bless the mutated row
+    — the exact "silent acceptance of changed journal contents" the
+    immutability/audit guarantee is supposed to prevent. Treat any
+    full-record mismatch (across every field except ``completed_at``)
+    as corruption.
+    """
+    io = OpLogIO(tmp_path)
+    original = _make_rename_op("a", "b")
+    io.append_record(original)
+    # External rewrite: same op + started_at, different `to`. Simulates
+    # a hostile edit, an aborted concurrent writer, or any other source
+    # of journal drift between read and mark_completed.
+    mutated_payload = json.dumps(
+        [
+            {
+                "op": "rename",
+                "from": "a",
+                "to": "evil",  # changed from "b"
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "affected_ids": [],
+            }
+        ]
+    )
+    (tmp_path / "oplog.json").write_text(mutated_payload, encoding="utf-8")
+    with pytest.raises(OpLogCorruptError):
+        io.mark_completed(original)
+
+
 def test_mark_completed_sets_timestamp(tmp_path: Path):
     io = OpLogIO(tmp_path)
     record = _make_rename_op()

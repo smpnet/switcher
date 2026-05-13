@@ -25,11 +25,25 @@ def _now() -> datetime:
     return datetime(2026, 5, 12, 10, 30, tzinfo=UTC)
 
 
+def _live_path(tool_id: str = "claude") -> str:
+    """Return a host-native absolute live path for ``tool_id``.
+
+    ``validate_absolute_path`` rejects cross-platform "absolute" shapes
+    (POSIX ``/...`` on Windows, drive-letter ``C:\\...`` on POSIX) so
+    tests that need a happy-path value must use the host's native
+    form. Centralized so every test references the same shape on each
+    OS, and so a single edit re-routes coverage for both shards.
+    """
+    if sys.platform == "win32":
+        return f"C:\\Users\\u\\.{tool_id}"
+    return f"/home/u/.{tool_id}"
+
+
 def test_mapping_intent_round_trip():
     intent = _MappingIntent(
         tool_id="claude",
         mapping_index=0,
-        live_path="/home/u/.claude",
+        live_path=_live_path(),
         profile_subdir="claude",
         original_kind="real-dir",
     )
@@ -48,7 +62,7 @@ def test_init_op_round_trip():
             _MappingIntent(
                 tool_id="claude",
                 mapping_index=0,
-                live_path="/home/u/.claude",
+                live_path=_live_path(),
                 profile_subdir="claude",
                 original_kind="real-dir",
             ),
@@ -156,7 +170,7 @@ def test_mapping_intent_string_fields_reject_empty(field: str):
     payload = {
         "tool_id": "claude",
         "mapping_index": 0,
-        "live_path": "/home/u/.claude",
+        "live_path": _live_path(),
         "profile_subdir": "claude",
         "original_kind": "real-dir",
     }
@@ -192,7 +206,7 @@ def test_mapping_intent_tool_id_rejects_unsafe_names(unsafe_id: str):
     payload = {
         "tool_id": unsafe_id,
         "mapping_index": 0,
-        "live_path": "/home/u/.claude",
+        "live_path": _live_path(),
         "profile_subdir": "claude",
         "original_kind": "real-dir",
     }
@@ -286,7 +300,7 @@ def test_mapping_intent_live_path_rejects_host_native_traversal():
 # which would silently parse a cross-platform shape as relative
 # against CWD and misclassify the mapping.
 _POSIX_ABSOLUTE_LIVE_PATHS = [
-    "/home/u/.claude",
+    _live_path(),
     "/Users/foo/.claude",
     "/var/lib/foo",
 ]
@@ -382,7 +396,7 @@ def test_mapping_intent_profile_subdir_rejects_unsafe_names(unsafe_subdir: str):
     payload = {
         "tool_id": "claude",
         "mapping_index": 0,
-        "live_path": "/home/u/.claude",
+        "live_path": _live_path(),
         "profile_subdir": unsafe_subdir,
         "original_kind": "real-dir",
     }
@@ -603,7 +617,7 @@ def test_negative_mapping_index_rejected():
             {
                 "tool_id": "claude",
                 "mapping_index": -1,
-                "live_path": "/home/u/.claude",
+                "live_path": _live_path(),
                 "profile_subdir": "claude",
                 "original_kind": "real-dir",
             }
@@ -620,7 +634,7 @@ def test_mapping_index_str_not_coerced_to_int():
             {
                 "tool_id": "claude",
                 "mapping_index": "0",
-                "live_path": "/home/u/.claude",
+                "live_path": _live_path(),
                 "profile_subdir": "claude",
                 "original_kind": "real-dir",
             }
@@ -687,7 +701,7 @@ def test_invalid_original_kind_rejected(bogus: str):
             {
                 "tool_id": "claude",
                 "mapping_index": 0,
-                "live_path": "/home/u/.claude",
+                "live_path": _live_path(),
                 "profile_subdir": "claude",
                 "original_kind": bogus,
             }
@@ -751,7 +765,7 @@ def test_unknown_field_in_mapping_intent_rejected():
             {
                 "tool_id": "claude",
                 "mapping_index": 0,
-                "live_path": "/home/u/.claude",
+                "live_path": _live_path(),
                 "profile_subdir": "claude",
                 "original_kind": "real-dir",
                 "rogue_field": "drift",
@@ -763,7 +777,7 @@ def _mapping(tool_id: str = "claude", mapping_index: int = 0) -> _MappingIntent:
     return _MappingIntent(
         tool_id=tool_id,
         mapping_index=mapping_index,
-        live_path=f"/home/u/.{tool_id}",
+        live_path=_live_path(tool_id),
         profile_subdir=tool_id,
         original_kind="real-dir",
     )
@@ -1064,7 +1078,7 @@ def test_records_are_frozen():
     intent = _MappingIntent(
         tool_id="claude",
         mapping_index=0,
-        live_path="/home/u/.claude",
+        live_path=_live_path(),
         profile_subdir="claude",
         original_kind="real-dir",
     )
@@ -1240,7 +1254,7 @@ def test_storage_path_round_trip_preserves_aliases_across_record_types():
     intent = _MappingIntent(
         tool_id="claude",
         mapping_index=0,
-        live_path="/home/u/.claude",
+        live_path=_live_path(),
         profile_subdir="claude",
         original_kind="real-dir",
     )

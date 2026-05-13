@@ -724,11 +724,21 @@ class OpLogIO:
     def mark_completed(self, record: OpLogRecord) -> None:
         """Set ``completed_at`` on the matching on-disk record and rewrite.
 
-        Matches the disk record by ``op`` + ``started_at`` (sufficient
-        discriminator for a single-user CLI). Delegates to the
-        module-level :func:`mark_completed` helper, which re-validates
-        through ``parse_record`` so a corrupt timestamp cannot slip in
-        via the write path — Pydantic v2's ``model_copy(update={...})``
+        Locates the disk record by ``op`` + ``started_at`` (sufficient
+        discriminator for a single-user CLI), then verifies the entire
+        persisted record matches the caller's reference. Matching only
+        on ``(op, started_at)`` would let an external rewrite that
+        preserves that pair (hostile edit, aborted concurrent writer,
+        any other source of journal drift) silently bless the mutated
+        record — defeating the audit and immutability guarantees the
+        rest of the module enforces. Full equality is the right
+        granularity: every persisted field is part of the journal's
+        truth, so any mismatch is corruption.
+
+        Delegates the completion transition to the module-level
+        :func:`mark_completed` helper, which re-validates through
+        ``parse_record`` so a corrupt timestamp cannot slip in via the
+        write path — Pydantic v2's ``model_copy(update={...})``
         bypasses validators on updated fields, which is intentionally
         avoided here. ValidationError from the helper is mapped to
         OpLogCorruptError to match the read-path failure shape.
@@ -742,11 +752,13 @@ class OpLogIO:
 
         Raises:
             OpLogCorruptError: more than one record is in-flight on
-                disk (single-in-flight invariant violated), no in-flight
-                record matches ``op`` + ``started_at``, or the
-                completion timestamp fails re-validation. A caller
-                holding a stale record reference is treated as
-                corruption rather than as a silent no-op.
+                disk (single-in-flight invariant violated), no
+                in-flight record matches ``op`` + ``started_at``, the
+                located in-flight record differs from the caller's
+                reference on any field, or the completion timestamp
+                fails re-validation. A caller holding a stale record
+                reference is treated as corruption rather than as a
+                silent no-op.
         """
         records = self.read_records()
         in_flight_count = sum(1 for r in records if r.completed_at is None)
@@ -765,6 +777,18 @@ class OpLogIO:
                 and r.started_at == record.started_at
                 and r.completed_at is None
             ):
+                # (op, started_at) locates the candidate; full equality
+                # confirms the caller hasn't been racing an external
+                # rewrite. Pydantic v2's __eq__ compares model fields,
+                # so this catches every persisted shape difference.
+                if r != record:
+                    raise OpLogCorruptError(
+                        f"oplog at {self._path}: in-flight record on disk "
+                        f"differs from caller's reference (same op + "
+                        f"started_at, differing fields). External rewrite "
+                        f"between read and mark_completed; manual recovery "
+                        f"required."
+                    )
                 try:
                     new_records.append(mark_completed(r, completed_at))
                 except ValidationError as e:
