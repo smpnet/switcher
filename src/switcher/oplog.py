@@ -748,12 +748,21 @@ class OpLogIO:
         same-filesystem renames; the tmp file shares the parent dir, so
         the rename never crosses filesystems.
 
-        Single-process: the tmp suffix is fixed (``oplog.json.tmp``),
-        so a concurrent second writer would trample the first writer's
-        tmp file even though the final replace is still atomic. The
-        spec is a single-user CLI with no concurrent ops, which makes
-        per-write suffix uniqueness unnecessary; callers that need
-        multi-writer safety are out of scope for the recovery journal.
+        Lock-free, single-process. The tmp suffix is fixed
+        (``oplog.json.tmp``) and ``append_record`` does a lock-free
+        read/modify/write cycle, so two overlapping switcher processes
+        could observe "no in-flight record", both proceed, and the
+        later ``replace()`` would clobber the earlier one's intent.
+        That is explicitly out of scope per spec §2.6 ("Lock-free.
+        Single-user CLI tool — concurrent invocations against the same
+        state dir are out of scope (matches every other switcher
+        invariant). No flock, no advisory locks."): switcher is an
+        interactive foreground tool the user runs by hand, and the
+        service layer below this module is also lock-free for the same
+        reason — adding a journal-only lock would be asymmetric
+        protection that does not actually close the FS-races above it.
+        Multi-writer safety, if ever wanted, belongs at the command
+        level and as a separate story.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = dump_records(records)
