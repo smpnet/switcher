@@ -237,6 +237,66 @@ def test_compensate_rename_refuses_when_live_path_is_real_dir(
     assert oplog.read_in_flight() is not None
 
 
+def test_compensate_rename_refuses_when_affected_id_drifted_to_third_profile(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """An affected tool's active entry was externally changed to some
+    third profile (not from_ or to). The previous logic silently skipped
+    it and still marked the intent completed — clearing the journal
+    while leaving the rename only partially reconciled (the third-profile
+    pointer survives, the user's rename request is forgotten). Refuse
+    loudly instead: this is corruption that the user must resolve
+    manually (reviewer convergence: abby blocking, CodeRabbit recurring)."""
+    name = service.init().profile_name
+    service.create("third-profile")
+    store = FileProfileStore(tmp_state)
+    store.rename(name, "client-A")
+    config_path = tmp_state / "config.json"
+    cfg = json.loads(config_path.read_text())
+    # claude was managed under `name` originally; simulate external
+    # drift: it now points at "third-profile" instead of either
+    # rename endpoint.
+    cfg["active"] = {"claude": "third-profile"}
+    cfg["active_live_paths"] = {}
+    config_path.write_text(json.dumps(cfg))
+    record = _make_record(name, "client-A", affected=["claude"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
+    with pytest.raises(OpLogCorruptError):
+        service._compensate_rename(record)
+    # Failure path: intent stays in-flight for manual recovery.
+    assert oplog.read_in_flight() is not None
+    # active map untouched: still points at the third profile, NOT
+    # silently re-pointed at "client-A".
+    after = FileProfileStore(tmp_state)
+    assert after.get_active().get("claude") == "third-profile"
+
+
+def test_compensate_rename_refuses_when_affected_id_missing_from_active(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """An affected_id captured at intent time was externally removed
+    from the active map (e.g. via partial-state corruption, unmanage,
+    or hand-edit between crash and compensation). The previous logic
+    silently skipped it and marked the intent completed. Refuse loudly."""
+    name = service.init().profile_name
+    store = FileProfileStore(tmp_state)
+    store.rename(name, "client-A")
+    config_path = tmp_state / "config.json"
+    cfg = json.loads(config_path.read_text())
+    # claude was in affected_ids when the intent was written, but the
+    # active map no longer has it.
+    cfg["active"] = {}
+    cfg["active_live_paths"] = {}
+    config_path.write_text(json.dumps(cfg))
+    record = _make_record(name, "client-A", affected=["claude"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
+    with pytest.raises(OpLogCorruptError):
+        service._compensate_rename(record)
+    assert oplog.read_in_flight() is not None
+
+
 def test_rename_writes_intent_and_marks_completed(service: ProfileService, tmp_state: Path) -> None:
     """A successful rename appends an intent record and marks it
     completed; vacuum then drops it. End-to-end covers the writer

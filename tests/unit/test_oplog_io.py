@@ -557,15 +557,16 @@ def test_cancel_intent_raises_corrupt_when_no_match(tmp_path: Path):
         io.cancel_intent(record)
 
 
-def test_cancel_intent_raises_corrupt_on_duplicate_op_started_at(tmp_path: Path):
-    """Hand-edited journal with TWO records sharing (op, started_at):
-    one completed, one in-flight. in_flight_count==1 lets the earlier
-    invariant check pass, but the identity is duplicated on disk —
-    that's corruption, not a stale caller reference. Surface as
-    OpLogCorruptError rather than the misleading "already completed"
-    ValueError (reviewer convergence, abby + CodeRabbit). Without this
-    classification, recovery code would treat a real journal-shape
-    violation as caller misuse."""
+def test_cancel_intent_succeeds_when_completed_record_shares_started_at(
+    tmp_path: Path,
+):
+    """A previously-completed record and a new in-flight record can
+    legitimately share (op, started_at): the writer derives started_at
+    from datetime.now() and clock resolution can be coarse (CodeRabbit
+    review). The completion-state filter distinguishes the two — the
+    in-flight one is the unique cancellation target; the completed one
+    stays put as audit history that the next vacuum will scrub on its
+    own schedule."""
     payload = json.dumps(
         [
             {
@@ -573,13 +574,13 @@ def test_cancel_intent_raises_corrupt_on_duplicate_op_started_at(tmp_path: Path)
                 "from": "a",
                 "to": "b",
                 "started_at": "2026-05-12T10:30:00+00:00",
-                "completed_at": "2026-05-12T10:30:01+00:00",
+                "completed_at": "2026-05-12T10:30:00.500+00:00",
                 "affected_ids": [],
             },
             {
                 "op": "rename",
-                "from": "a",
-                "to": "b",
+                "from": "c",
+                "to": "d",
                 "started_at": "2026-05-12T10:30:00+00:00",
                 "affected_ids": [],
             },
@@ -587,9 +588,13 @@ def test_cancel_intent_raises_corrupt_on_duplicate_op_started_at(tmp_path: Path)
     )
     (tmp_path / "oplog.json").write_text(payload, encoding="utf-8")
     io = OpLogIO(tmp_path)
-    caller_ref = _make_rename_op("a", "b")
-    with pytest.raises(OpLogCorruptError, match="duplicate"):
-        io.cancel_intent(caller_ref)
+    caller_ref = _make_rename_op("c", "d")
+    io.cancel_intent(caller_ref)  # MUST NOT raise
+    # Only the completed record remains; the in-flight has been dropped.
+    on_disk: list[dict[str, Any]] = json.loads((tmp_path / "oplog.json").read_text())
+    assert len(on_disk) == 1
+    assert on_disk[0]["from"] == "a"
+    assert on_disk[0]["completed_at"] is not None
 
 
 def test_cancel_intent_raises_corrupt_on_multiple_in_flight(tmp_path: Path):

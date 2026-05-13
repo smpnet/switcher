@@ -1232,6 +1232,29 @@ class ProfileService:
 
         # Step 2: re-point any affected entry that still references `from`.
         active = dict(self._store.get_active())
+        # Drift guard: every id captured in record.affected_ids must
+        # currently map to either `from_` (pre-step-2 state) or `to`
+        # (post-step-2 state). Anything else — third profile,
+        # missing entry — is external mutation between intent-write and
+        # compensation, NOT a recovery state the journal predicted.
+        # Silently skipping those entries would clear the journal while
+        # leaving the rename only partially reconciled: the third-profile
+        # pointer survives, the user's original rename intent is
+        # forgotten (reviewer convergence: abby blocking + CodeRabbit
+        # recurring). Refuse loudly and leave the intent in flight for
+        # manual investigation.
+        drifted = {
+            tid: active.get(tid)
+            for tid in record.affected_ids
+            if active.get(tid) not in {record.from_, record.to}
+        }
+        if drifted:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"affected active-map entries drifted outside the expected "
+                f"{{{record.from_!r}, {record.to!r}}} set: {drifted!r}. "
+                f"Manual recovery required."
+            )
         affected_still_at_old = [
             tid for tid in record.affected_ids if active.get(tid) == record.from_
         ]

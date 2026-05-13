@@ -888,42 +888,47 @@ class OpLogIO:
                 f"oplog at {self._path}: {in_flight_count} records are in-flight; "
                 f"single-in-flight invariant violated. Manual recovery required."
             )
-        # First collect every record sharing (op, started_at), then dispatch
-        # on the *count* of matches before deciding which classification to
-        # raise. The previous loop short-circuited on the first match,
-        # which misclassified a hand-edited journal carrying BOTH a
-        # completed and an in-flight record with identical (op, started_at)
-        # as caller-misuse "already completed" — the duplicate identity is
-        # corruption, not a stale caller reference (reviewer convergence,
-        # abby + CodeRabbit). started_at is microsecond-precision and the
-        # writer never reuses it, so >1 match is unreachable without
-        # external journal manipulation.
-        identity_matches = [
-            r for r in records if r.op == record.op and r.started_at == record.started_at
+        # A previous completed record can legitimately share (op, started_at)
+        # with a later in-flight record: the writer derives started_at from
+        # datetime.now() and clock resolution can be coarse (Windows
+        # historically ~16ms), so back-to-back ops or freezegun-driven tests
+        # can collide on the timestamp pair (CodeRabbit review). Distinguish
+        # the two by completion state instead of treating any duplicate
+        # identity as corruption. The earlier in_flight_count guard already
+        # rules out >1 in-flight, so the in-flight-side filter yields 0 or 1.
+        in_flight_id_matches = [
+            r
+            for r in records
+            if r.completed_at is None and r.op == record.op and r.started_at == record.started_at
         ]
-        if len(identity_matches) > 1:
-            raise OpLogCorruptError(
-                f"oplog at {self._path}: {len(identity_matches)} records share "
-                f"op={record.op!r} started_at={record.started_at!r}; duplicate "
-                f"identity is corruption (started_at is microsecond-precision and "
-                f"the writer never reuses it). Manual recovery required."
-            )
-        if not identity_matches:
+        if not in_flight_id_matches:
+            # No in-flight match. Either a completed record with the same
+            # (op, started_at) exists (caller's reference is stale — the
+            # intent already transitioned) or nothing matches at all
+            # (corruption).
+            completed_id_matches = [
+                r
+                for r in records
+                if r.completed_at is not None
+                and r.op == record.op
+                and r.started_at == record.started_at
+            ]
+            if completed_id_matches:
+                sole_completed = completed_id_matches[0]
+                # mypy/basedpyright: completed_id_matches is filtered on
+                # `completed_at is not None`, so the cast is safe.
+                completed_at = sole_completed.completed_at
+                assert completed_at is not None
+                raise ValueError(
+                    f"cancel_intent: record with op={record.op!r} "
+                    f"started_at={record.started_at!r} is already completed "
+                    f"on disk at {completed_at.isoformat()}; cannot cancel"
+                )
             raise OpLogCorruptError(
                 f"oplog at {self._path}: no matching record for "
                 f"op={record.op!r} started_at={record.started_at!r}"
             )
-        sole = identity_matches[0]
-        if sole.completed_at is not None:
-            # Single match, and it's already completed. Caller is holding a
-            # stale reference (their intent already finished) — surface as
-            # ValueError, not OpLogCorruptError, to match the re-completion
-            # guard in mark_completed.
-            raise ValueError(
-                f"cancel_intent: record with op={record.op!r} "
-                f"started_at={record.started_at!r} is already completed "
-                f"on disk at {sole.completed_at.isoformat()}; cannot cancel"
-            )
+        sole = in_flight_id_matches[0]
         if sole != record:
             raise OpLogCorruptError(
                 f"oplog at {self._path}: in-flight record on disk "
