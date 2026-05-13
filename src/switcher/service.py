@@ -1156,7 +1156,6 @@ class ProfileService:
             for tid in affected_still_at_old:
                 active[tid] = record.to
             self._store.set_active(active)
-            active = dict(self._store.get_active())
 
         # Step 3: swap_link for every affected tool whose active entry is `to`
         # and is in the registry (orphans skip link-fixup — same as the
