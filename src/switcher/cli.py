@@ -133,6 +133,15 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
     Same text for read-only and mutating callers so the wording stays
     consistent across multiple invocations of the same broken state.
     Rename has no hint — it is auto-compensated transparently.
+
+    The hint references ``switcher init --continue/--abort`` and
+    ``switcher rescan --continue/--abort``. Those flags ship in
+    follow-on PRs (init compensation = Phase 6; rescan compensation =
+    Phase 7). Until they land, ``service.init`` and ``service.rescan``
+    do NOT write op-log intent records — so the journal never carries
+    an in-flight ``_InitOp`` or ``_RescanOp`` in a PR3-only deployment,
+    and this hint surface is unreachable. The flags become functional
+    in lockstep with the records becoming writable.
     """
     if isinstance(record, _InitOp):
         targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
@@ -170,7 +179,15 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
 
 
 def _detect_or_compensate_oplog(deps: Deps, *, allow_mutation: bool) -> None:
-    """Op-log detection hook. Called at the top of every command callback.
+    """Op-log detection hook.
+
+    Called at the top of every state-touching command callback (every
+    callback in this module's `@app.command` / `@tools_app.command` /
+    `@tools_app.callback` set EXCEPT ``version``, which has no FS
+    dependency and intentionally skips the hook per spec §5.2 dispatch
+    table). Mutating callbacks must invoke this BEFORE any interactive
+    prompt — otherwise an in-flight init/rescan would let the user
+    answer a confirm dialog before being told about the broken state.
 
     Always vacuums completed records first so a stale "completed" snapshot
     cannot masquerade as in-flight. Then:
@@ -561,10 +578,14 @@ def delete(
     force: bool = typer.Option(False, "--force", help="Skip the interactive confirmation."),
 ) -> None:
     """Delete a profile. Refuses if the profile is active for any tool."""
-    if not force and not typer.confirm(f"Delete profile {name!r}?"):
-        raise typer.Exit(code=0)
+    # Hook BEFORE typer.confirm: an in-flight init/rescan must surface the
+    # recovery hint before the user is prompted to delete anything (Hermes
+    # review). Otherwise a user who answers "y" to "Delete profile X?" only
+    # then sees they have a broken state to recover first.
     deps = get_deps()
     _detect_or_compensate_oplog(deps, allow_mutation=True)
+    if not force and not typer.confirm(f"Delete profile {name!r}?"):
+        raise typer.Exit(code=0)
     deps.service.delete(name)
     console.print(f"Deleted profile {name!r}")
 
