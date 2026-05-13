@@ -164,19 +164,44 @@ def test_mapping_intent_string_fields_reject_empty(field: str):
         _MappingIntent.model_validate(payload)
 
 
+# Names that ``validate_safe_name`` rejects. Used across multiple
+# record-level tests below to keep the corruption-boundary coverage
+# symmetric across every persisted name/id field.
+_UNSAFE_NAMES = [
+    "../escape",  # parent-dir traversal
+    "..",
+    "a/b",  # POSIX path separator
+    "a\\b",  # Windows path separator
+    "/etc/passwd",  # POSIX absolute
+    "C:\\Windows",  # Windows absolute
+    "claude.",  # trailing dot (Windows-illegal)
+    "CON",  # Windows reserved device name
+    "CON.txt",  # reserved stem
+]
+
+
+@pytest.mark.parametrize("unsafe_id", _UNSAFE_NAMES)
+def test_mapping_intent_tool_id_rejects_unsafe_names(unsafe_id: str):
+    """``tool_id`` is the registry key for a Tool — same shape
+    ``Tool.id`` already validates via ``validate_safe_name`` in
+    ``models.py``. The journal must enforce the same invariant so a
+    hand-edited entry can't carry an id that the rest of the codebase
+    treats as a safe path segment.
+    """
+    payload = {
+        "tool_id": unsafe_id,
+        "mapping_index": 0,
+        "live_path": "/home/u/.claude",
+        "profile_subdir": "claude",
+        "original_kind": "real-dir",
+    }
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(payload)
+
+
 @pytest.mark.parametrize(
     "unsafe_subdir",
-    [
-        "../escape",  # parent-dir traversal
-        "..",
-        "a/b",  # path separator
-        "a\\b",  # Windows path separator
-        "/etc/passwd",  # POSIX absolute
-        "C:\\Windows",  # Windows absolute
-        "claude.",  # trailing dot (Windows-illegal)
-        "CON",  # Windows reserved device name
-        "CON.txt",  # reserved stem
-    ],
+    _UNSAFE_NAMES,
 )
 def test_mapping_intent_profile_subdir_rejects_unsafe_names(unsafe_subdir: str):
     """``profile_subdir`` is joined to ``profile_dir`` as a path segment
@@ -241,6 +266,162 @@ def test_rename_op_rejects_empty_from_or_to():
                 "from": "experiment",
                 "to": "",
                 "affected_ids": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("unsafe", _UNSAFE_NAMES)
+def test_init_op_profile_name_rejects_unsafe_names(unsafe: str):
+    """``profile_name`` is the profile-store key; ``Profile.name``
+    already validates the same shape via ``validate_safe_name``. A
+    corrupt journal entry like ``profile_name="../escape"`` would
+    otherwise survive deserialization and only blow up later when
+    compensation joined it to ``state_dir/profiles``.
+    """
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "init",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": ["claude"],
+                "profile_name": unsafe,
+                "mappings": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("unsafe", _UNSAFE_NAMES)
+def test_init_op_target_ids_rejects_unsafe_names(unsafe: str):
+    """``target_ids`` carries tool IDs — ``Tool.id`` is itself
+    validated via ``validate_safe_name``. The journal must enforce
+    the same invariant so a hand-edited list can't carry a tool id
+    that the rest of the codebase treats as a safe segment.
+    """
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "init",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": [unsafe],
+                "profile_name": "current",
+                "mappings": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("unsafe", _UNSAFE_NAMES)
+@pytest.mark.parametrize("field", ["from", "to"])
+def test_rename_op_from_and_to_reject_unsafe_names(field: str, unsafe: str):
+    """``from``/``to`` are profile names. Same source-of-truth shape as
+    ``profile_name`` above.
+    """
+    payload = {
+        "op": "rename",
+        "started_at": "2026-05-12T10:30:00+00:00",
+        "from": "old-profile",
+        "to": "new-profile",
+        "affected_ids": [],
+    }
+    payload[field] = unsafe
+    with pytest.raises(ValidationError):
+        parse_record(payload)
+
+
+@pytest.mark.parametrize("unsafe", _UNSAFE_NAMES)
+def test_rename_op_affected_ids_rejects_unsafe_names(unsafe: str):
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rename",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "from": "old-profile",
+                "to": "new-profile",
+                "affected_ids": [unsafe],
+            }
+        )
+
+
+@pytest.mark.parametrize("unsafe", _UNSAFE_NAMES)
+def test_rescan_op_target_ids_rejects_unsafe_names(unsafe: str):
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rescan",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": [unsafe],
+                "target_profiles": {unsafe: "current"},
+                "into_mode": False,
+                "mappings": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("unsafe", _UNSAFE_NAMES)
+def test_rescan_op_target_profiles_value_rejects_unsafe_names(unsafe: str):
+    """``target_profiles`` values are profile names (where to rescan
+    INTO). Same shape constraint as ``profile_name`` / ``Profile.name``.
+    """
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rescan",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": ["claude"],
+                "target_profiles": {"claude": unsafe},
+                "into_mode": False,
+                "mappings": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("unsafe", _UNSAFE_NAMES)
+def test_rescan_op_target_profiles_key_rejects_unsafe_names(unsafe: str):
+    """``target_profiles`` keys are tool IDs."""
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rescan",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": [unsafe],
+                "target_profiles": {unsafe: "current"},
+                "into_mode": False,
+                "mappings": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("unsafe", _UNSAFE_NAMES)
+def test_rescan_op_previous_tools_outer_key_rejects_unsafe_names(unsafe: str):
+    """``previous_tools`` outer keys are profile names (the
+    profile-set being rescanned INTO)."""
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rescan",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": ["claude"],
+                "target_profiles": {"claude": unsafe},
+                "into_mode": True,
+                "previous_tools": {unsafe: {"claude": True}},
+                "mappings": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("unsafe", _UNSAFE_NAMES)
+def test_rescan_op_previous_tools_inner_key_rejects_unsafe_names(unsafe: str):
+    """``previous_tools`` inner keys are tool IDs (the tools the
+    target profile previously hosted)."""
+    with pytest.raises(ValidationError):
+        parse_record(
+            {
+                "op": "rescan",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": ["claude"],
+                "target_profiles": {"claude": "current"},
+                "into_mode": True,
+                "previous_tools": {"current": {unsafe: True}},
+                "mappings": [],
             }
         )
 

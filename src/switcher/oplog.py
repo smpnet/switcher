@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
+    AfterValidator,
     AwareDatetime,
     BaseModel,
     ConfigDict,
@@ -34,7 +35,6 @@ from pydantic import (
     StrictStr,
     TypeAdapter,
     ValidationError,
-    field_validator,
     model_validator,
 )
 
@@ -54,6 +54,18 @@ NonEmptyStr = Annotated[StrictStr, Field(min_length=1)]
 # list-indexing semantics — driving compensation against the wrong
 # mapping. Constrain to ge=0 so the journal never carries one.
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
+
+# SafeName ties NonEmptyStr to the same `validate_safe_name` invariant
+# that `Profile.name`, `Tool.id`, and `DirMapping.profile_subdir`
+# already enforce on the source-of-truth side. Used everywhere the
+# journal persists a value that will later be joined to a filesystem
+# path or used as a registry key. Without it the op-log is the weakest
+# link in the chain — `profile_name="../escape"` and friends would
+# satisfy `NonEmptyStr`, slip past the corruption boundary, and only
+# blow up when compensation turned the string back into a path.
+# `validate_safe_name` rejects traversal segments, path separators,
+# absolute paths, trailing dots and Windows reserved device names.
+SafeName = Annotated[NonEmptyStr, AfterValidator(validate_safe_name)]
 
 
 class _MappingIntent(BaseModel):
@@ -97,34 +109,16 @@ class _MappingIntent(BaseModel):
     # pydantic type because the on-disk format stores timestamps as
     # ISO strings — JSON has no native datetime — and AwareDatetime is
     # itself strict about the tzinfo invariant.
-    tool_id: NonEmptyStr
+    # Path-segment / identifier fields use SafeName so the corruption
+    # boundary matches Profile.name / Tool.id / DirMapping.profile_subdir
+    # on the source-of-truth side. live_path is a full absolute path
+    # (the live dotfile location like ~/.claude), not a segment, so it
+    # stays NonEmptyStr.
+    tool_id: SafeName
     mapping_index: NonNegativeInt
     live_path: NonEmptyStr
-    profile_subdir: NonEmptyStr
+    profile_subdir: SafeName
     original_kind: Literal["missing", "real-dir"]
-
-    @field_validator("profile_subdir")
-    @classmethod
-    def _validate_profile_subdir_is_safe_segment(cls, v: str) -> str:
-        """Route ``profile_subdir`` through the same path-segment check
-        the rest of the codebase enforces on ``DirMapping.profile_subdir``.
-
-        ``classify_mapping`` joins this value with ``profile_dir`` and
-        does filesystem reads at the resulting path. A hand-edited
-        journal entry like ``"../escape"`` or ``"/etc/passwd"`` would
-        otherwise satisfy ``NonEmptyStr``, slip past the corruption
-        boundary, and let compensation reason about (and act on) paths
-        outside the profile directory. ``validate_safe_name`` rejects
-        traversal segments, path separators, absolute paths, trailing
-        dots and Windows reserved device names — the same invariant
-        ``DirMapping`` enforces on the source-of-truth side. Without
-        this validator the op-log would be the weakest link in the
-        chain.
-        """
-        try:
-            return validate_safe_name(v)
-        except ValueError as e:
-            raise ValueError(f"profile_subdir is not a safe path segment: {e}") from e
 
 
 class _BaseOp(BaseModel):
@@ -243,8 +237,12 @@ def _check_mappings_against_target_ids(
 
 class _InitOp(_BaseOp):
     op: Literal["init"]
-    target_ids: list[NonEmptyStr]
-    profile_name: NonEmptyStr
+    # target_ids carries Tool ids; profile_name is the profile-store
+    # key. Both already validate via SafeName on the source-of-truth
+    # side (Tool.id, Profile.name); enforce the same invariant here so
+    # the journal can't be the weakest link.
+    target_ids: list[SafeName]
+    profile_name: SafeName
     mappings: list[_MappingIntent]
 
     @model_validator(mode="after")
@@ -260,9 +258,12 @@ class _InitOp(_BaseOp):
 
 class _RenameOp(_BaseOp):
     op: Literal["rename"]
-    from_: NonEmptyStr = Field(alias="from")
-    to: NonEmptyStr
-    affected_ids: list[NonEmptyStr]
+    # from_/to are profile names (Profile.name shape); affected_ids
+    # carries Tool ids (Tool.id shape). Both go through SafeName so a
+    # hand-edited journal can't carry "../old" / "../new" / etc.
+    from_: SafeName = Field(alias="from")
+    to: SafeName
+    affected_ids: list[SafeName]
 
     @model_validator(mode="after")
     def _check_affected_ids_unique(self) -> Self:
@@ -283,10 +284,14 @@ class _RenameOp(_BaseOp):
 
 class _RescanOp(_BaseOp):
     op: Literal["rescan"]
-    target_ids: list[NonEmptyStr]
-    target_profiles: dict[NonEmptyStr, NonEmptyStr]
+    # target_ids: list of Tool ids (Tool.id shape).
+    # target_profiles: {tool_id: profile_name} — both SafeName.
+    # previous_tools: {profile_name: {tool_id: was_managed_before}} —
+    #   outer key Profile.name shape, inner key Tool.id shape.
+    target_ids: list[SafeName]
+    target_profiles: dict[SafeName, SafeName]
     into_mode: StrictBool
-    previous_tools: dict[NonEmptyStr, dict[NonEmptyStr, StrictBool]] | None = None
+    previous_tools: dict[SafeName, dict[SafeName, StrictBool]] | None = None
     mappings: list[_MappingIntent]
 
     @model_validator(mode="after")
