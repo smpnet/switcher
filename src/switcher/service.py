@@ -1141,6 +1141,35 @@ class ProfileService:
                 f"interrupted rename {record.from_!r} -> {record.to!r}: "
                 f"neither profile dir exists on disk; manual recovery required"
             )
+
+        # Pre-flight (mirrors service.rename): every affected tool's live path
+        # must be a link (broken or valid) or non-existent. A real directory
+        # or regular file there would let store.rename / set_active run, then
+        # swap_link would refuse mid-loop, leaving the active map at `to`
+        # while a stale live link still references `from` — exactly the
+        # partial-apply shape this compensation is supposed to resolve. The
+        # window is real: a user who notices a missing live dir post-crash
+        # and runs `mkdir ~/.claude` before re-invoking switcher will land
+        # here. Validate before any mutation; same discipline as rename().
+        for tid in record.affected_ids:
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                continue
+            for i in range(len(tool.config_dirs)):
+                live = self._resolver.tool_dir(tool, i)
+                if not self._resolver.is_link(live) and live.exists():
+                    if live.is_dir():
+                        raise PathNotADirectoryError(
+                            f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                            f"{live} is a real directory, not a switcher link; "
+                            f"remove it (or restore the original symlink) before "
+                            f"compensation can complete"
+                        )
+                    raise PathNotADirectoryError(
+                        f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                        f"{live} exists but is not a directory; cannot relink"
+                    )
+
         if from_dir_exists:
             # Intent written, store.rename never completed. Roll FORWARD —
             # the user committed to this rename when the intent record landed.

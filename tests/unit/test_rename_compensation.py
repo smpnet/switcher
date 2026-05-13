@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from switcher.errors import OpLogCorruptError
+from switcher.errors import OpLogCorruptError, PathNotADirectoryError
 from switcher.models import Tool
 from switcher.oplog import OpLogIO, _RenameOp
 from switcher.paths import PathResolver
@@ -153,6 +153,53 @@ def test_compensate_rename_handles_orphan_tool_ids(
     service._compensate_rename(record)
     store = FileProfileStore(tmp_state)
     assert store.get_active().get("unknown_tool") == "client-A"
+
+
+def test_compensate_rename_refuses_when_live_path_is_real_dir(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Between intent-write and compensation, the user manually recreated a
+    real directory at a managed live path (e.g. they ran `mkdir ~/.claude`
+    after noticing the symlink was missing post-crash). Compensation must
+    refuse BEFORE mutating canonical state — otherwise it would run
+    store.rename / set_active and then fail mid-loop on swap_link, leaving
+    the active map at `to` while a stale live link still references `from`.
+
+    Same "validate, then mutate" discipline as service.rename's preflight."""
+    name = service.init().profile_name
+    # Pre-stage the post-step-1 shape and then break the live path.
+    store = FileProfileStore(tmp_state)
+    store.rename(name, "client-A")
+    config_path = tmp_state / "config.json"
+    cfg = json.loads(config_path.read_text())
+    cfg["active"] = dict.fromkeys(cfg["active"], name)
+    cfg["active_live_paths"] = {}
+    config_path.write_text(json.dumps(cfg))
+    # User intervened: the live symlink was unlinked and replaced with a
+    # real directory between the crash and our compensation pass.
+    claude_live = tmp_home / ".claude"
+    if claude_live.is_symlink():
+        claude_live.unlink()
+    elif claude_live.exists():
+        # Original conftest fixture seeded a real dir; remove the link/dir
+        # however it lands so we can pre-stage the bad shape.
+        if claude_live.is_dir():
+            import shutil
+
+            shutil.rmtree(claude_live)
+        else:
+            claude_live.unlink()
+    claude_live.mkdir()
+    record = _make_record(name, "client-A", affected=["claude"])
+    with pytest.raises(PathNotADirectoryError):
+        service._compensate_rename(record)
+    # Canonical state untouched: store still at `client-A` (where step-1 left
+    # it), active still at `name` (the pre-step-2 shape we staged), live still
+    # the bad real dir we created.
+    after = FileProfileStore(tmp_state)
+    assert after.profile_dir("client-A").exists()
+    assert after.get_active().get("claude") == name
+    assert claude_live.is_dir() and not claude_live.is_symlink()
 
 
 def test_rename_writes_intent_and_marks_completed(service: ProfileService, tmp_state: Path) -> None:
