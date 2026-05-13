@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +78,32 @@ def test_read_records_empty_file_raises_corrupt(tmp_path: Path):
     (tmp_path / "oplog.json").write_text("")
     io = OpLogIO(tmp_path)
     with pytest.raises(OpLogCorruptError):
+        io.read_records()
+
+
+def test_read_records_io_failure_raises_storage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A bare ``OSError`` from ``read_text`` (EACCES, transient FS
+    failure, file unmounted underneath us, etc.) is an I/O concern,
+    not a journal-corruption concern: the file *contents* may be
+    perfectly fine, we just couldn't open it. Mapping every OSError
+    to ``OpLogCorruptError`` would tell the user "manual recovery
+    required" for what's actually a permissions or transient-FS
+    issue, and conflicts with ``store.py``'s pattern of routing
+    unreadable files through :class:`StorageError`. Keep the
+    corruption boundary for content/shape problems only.
+    """
+    (tmp_path / "oplog.json").write_text(
+        "[]", encoding="utf-8"
+    )  # contents are valid; only the read fails
+
+    def raises_eacces(self: Path, **_kwargs: object) -> str:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "read_text", raises_eacces)
+    io = OpLogIO(tmp_path)
+    with pytest.raises(StorageError):
         io.read_records()
 
 
@@ -384,6 +410,38 @@ def test_mark_completed_raises_corrupt_on_externally_mutated_record(tmp_path: Pa
     (tmp_path / "oplog.json").write_text(mutated_payload, encoding="utf-8")
     with pytest.raises(OpLogCorruptError):
         io.mark_completed(original)
+
+
+def test_mark_completed_clamps_to_started_at_when_clock_skews_back(tmp_path: Path):
+    """``datetime.now(UTC)`` can land *before* ``record.started_at`` if
+    the host's wall clock moved backwards after the record was
+    written — NTP step, manual clock change, VM time correction,
+    suspend/resume drift. The ``_check_completion_ordering`` validator
+    on ``_BaseOp`` would then reject the completion as "completed_at
+    precedes started_at" corruption even though the journal contents
+    are valid and the operation succeeded. Clamp to
+    ``max(datetime.now(UTC), started_at)`` so clock skew can't strand
+    a legitimate in-flight record. Simulated here by recording the
+    intent with a ``started_at`` a few minutes in the future relative
+    to ``now``.
+    """
+    future_started = datetime.now(UTC) + timedelta(minutes=5)
+    record = _RenameOp.model_validate(
+        {
+            "op": "rename",
+            "started_at": future_started.isoformat(),
+            "from": "a",
+            "to": "b",
+            "affected_ids": [],
+        }
+    )
+    io = OpLogIO(tmp_path)
+    io.append_record(record)
+    # Should succeed; without the clamp this raises OpLogCorruptError
+    # via the _check_completion_ordering validator.
+    io.mark_completed(record)
+    on_disk: list[dict[str, Any]] = json.loads((tmp_path / "oplog.json").read_text())
+    assert on_disk[0]["completed_at"] is not None
 
 
 def test_mark_completed_sets_timestamp(tmp_path: Path):

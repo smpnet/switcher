@@ -644,7 +644,16 @@ class OpLogIO:
         try:
             blob = self._path.read_text(encoding="utf-8")
         except OSError as e:
-            raise OpLogCorruptError(f"oplog at {self._path} could not be read: {e}") from e
+            # I/O failure (EACCES, transient FS, etc.) is a storage
+            # concern, not a journal-corruption one — the file's
+            # contents may be perfectly fine. Mapping every OSError to
+            # OpLogCorruptError would tell the user "manual journal
+            # recovery required" for what's actually a permissions or
+            # filesystem-availability problem. store.py routes
+            # unreadable-file failures through StorageError; match
+            # that pattern so the CLI error renderer surfaces the
+            # right concern.
+            raise StorageError(f"oplog at {self._path} could not be read: {e}") from e
         except UnicodeDecodeError as e:
             # read_text raises UnicodeDecodeError separately from OSError
             # for non-UTF-8 bytes; without an explicit branch it would
@@ -767,7 +776,18 @@ class OpLogIO:
                 f"oplog at {self._path}: {in_flight_count} records are in-flight; "
                 f"single-in-flight invariant violated. Manual recovery required."
             )
-        completed_at = datetime.now(UTC)
+        # Clamp the completion timestamp to never precede started_at —
+        # wall clock can move backwards between intent-write and
+        # completion (NTP step, manual change, suspend/resume drift),
+        # and the _check_completion_ordering validator on _BaseOp
+        # rejects completed_at < started_at. Without the clamp, clock
+        # skew turns a legitimate completion into OpLogCorruptError
+        # and strands the in-flight record. The journal's audit
+        # guarantee is "completed_at >= started_at"; this preserves it
+        # without smuggling false-positive corruption signals through
+        # the contract.
+        now = datetime.now(UTC)
+        completed_at = max(now, record.started_at)
         matched = False
         new_records: list[OpLogRecord] = []
         for r in records:

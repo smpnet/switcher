@@ -300,7 +300,7 @@ def test_mapping_intent_live_path_rejects_host_native_traversal():
 # which would silently parse a cross-platform shape as relative
 # against CWD and misclassify the mapping.
 _POSIX_ABSOLUTE_LIVE_PATHS = [
-    _live_path(),
+    "/home/u/.claude",
     "/Users/foo/.claude",
     "/var/lib/foo",
 ]
