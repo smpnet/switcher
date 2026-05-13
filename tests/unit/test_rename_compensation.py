@@ -11,7 +11,7 @@ import pytest
 
 from switcher.errors import OpLogCorruptError
 from switcher.models import Tool
-from switcher.oplog import _RenameOp
+from switcher.oplog import OpLogIO, _RenameOp
 from switcher.paths import PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
@@ -153,3 +153,18 @@ def test_compensate_rename_handles_orphan_tool_ids(
     service._compensate_rename(record)
     store = FileProfileStore(tmp_state)
     assert store.get_active().get("unknown_tool") == "client-A"
+
+
+def test_rename_writes_intent_and_marks_completed(service: ProfileService, tmp_state: Path) -> None:
+    """A successful rename appends an intent record and marks it
+    completed; vacuum then drops it. End-to-end covers the writer
+    side of the op-log integration."""
+    name = service.init().profile_name
+    service.rename(name, "client-A")
+    oplog = OpLogIO(tmp_state)
+    records = oplog.read_records()
+    assert len(records) == 1
+    assert records[0].op == "rename"
+    assert records[0].completed_at is not None
+    oplog.vacuum_completed()
+    assert oplog.read_records() == []

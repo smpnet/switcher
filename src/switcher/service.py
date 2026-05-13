@@ -43,7 +43,7 @@ from switcher.models import Profile, Tool
 # them as internal-to-switcher, not a user-facing surface). Service is the
 # legitimate cross-module consumer that builds and dispatches them; the
 # per-line suppression keeps the convention without leaking module-wide.
-from switcher.oplog import _RenameOp  # pyright: ignore[reportPrivateUsage]
+from switcher.oplog import OpLogIO, _RenameOp  # pyright: ignore[reportPrivateUsage]
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import find_tool
 from switcher.store import ProfileStore
@@ -1020,11 +1020,13 @@ class ProfileService:
            is ``use(<new>)``, which runs swap_link for every tool in the
            profile; it's idempotent on already-relinked tools.
 
-        The narrow failure window between steps 1 and 2 (rename succeeds,
-        set_active fails) leaves the active map pointing at ``old`` while
-        the profile lives at ``new``. That requires a manual state.json
-        edit until tracked-ops land in v0.2.0 — same constraint as
-        init() multi-step failures.
+        v0.1.5: an op-log intent record is appended BEFORE store.rename
+        runs and marked completed after the final
+        ``set_active_live_paths``. A crash in the narrow failure window
+        between steps 1 and 2 leaves the in-flight record for the next
+        CLI command's detection hook to auto-compensate via
+        :meth:`_compensate_rename` (idempotent disk-truth roll-forward;
+        no user input). See spec §2.3.
         """
         self._require_initialized()
         if not self._store.profile_dir(old).exists():
@@ -1036,8 +1038,7 @@ class ProfileService:
         # would let store.rename succeed, then swap_link refuse mid-loop with
         # IsADirectoryError, leaving the rename half-applied (profile dir
         # moved, some live links updated, others stale). Same "validate, then
-        # mutate" discipline as use() / save() / init(). True transactional
-        # rollback on transient swap_link failures is v0.2.0 (tracked-ops).
+        # mutate" discipline as use() / save() / init().
         active = self._store.get_active()
         affected_ids = [tid for tid, p in active.items() if p == old]
         for tid in affected_ids:
@@ -1055,6 +1056,20 @@ class ProfileService:
                     raise PathNotADirectoryError(
                         f"{live} exists but is not a directory; cannot relink"
                     )
+        # v0.1.5: record intent BEFORE any FS mutation. affected_ids carries
+        # SafeName-validated profile/tool ids (no path canonicalization
+        # needed at this entry point — rename does not persist live_paths).
+        oplog = OpLogIO(self._store.state_dir())
+        intent = _RenameOp.model_validate(
+            {
+                "op": "rename",
+                "started_at": now(),
+                "from": old,
+                "to": new,
+                "affected_ids": list(affected_ids),
+            }
+        )
+        oplog.append_record(intent)
         self._store.rename(old, new)
         # Persist the active-map update IMMEDIATELY after the dir rename:
         # once both succeed, the rename is logically committed and any
@@ -1090,6 +1105,9 @@ class ProfileService:
         # consistent; the cache is a derived index, not load-bearing for
         # recovery (recovery path is `use(<new>)` regardless).
         self._store.set_active_live_paths(self._derive_cache_for_active(active))
+
+        # v0.1.5: mark the intent record completed.
+        oplog.mark_completed(intent)
 
     def _compensate_rename(self, record: _RenameOp) -> None:
         """Idempotent disk-truth roll-forward of a partial rename (spec §2.3).
