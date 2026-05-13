@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -184,8 +186,6 @@ def test_compensate_rename_refuses_when_live_path_is_real_dir(
         # Original conftest fixture seeded a real dir; remove the link/dir
         # however it lands so we can pre-stage the bad shape.
         if claude_live.is_dir():
-            import shutil
-
             shutil.rmtree(claude_live)
         else:
             claude_live.unlink()
@@ -214,4 +214,32 @@ def test_rename_writes_intent_and_marks_completed(service: ProfileService, tmp_s
     assert records[0].op == "rename"
     assert records[0].completed_at is not None
     oplog.vacuum_completed()
+    assert oplog.read_records() == []
+
+
+def test_rename_cancels_intent_on_sync_exception(service: ProfileService, tmp_state: Path) -> None:
+    """A synchronous exception during the rename mutation block must drop
+    the in-flight intent record so the next CLI command does not auto-
+    compensate work the user has already been told failed.
+
+    The original exception MUST propagate; cancel_intent runs as
+    best-effort cleanup. Without this, a normal failed rename becomes a
+    persistent recovery state — abby-review batch-1 finding."""
+    name = service.init().profile_name
+    # Force store.rename to fail synchronously after the intent record has
+    # been appended. Patch the bound method on the service's store so the
+    # failure happens *during* service.rename's mutation block, after
+    # oplog.append_record but before any later mutation.
+    with (
+        patch.object(
+            service._store,
+            "rename",
+            side_effect=OSError("simulated sync failure"),
+        ),
+        pytest.raises(OSError, match="simulated sync failure"),
+    ):
+        service.rename(name, "client-A")
+    # Intent record must be gone — no compensation should run on next CLI.
+    oplog = OpLogIO(tmp_state)
+    assert oplog.read_in_flight() is None
     assert oplog.read_records() == []
