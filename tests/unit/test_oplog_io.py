@@ -66,6 +66,20 @@ def test_read_records_unknown_op_raises_corrupt(tmp_path: Path):
         io.read_records()
 
 
+def test_read_records_dangling_symlink_raises_corrupt(tmp_path: Path):
+    """``Path.exists()`` follows symlinks, so a dangling symlink at the
+    journal path returns False and would otherwise fall through to the
+    "no journal" branch — silently recovering from external
+    interference. The journal's contract is fail-fast at the corruption
+    boundary; surface this as OpLogCorruptError so callers don't
+    proceed as if no journal exists and overwrite the evidence.
+    """
+    (tmp_path / "oplog.json").symlink_to(tmp_path / "does-not-exist")
+    io = OpLogIO(tmp_path)
+    with pytest.raises(OpLogCorruptError):
+        io.read_records()
+
+
 def test_read_records_non_list_top_level_raises_corrupt(tmp_path: Path):
     """A valid JSON value that isn't a list (e.g. an object) is a
     distinct corruption path from malformed JSON — it parses but fails
