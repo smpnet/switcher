@@ -1152,6 +1152,13 @@ class ProfileService:
         OR inside store.rename before the directory replace). Compensation rolls
         FORWARD by running store.rename ourselves — the user asked for this
         rename and the intent record commits us to completing it.
+
+        On successful return, the in-flight intent is marked completed so the
+        next vacuum drops it. Failure paths re-raise without marking; the
+        record stays in-flight for the next compensation pass to pick up.
+        Mirrors the init/rescan compensation lifecycle (Tasks 6.3 / 7.2):
+        the service method that knows the record is fully recovered owns
+        the journal transition.
         """
         from_dir_exists = self._store.profile_dir(record.from_).exists()
         to_dir_exists = self._store.profile_dir(record.to).exists()
@@ -1227,6 +1234,13 @@ class ProfileService:
 
         # Refresh the live-paths cache (the original rename does this too).
         self._store.set_active_live_paths(self._derive_cache_for_active(active))
+
+        # v0.1.5: mark the in-flight intent completed so the next vacuum
+        # drops it. Locating the journal here (not as a constructor field)
+        # mirrors the rename / init / rescan write paths and keeps the
+        # _compensate_rename surface a pure (state-dir + record) function
+        # of the service it was constructed against.
+        OpLogIO(self._store.state_dir()).mark_completed(record)
 
     def delete(self, name: str) -> None:
         """Delete a profile, refusing if it's active for any tool.

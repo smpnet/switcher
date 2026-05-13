@@ -61,10 +61,16 @@ def test_compensate_rename_rolls_forward_when_intent_written_before_store_rename
     """
     name = service.init().profile_name
     record = _make_record(name, "client-A", affected=[])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
     service._compensate_rename(record)
     store = FileProfileStore(tmp_state)
     assert not store.profile_dir(name).exists()
     assert store.profile_dir("client-A").exists()
+    # Recovery succeeded — the in-flight record must be marked completed
+    # so the next vacuum can drop it; otherwise every subsequent CLI
+    # command re-enters compensation for the same record.
+    assert oplog.read_in_flight() is None
 
 
 def test_compensate_rename_both_dirs_exist_raises_corrupt(
@@ -75,11 +81,16 @@ def test_compensate_rename_both_dirs_exist_raises_corrupt(
     name = service.init().profile_name
     service.create("client-A")
     record = _make_record(name, "client-A", affected=[])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
     with pytest.raises(OpLogCorruptError):
         service._compensate_rename(record)
     store = FileProfileStore(tmp_state)
     assert store.profile_dir(name).exists()
     assert store.profile_dir("client-A").exists()
+    # Failure path: intent stays in-flight so the next compensation pass
+    # (e.g. after the user resolves the ambiguity) can pick it up.
+    assert oplog.read_in_flight() is not None
 
 
 def test_compensate_rename_step1_done_step2_pending(
@@ -104,6 +115,8 @@ def test_compensate_rename_step1_done_step2_pending(
     cfg["active_live_paths"] = {}
     config_path.write_text(json.dumps(cfg))
     record = _make_record(name, "client-A", affected=["claude"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
     service._compensate_rename(record)
     store = FileProfileStore(tmp_state)
     active = store.get_active()
@@ -111,30 +124,45 @@ def test_compensate_rename_step1_done_step2_pending(
     claude_live = tmp_home / ".claude"
     expected = (store.profile_dir("client-A") / "claude").resolve()
     assert claude_live.resolve() == expected
+    assert oplog.read_in_flight() is None
 
 
 def test_compensate_rename_both_dirs_missing_raises_corrupt(
-    service: ProfileService,
+    service: ProfileService, tmp_state: Path
 ) -> None:
     """Neither `from` nor `to` exists. Refuse loudly — user manually
     intervened or something else went wrong."""
     record = _make_record("a", "b", affected=[])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
     with pytest.raises(OpLogCorruptError):
         service._compensate_rename(record)
+    assert oplog.read_in_flight() is not None
 
 
 def test_compensate_rename_idempotent_when_already_complete(
     service: ProfileService, tmp_state: Path
 ) -> None:
     """Both store.rename and set_active ran cleanly. Compensation runs
-    the swap_link loop (idempotent on already-correct links) and exits."""
+    the swap_link loop (idempotent on already-correct links) and exits.
+
+    The original `service.rename` call already wrote AND completed AND
+    vacuumed its own intent record, so the journal is empty at the top
+    of this test. Compensation needs its own in-flight record to mark
+    completed (mirroring the production flow where the CLI hook reads
+    an in-flight record before invoking _compensate_rename); append one
+    explicitly to model "user manually triggered re-compensation"."""
     name = service.init().profile_name
     service.rename(name, "client-A")
+    OpLogIO(tmp_state).vacuum_completed()
     record = _make_record(name, "client-A", affected=["claude"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
     service._compensate_rename(record)
     store = FileProfileStore(tmp_state)
     assert store.profile_dir("client-A").exists()
     assert store.get_active().get("claude") == "client-A"
+    assert oplog.read_in_flight() is None
 
 
 def test_compensate_rename_handles_orphan_tool_ids(
@@ -152,9 +180,12 @@ def test_compensate_rename_handles_orphan_tool_ids(
     cfg["active"]["unknown_tool"] = name
     config_path.write_text(json.dumps(cfg))
     record = _make_record(name, "client-A", affected=["unknown_tool"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
     service._compensate_rename(record)
     store = FileProfileStore(tmp_state)
     assert store.get_active().get("unknown_tool") == "client-A"
+    assert oplog.read_in_flight() is None
 
 
 def test_compensate_rename_refuses_when_live_path_is_real_dir(
@@ -191,6 +222,8 @@ def test_compensate_rename_refuses_when_live_path_is_real_dir(
             claude_live.unlink()
     claude_live.mkdir()
     record = _make_record(name, "client-A", affected=["claude"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
     with pytest.raises(PathNotADirectoryError):
         service._compensate_rename(record)
     # Canonical state untouched: store still at `client-A` (where step-1 left
@@ -200,6 +233,8 @@ def test_compensate_rename_refuses_when_live_path_is_real_dir(
     assert after.profile_dir("client-A").exists()
     assert after.get_active().get("claude") == name
     assert claude_live.is_dir() and not claude_live.is_symlink()
+    # Failure path: intent stays in-flight for the next compensation pass.
+    assert oplog.read_in_flight() is not None
 
 
 def test_rename_writes_intent_and_marks_completed(service: ProfileService, tmp_state: Path) -> None:
