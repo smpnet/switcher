@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from switcher.errors import OpLogCorruptError
+from switcher.errors import OpLogCorruptError, StorageError
 from switcher.oplog import (
     OpLogIO,
     _RenameOp,
@@ -334,6 +334,55 @@ def test_vacuum_clears_file_when_all_completed(tmp_path: Path):
     io.vacuum_completed()
     on_disk: list[dict[str, Any]] = json.loads((tmp_path / "oplog.json").read_text())
     assert on_disk == []
+
+
+def test_write_wraps_oserror_into_storage_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A raw ``OSError`` from the underlying write would surface to
+    the CLI as a traceback rather than as a domain error. ``_write_records``
+    must wrap filesystem failures (permission denied, ENOSPC, EXDEV)
+    into :class:`StorageError` so the CLI's error renderer can present
+    them like every other ``SwitcherError`` subclass.
+    """
+
+    def raises_oserror(self: Path, data: str, **_kwargs: object) -> int:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_text", raises_oserror)
+    io = OpLogIO(tmp_path)
+    with pytest.raises(StorageError):
+        io.append_record(_make_rename_op())
+
+
+@_skip_no_file_symlinks
+def test_write_refuses_pre_existing_tmp_symlink(tmp_path: Path):
+    """The temp path ``oplog.json.tmp`` is fixed and predictable. If a
+    symlink is pre-placed there pointing at a victim file, the naive
+    write would do two harmful things in sequence:
+
+    1. ``tmp.write_text(...)`` follows the symlink and clobbers the
+       victim file with serialized journal JSON.
+    2. ``tmp.replace(self._path)`` then installs the symlink at
+       ``oplog.json`` itself — bypassing the symlink rejection
+       ``read_records`` enforces and producing exactly the
+       split-brain shape that policy exists to prevent.
+
+    Defend the tmp path the same way the journal path is defended:
+    refuse any non-regular file at the temp location, surface as
+    ``StorageError``, and never touch the symlink target.
+    """
+    victim = tmp_path / "victim.txt"
+    original_contents = "do not clobber me"
+    victim.write_text(original_contents, encoding="utf-8")
+    tmp = tmp_path / "oplog.json.tmp"
+    tmp.symlink_to(victim)
+    io = OpLogIO(tmp_path)
+    with pytest.raises(StorageError):
+        io.append_record(_make_rename_op())
+    # Victim file must not have been written through the symlink.
+    assert victim.read_text(encoding="utf-8") == original_contents
+    # oplog.json must not have been created — refusing the write means
+    # no journal state was published.
+    assert not (tmp_path / "oplog.json").exists()
 
 
 def test_atomic_write_uses_tmp_plus_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

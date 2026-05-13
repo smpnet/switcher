@@ -34,10 +34,12 @@ from pydantic import (
     StrictStr,
     TypeAdapter,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
-from switcher.errors import OpLogCorruptError
+from switcher.errors import OpLogCorruptError, StorageError
+from switcher.models import validate_safe_name
 
 # StrictStr blocks str/int/bool coercion; Field(min_length=1) rejects
 # the empty string. Together they ensure an empty `tool_id`,
@@ -100,6 +102,29 @@ class _MappingIntent(BaseModel):
     live_path: NonEmptyStr
     profile_subdir: NonEmptyStr
     original_kind: Literal["missing", "real-dir"]
+
+    @field_validator("profile_subdir")
+    @classmethod
+    def _validate_profile_subdir_is_safe_segment(cls, v: str) -> str:
+        """Route ``profile_subdir`` through the same path-segment check
+        the rest of the codebase enforces on ``DirMapping.profile_subdir``.
+
+        ``classify_mapping`` joins this value with ``profile_dir`` and
+        does filesystem reads at the resulting path. A hand-edited
+        journal entry like ``"../escape"`` or ``"/etc/passwd"`` would
+        otherwise satisfy ``NonEmptyStr``, slip past the corruption
+        boundary, and let compensation reason about (and act on) paths
+        outside the profile directory. ``validate_safe_name`` rejects
+        traversal segments, path separators, absolute paths, trailing
+        dots and Windows reserved device names — the same invariant
+        ``DirMapping`` enforces on the source-of-truth side. Without
+        this validator the op-log would be the weakest link in the
+        chain.
+        """
+        try:
+            return validate_safe_name(v)
+        except ValueError as e:
+            raise ValueError(f"profile_subdir is not a safe path segment: {e}") from e
 
 
 class _BaseOp(BaseModel):
@@ -763,9 +788,40 @@ class OpLogIO:
         protection that does not actually close the FS-races above it.
         Multi-writer safety, if ever wanted, belongs at the command
         level and as a separate story.
+
+        The temp path is defended the same way the journal path is:
+        if ``oplog.json.tmp`` already exists as a symlink or junction,
+        refuse the write. ``Path.write_text`` follows symlinks, so a
+        naive write would clobber the link target with journal JSON
+        and the subsequent ``replace`` would install the link at
+        ``oplog.json`` itself — bypassing read-path symlink rejection
+        and producing the split-brain shape that policy exists to
+        prevent. Fail-fast at the corruption boundary instead.
+
+        Filesystem failures from ``mkdir`` / ``write_text`` /
+        ``replace`` (permission denied, disk full, EXDEV, etc.) are
+        wrapped into :class:`StorageError` so the CLI gets a
+        user-facing domain error rather than a raw ``OSError``
+        traceback.
+
+        Raises:
+            StorageError: temp path is a pre-existing symlink/junction,
+                or any of the underlying filesystem ops raises OSError.
         """
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = dump_records(records)
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_text(payload, encoding="utf-8")
-        tmp.replace(self._path)
+        # Defend the temp path the same way read_records defends the
+        # journal path. is_symlink() covers POSIX symlinks and Windows
+        # symlinks; the explicit isjunction() branch catches the
+        # Windows directory-junction shape that is_symlink misses.
+        if tmp.is_symlink() or (os.name == "nt" and os.path.isjunction(str(tmp))):
+            raise StorageError(
+                f"oplog tmp path at {tmp} is a symlink/junction; refusing to "
+                f"write through it. Manual recovery required."
+            )
+        payload = dump_records(records)
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(self._path)
+        except OSError as e:
+            raise StorageError(f"oplog at {self._path} could not be written: {e}") from e

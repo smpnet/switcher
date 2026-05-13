@@ -164,6 +164,41 @@ def test_mapping_intent_string_fields_reject_empty(field: str):
         _MappingIntent.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    "unsafe_subdir",
+    [
+        "../escape",  # parent-dir traversal
+        "..",
+        "a/b",  # path separator
+        "a\\b",  # Windows path separator
+        "/etc/passwd",  # POSIX absolute
+        "C:\\Windows",  # Windows absolute
+        "claude.",  # trailing dot (Windows-illegal)
+        "CON",  # Windows reserved device name
+        "CON.txt",  # reserved stem
+    ],
+)
+def test_mapping_intent_profile_subdir_rejects_unsafe_names(unsafe_subdir: str):
+    """``profile_subdir`` is joined to ``profile_dir`` as a path segment
+    during classification/recovery, so a hand-edited journal entry like
+    ``"../escape"`` or ``"/etc/passwd"`` would let compensation reason
+    about paths outside the profile directory and operate on arbitrary
+    locations. The rest of the codebase routes ``DirMapping.profile_subdir``
+    through ``validate_safe_name``; the op-log persists the same value
+    and must enforce the same invariant at the corruption boundary so
+    a corrupt journal can't bypass that check.
+    """
+    payload = {
+        "tool_id": "claude",
+        "mapping_index": 0,
+        "live_path": "/home/u/.claude",
+        "profile_subdir": unsafe_subdir,
+        "original_kind": "real-dir",
+    }
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(payload)
+
+
 def test_init_op_rejects_empty_profile_name_and_target_id():
     with pytest.raises(ValidationError):
         parse_record(
