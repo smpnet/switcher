@@ -262,11 +262,12 @@ def test_status_with_in_flight_init_exits_3_and_prints_hint(
 ) -> None:
     """End-to-end smoke for spec §2.2 read-only dispatch.
 
-    Initializes switcher (which writes + completes its own init record),
-    then injects a second in-flight `_InitOp` into the journal to mimic
-    an interrupted run. `status` must vacuum the completed record,
-    surface the recovery hint, and exit 3 — proving the hook is wired
-    in and that typer.Exit propagates through handle_errors.
+    Initializes switcher (no op-log record produced — service.init
+    doesn't write _InitOp intent records until Phase 6 / PR4), then
+    injects an in-flight `_InitOp` directly into the journal to mimic
+    an interrupted run. `status` must surface the recovery hint and
+    exit 3 — proving the hook is wired in and that typer.Exit
+    propagates through handle_errors.
     """
     runner = CliRunner()
     setup = runner.invoke(app, ["init"])
