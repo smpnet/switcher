@@ -272,6 +272,48 @@ def test_compensate_rename_refuses_when_affected_id_drifted_to_third_profile(
     assert after.get_active().get("claude") == "third-profile"
 
 
+def test_compensate_rename_drift_check_runs_before_store_rename_replay(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """When the intent was written but store.rename never ran AND the
+    active map has already drifted, the drift check must fire BEFORE
+    store.rename is replayed. Otherwise compensation would mutate the
+    profile dir (from → to) and only then refuse, turning a detectable
+    corruption case into a different partial state (abby blocking
+    review). All corruption guards run before any further canonical-
+    state mutation."""
+    name = service.init().profile_name
+    # Stage the pre-step-1 shape: from dir exists, to dir does NOT.
+    # The intent says we should roll-forward to `to`, but the active
+    # map has drifted to a third profile already.
+    service.create("third-profile")
+    config_path = tmp_state / "config.json"
+    cfg = json.loads(config_path.read_text())
+    cfg["active"] = {"claude": "third-profile"}
+    cfg["active_live_paths"] = {}
+    config_path.write_text(json.dumps(cfg))
+    record = _make_record(name, "client-A", affected=["claude"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
+    # Capture profile dir state BEFORE compensation.
+    store_before = FileProfileStore(tmp_state)
+    assert store_before.profile_dir(name).exists()
+    assert not store_before.profile_dir("client-A").exists()
+
+    with pytest.raises(OpLogCorruptError):
+        service._compensate_rename(record)
+
+    # Disk-truth invariant: the FROM dir must still exist with its
+    # original name; the TO dir must not have been created. The drift
+    # check fired before any further FS mutation, so the "intent
+    # written, store.rename pending" shape is preserved for the user
+    # to investigate.
+    store_after = FileProfileStore(tmp_state)
+    assert store_after.profile_dir(name).exists()
+    assert not store_after.profile_dir("client-A").exists()
+    assert oplog.read_in_flight() is not None
+
+
 def test_compensate_rename_refuses_when_affected_id_missing_from_active(
     service: ProfileService, tmp_state: Path
 ) -> None:

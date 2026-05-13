@@ -1169,8 +1169,27 @@ class ProfileService:
         the service method that knows the record is fully recovered owns
         the journal transition.
         """
-        from_dir_exists = self._store.profile_dir(record.from_).exists()
-        to_dir_exists = self._store.profile_dir(record.to).exists()
+        from_path = self._store.profile_dir(record.from_)
+        to_path = self._store.profile_dir(record.to)
+        # Path.exists() follows the link/file/dir distinction loosely;
+        # a regular file at profiles/<from>/ or profiles/<to>/ would
+        # otherwise look like a legitimate rename step state and slip
+        # past the dual-existence guards, only to fail later inside
+        # store.rename or relinking (CodeRabbit recurring review).
+        # is_dir() narrows existence to "actual profile directory";
+        # anything else (file, broken link, special) is corruption.
+        if from_path.exists() and not from_path.is_dir():
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"{from_path} exists but is not a directory; manual recovery required"
+            )
+        if to_path.exists() and not to_path.is_dir():
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"{to_path} exists but is not a directory; manual recovery required"
+            )
+        from_dir_exists = from_path.is_dir()
+        to_dir_exists = to_path.is_dir()
 
         if from_dir_exists and to_dir_exists:
             raise OpLogCorruptError(
@@ -1211,6 +1230,38 @@ class ProfileService:
                         f"{live} exists but is not a directory; cannot relink"
                     )
 
+        # Drift guard: every id captured in record.affected_ids must
+        # currently map to either `from_` (pre-step-2 state) or `to`
+        # (post-step-2 state). Anything else — third profile,
+        # missing entry — is external mutation between intent-write and
+        # compensation, NOT a recovery state the journal predicted.
+        # Silently skipping those entries would clear the journal while
+        # leaving the rename only partially reconciled: the third-profile
+        # pointer survives, the user's original rename intent is
+        # forgotten (reviewer convergence: abby blocking + CodeRabbit
+        # recurring).
+        #
+        # Runs BEFORE the store.rename replay (abby blocking pass 9):
+        # the replay mutates canonical state, and a drift-detected
+        # journal must NOT trigger further mutation. Otherwise an
+        # "intent written, store.rename never ran, active drifted"
+        # crash would turn into a different partial state (from dir
+        # gone, to dir created) before refusing — making manual
+        # recovery harder, not easier.
+        active = dict(self._store.get_active())
+        drifted = {
+            tid: active.get(tid)
+            for tid in record.affected_ids
+            if active.get(tid) not in {record.from_, record.to}
+        }
+        if drifted:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"affected active-map entries drifted outside the expected "
+                f"{{{record.from_!r}, {record.to!r}}} set: {drifted!r}. "
+                f"Manual recovery required."
+            )
+
         if from_dir_exists:
             # Intent written, store.rename never completed (or completed
             # only its first step — the metadata rewrite — before the
@@ -1231,30 +1282,6 @@ class ProfileService:
             self._store.rename(record.from_, record.to)
 
         # Step 2: re-point any affected entry that still references `from`.
-        active = dict(self._store.get_active())
-        # Drift guard: every id captured in record.affected_ids must
-        # currently map to either `from_` (pre-step-2 state) or `to`
-        # (post-step-2 state). Anything else — third profile,
-        # missing entry — is external mutation between intent-write and
-        # compensation, NOT a recovery state the journal predicted.
-        # Silently skipping those entries would clear the journal while
-        # leaving the rename only partially reconciled: the third-profile
-        # pointer survives, the user's original rename intent is
-        # forgotten (reviewer convergence: abby blocking + CodeRabbit
-        # recurring). Refuse loudly and leave the intent in flight for
-        # manual investigation.
-        drifted = {
-            tid: active.get(tid)
-            for tid in record.affected_ids
-            if active.get(tid) not in {record.from_, record.to}
-        }
-        if drifted:
-            raise OpLogCorruptError(
-                f"interrupted rename {record.from_!r} -> {record.to!r}: "
-                f"affected active-map entries drifted outside the expected "
-                f"{{{record.from_!r}, {record.to!r}}} set: {drifted!r}. "
-                f"Manual recovery required."
-            )
         affected_still_at_old = [
             tid for tid in record.affected_ids if active.get(tid) == record.from_
         ]
