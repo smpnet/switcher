@@ -23,6 +23,7 @@ from switcher.errors import (
     UnknownToolError,
 )
 from switcher.models import Tool
+from switcher.oplog import OpLogIO
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
 from switcher.service import InitReport, ProfileService, UninstallMappingState
@@ -70,6 +71,7 @@ class Deps:
     service: ProfileService
     store: ProfileStore
     registry: Sequence[Tool]
+    oplog: OpLogIO
 
 
 def get_deps() -> Deps:
@@ -79,7 +81,8 @@ def get_deps() -> Deps:
     registry = build_registry(state / "registry.d")
     store = FileProfileStore(state)
     service = ProfileService(store, resolver, registry)
-    return Deps(service=service, store=store, registry=registry)
+    oplog = OpLogIO(state)
+    return Deps(service=service, store=store, registry=registry, oplog=oplog)
 
 
 def handle_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
