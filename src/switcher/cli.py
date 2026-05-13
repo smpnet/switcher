@@ -438,12 +438,17 @@ def init(
     ),
 ) -> None:
     """Initialize switcher; optionally restrict to a subset of detected tools."""
+    # Hook FIRST — an in-flight init/rescan must surface ahead of any
+    # flag-mutex BadParameter (abby blocking review). A user with broken
+    # state who accidentally passes `--interactive --only` should see
+    # the recovery hint, not a misleading "mutually exclusive" error
+    # for flags they could have corrected after fixing the state.
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     if interactive and (only is not None or skip is not None):
         raise typer.BadParameter("--interactive is mutually exclusive with --only/--skip")
     if only is not None and skip is not None:
         raise typer.BadParameter("--only and --skip are mutually exclusive")
-
-    deps = get_deps()
     # Hermes blocker: surface StateAlreadyInitializedError BEFORE any
     # flag-specific detection / prompting runs. Without this preflight,
     # `init --skip claude` on an already-initialized repo reaches the
@@ -453,7 +458,6 @@ def init(
     # the user before failing. The state-invariant takes priority over
     # filter validation; emitting the same error for every init variant
     # keeps the CLI surface consistent.
-    _detect_or_compensate_oplog(deps, allow_mutation=True)
     if deps.store.list():
         raise StateAlreadyInitializedError("switcher is already initialized")
 
@@ -545,14 +549,17 @@ def use(
     active map. After `unmanage X`, subsequent `use` calls leave X alone —
     the durability fix from v0.1.4. Pass `--only X` to restrict further.
     """
+    # Hook FIRST — an in-flight init/rescan must surface ahead of the
+    # --only emptiness check (abby blocking review). Same precedence
+    # rationale as init.
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     if only is None:
         only_list = None
     else:
         only_list = [t.strip() for t in only.split(",") if t.strip()]
         if not only_list:
             raise typer.BadParameter("--only must contain at least one tool id")
-    deps = get_deps()
-    _detect_or_compensate_oplog(deps, allow_mutation=True)
     deps.service.use(name, only_list)
     if only_list is None:
         console.print(f"Using profile {name!r} for all currently-managed tools")
@@ -743,11 +750,13 @@ def rescan(
     tool. Use --all to suppress the warning, or --only to be selective.
     --dry-run never prompts regardless of TTY.
     """
-    if all_ and only is not None:
-        raise typer.BadParameter("--all and --only are mutually exclusive")
-
+    # Hook FIRST — an in-flight init/rescan must surface ahead of the
+    # flag-mutex BadParameter (abby blocking review). Same precedence
+    # rationale as init.
     deps = get_deps()
     _detect_or_compensate_oplog(deps, allow_mutation=True)
+    if all_ and only is not None:
+        raise typer.BadParameter("--all and --only are mutually exclusive")
 
     # Preflight: surface StateNotInitializedError BEFORE the new prompt /
     # warning logic touches the user (Hermes review). Otherwise bare

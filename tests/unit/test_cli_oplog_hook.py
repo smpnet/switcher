@@ -1,4 +1,8 @@
-# pyright: reportPrivateUsage=none
+# pyright: reportPrivateUsage=none, reportArgumentType=none
+# reportArgumentType=none: the helper takes a Deps (frozen dataclass);
+# tests pass a structurally-equivalent _FakeDeps that exposes just the
+# oplog + service slice the hook touches. The runtime is fine; only the
+# nominal type check would object.
 """Tests for the CLI op-log detection hook (spec §2.2).
 
 The hook runs at the top of every command callback. Its responsibilities:
@@ -11,15 +15,15 @@ The hook runs at the top of every command callback. Its responsibilities:
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
 
 import pytest
 import typer
 
 from switcher.cli import _detect_or_compensate_oplog, _format_in_progress_hint
 from switcher.errors import InitInProgressError, RescanInProgressError
-from switcher.oplog import _InitOp, _RenameOp, _RescanOp
+from switcher.oplog import OpLogRecord, _InitOp, _RenameOp, _RescanOp
 
 
 def _now() -> datetime:
@@ -80,44 +84,89 @@ def _rescan_record_into() -> _RescanOp:
     )
 
 
-def _make_deps(in_flight: object | None = None) -> MagicMock:
-    """Build a MagicMock Deps whose oplog returns `in_flight` from read_in_flight."""
-    deps = MagicMock()
-    deps.oplog.read_in_flight.return_value = in_flight
-    deps.oplog.vacuum_completed.return_value = None
-    return deps
+# Small fakes over MagicMock: the hook touches a tiny stable surface
+# (deps.oplog.{vacuum_completed,read_in_flight,mark_completed,cancel_intent}
+# and deps.service._compensate_rename). Hand-rolled fakes catch interface
+# drift the moment a method is renamed or added (a MagicMock attribute
+# lookup always succeeds), and match the project's no-mocks-unless-
+# unavoidable convention (CodeRabbit review).
+
+
+@dataclass
+class _FakeOpLog:
+    """Captures call history without mocking — every method records a
+    call so tests can assert ordering and call counts."""
+
+    in_flight: OpLogRecord | None = None
+    calls: list[str] = field(default_factory=list)
+    mark_completed_args: list[OpLogRecord] = field(default_factory=list)
+    cancel_intent_args: list[OpLogRecord] = field(default_factory=list)
+
+    def vacuum_completed(self) -> None:
+        self.calls.append("vacuum_completed")
+
+    def read_in_flight(self) -> OpLogRecord | None:
+        self.calls.append("read_in_flight")
+        return self.in_flight
+
+    def mark_completed(self, record: OpLogRecord) -> None:
+        self.calls.append("mark_completed")
+        self.mark_completed_args.append(record)
+
+    def cancel_intent(self, record: OpLogRecord) -> None:
+        self.calls.append("cancel_intent")
+        self.cancel_intent_args.append(record)
+
+
+@dataclass
+class _FakeService:
+    """Mirrors the slice of ProfileService the hook calls."""
+
+    compensate_rename_args: list[_RenameOp] = field(default_factory=list)
+
+    def _compensate_rename(self, record: _RenameOp) -> None:
+        self.compensate_rename_args.append(record)
+
+
+@dataclass
+class _FakeDeps:
+    """The hook only consumes `.oplog` and `.service`; nothing else is
+    exercised, so the fake stays minimal. Constructor accepts an
+    optional in-flight record to seed the read_in_flight return."""
+
+    oplog: _FakeOpLog
+    service: _FakeService
+
+    @classmethod
+    def with_in_flight(cls, in_flight: OpLogRecord | None) -> _FakeDeps:
+        return cls(oplog=_FakeOpLog(in_flight=in_flight), service=_FakeService())
 
 
 # -- no-op path -------------------------------------------------------------
 
 
 def test_no_in_flight_read_only_returns_silently() -> None:
-    deps = _make_deps(in_flight=None)
+    deps = _FakeDeps.with_in_flight(None)
     _detect_or_compensate_oplog(deps, allow_mutation=False)
-    deps.oplog.vacuum_completed.assert_called_once()
-    deps.oplog.read_in_flight.assert_called_once()
-    deps.service._compensate_rename.assert_not_called()
-    deps.oplog.mark_completed.assert_not_called()
+    assert deps.oplog.calls == ["vacuum_completed", "read_in_flight"]
+    assert deps.service.compensate_rename_args == []
+    assert deps.oplog.mark_completed_args == []
 
 
 def test_no_in_flight_mutating_returns_silently() -> None:
-    deps = _make_deps(in_flight=None)
+    deps = _FakeDeps.with_in_flight(None)
     _detect_or_compensate_oplog(deps, allow_mutation=True)
-    deps.oplog.vacuum_completed.assert_called_once()
-    deps.service._compensate_rename.assert_not_called()
+    assert deps.oplog.calls == ["vacuum_completed", "read_in_flight"]
+    assert deps.service.compensate_rename_args == []
 
 
 def test_vacuum_runs_before_read_in_flight() -> None:
     """Vacuum must happen before any decision is made on read_in_flight,
     so a previous run's completed record can't masquerade as in-flight
     via a stale snapshot."""
-    deps = _make_deps(in_flight=None)
-    parent = MagicMock()
-    parent.attach_mock(deps.oplog.vacuum_completed, "vacuum")
-    parent.attach_mock(deps.oplog.read_in_flight, "read")
+    deps = _FakeDeps.with_in_flight(None)
     _detect_or_compensate_oplog(deps, allow_mutation=False)
-    call_names = [c[0] for c in parent.mock_calls]
-    assert call_names.index("vacuum") < call_names.index("read")
+    assert deps.oplog.calls.index("vacuum_completed") < deps.oplog.calls.index("read_in_flight")
 
 
 # -- rename path (auto-compensates regardless of allow_mutation) ------------
@@ -128,40 +177,41 @@ def test_in_flight_rename_auto_compensates_read_only() -> None:
     compensation is idempotent disk-truth roll-forward of a state the
     user already committed (spec §2.2)."""
     record = _rename_record()
-    deps = _make_deps(in_flight=record)
+    deps = _FakeDeps.with_in_flight(record)
     _detect_or_compensate_oplog(deps, allow_mutation=False)
-    deps.service._compensate_rename.assert_called_once_with(record)
+    assert deps.service.compensate_rename_args == [record]
 
 
 def test_in_flight_rename_auto_compensates_mutating() -> None:
     record = _rename_record()
-    deps = _make_deps(in_flight=record)
+    deps = _FakeDeps.with_in_flight(record)
     _detect_or_compensate_oplog(deps, allow_mutation=True)
-    deps.service._compensate_rename.assert_called_once_with(record)
+    assert deps.service.compensate_rename_args == [record]
 
 
 def test_in_flight_rename_does_not_mark_completed_in_hook() -> None:
     """ProfileService._compensate_rename already calls mark_completed
-    itself (service.py:1265). The hook must not duplicate that — a
-    second mark_completed would raise on the already-completed record."""
+    itself (service.py). The hook must not duplicate that — a second
+    mark_completed would raise on the already-completed record."""
     record = _rename_record()
-    deps = _make_deps(in_flight=record)
+    deps = _FakeDeps.with_in_flight(record)
     _detect_or_compensate_oplog(deps, allow_mutation=True)
-    deps.oplog.mark_completed.assert_not_called()
+    assert deps.oplog.mark_completed_args == []
+    assert "mark_completed" not in deps.oplog.calls
 
 
 # -- init in-flight ---------------------------------------------------------
 
 
 def test_in_flight_init_read_only_raises_typer_exit_3() -> None:
-    deps = _make_deps(in_flight=_init_record())
+    deps = _FakeDeps.with_in_flight(_init_record())
     with pytest.raises(typer.Exit) as excinfo:
         _detect_or_compensate_oplog(deps, allow_mutation=False)
     assert excinfo.value.exit_code == 3
 
 
 def test_in_flight_init_mutating_raises_init_in_progress() -> None:
-    deps = _make_deps(in_flight=_init_record())
+    deps = _FakeDeps.with_in_flight(_init_record())
     with pytest.raises(InitInProgressError):
         _detect_or_compensate_oplog(deps, allow_mutation=True)
 
@@ -170,14 +220,14 @@ def test_in_flight_init_mutating_raises_init_in_progress() -> None:
 
 
 def test_in_flight_rescan_read_only_raises_typer_exit_3() -> None:
-    deps = _make_deps(in_flight=_rescan_record_fresh())
+    deps = _FakeDeps.with_in_flight(_rescan_record_fresh())
     with pytest.raises(typer.Exit) as excinfo:
         _detect_or_compensate_oplog(deps, allow_mutation=False)
     assert excinfo.value.exit_code == 3
 
 
 def test_in_flight_rescan_mutating_raises_rescan_in_progress() -> None:
-    deps = _make_deps(in_flight=_rescan_record_fresh())
+    deps = _FakeDeps.with_in_flight(_rescan_record_fresh())
     with pytest.raises(RescanInProgressError):
         _detect_or_compensate_oplog(deps, allow_mutation=True)
 
