@@ -70,12 +70,26 @@ SafeName = Annotated[NonEmptyStr, AfterValidator(validate_safe_name)]
 
 # AbsolutePath enforces the shape `live_path` must take when it is
 # eventually trusted by `classify_mapping` as `Path(intent.live_path)`.
-# The intent writer always runs the raw mapping path through
-# `PathResolver.expand()` first, which yields a canonical absolute
-# path (POSIX `/...`, Windows `C:\\...`, UNC `\\\\server\\share\\...`).
+#
+# Writer-side contract (two steps, both required before persisting):
+#   1. Resolve env vars + tilde via `PathResolver.expand()` — produces an
+#      absolute path on the host platform but does NOT normalize `..`
+#      segments. `expand('/tmp/foo/../bar')` returns `'/tmp/foo/../bar'`
+#      unchanged.
+#   2. Canonicalize the result (e.g. via `os.path.normpath` or
+#      `Path.resolve(strict=False)`) so `..` segments are folded out.
+#      The intent recorder (lands with the v0.1.5 PR that wires
+#      compensation hooks into the CLI) is the right place for this
+#      step; PR2 ships the load-side enforcement only.
+#
 # Without this validator a hand-edited journal entry like `"foo"`,
-# `"../escape"`, or `"~/rel"` would satisfy `NonEmptyStr` and let
-# compensation operate on cwd-relative or unintended targets.
+# `"../escape"`, `"C:\\Users\\me"` on a POSIX host, or `"~/rel"` would
+# satisfy `NonEmptyStr` and let compensation operate on cwd-relative
+# or otherwise unintended targets. The strict `..` rejection here is
+# what makes the writer-side canonicalization step necessary instead
+# of optional — keeping the corruption boundary fail-fast for hand-
+# edited journals.
+#
 # `validate_absolute_path` is in `models.py` next to its mirror
 # `validate_credential_path` (which enforces the opposite invariant
 # for credential-file entries).

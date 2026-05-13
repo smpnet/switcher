@@ -97,10 +97,15 @@ def validate_absolute_path(value: str) -> str:
     validator's contract aligned with what the runtime consumer
     actually does.
 
-    The intent writer is expected to have already routed raw mapping
-    paths through :meth:`PathResolver.expand` (env vars + ``~`` → host
-    home), so an unexpanded ``~/...`` here is corruption rather than a
-    legitimate shape.
+    The intent writer is expected to have produced a canonical absolute
+    path before persisting. That's a two-step contract: (a) resolve env
+    vars + ``~`` via :meth:`PathResolver.expand`, then (b) canonicalize
+    via ``os.path.normpath`` / ``Path.resolve(strict=False)`` to fold
+    out ``..`` segments — ``expand()`` itself does *not* normalize.
+    A ``"~/..."`` value here means step (a) was skipped (corruption);
+    a ``"..``-containing absolute path means step (b) was skipped
+    (writer bug). Both surface as ``ValueError`` so the journal stays
+    fail-fast at the corruption boundary.
     """
     if not value:
         raise ValueError(f"absolute path must not be empty: {value!r}")
