@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, cast
 
 from pydantic import (
@@ -79,30 +79,49 @@ def validate_credential_path(value: str) -> str:
 
 
 def validate_absolute_path(value: str) -> str:
-    """Reject relative, tilde-prefixed, or traversal-containing paths.
+    """Reject paths that aren't absolute on the **host platform**.
 
     The mirror of ``validate_credential_path``: where credential paths
     must be relative + free of ``..``, absolute paths (e.g. an op-log
-    ``live_path``) must be absolute + free of ``..`` and not start with
-    ``~``. Cross-platform: accepts POSIX absolute (``/...``), Windows
-    absolute (``C:\\...``) and UNC (``\\\\server\\share\\...``)
-    regardless of host OS, so a journal can be inspected from a
-    different platform without false rejection. The intent writer is
-    expected to have already routed values through
-    :meth:`PathResolver.expand` (env vars + ``~`` → host home), so an
-    unexpanded ``~/...`` here is corruption rather than a legitimate
-    shape.
+    ``live_path``) must be absolute on the host + free of ``..`` and
+    not start with ``~``.
+
+    Host-native, intentionally. Downstream consumers (e.g. the op-log
+    classifier) parse the value via ``pathlib.Path``, which on POSIX
+    is ``PosixPath`` and on Windows is ``WindowsPath``. A cross-
+    platform "absolute" form like ``C:\\Users\\me`` on Linux or
+    ``/home/u/.claude`` on Windows is ``is_absolute() == False`` for
+    the host's Path and would silently be treated as relative against
+    CWD — exactly the silent-misclassification class this validator
+    exists to prevent. Accepting only the host-native shape keeps the
+    validator's contract aligned with what the runtime consumer
+    actually does.
+
+    The intent writer is expected to have already routed raw mapping
+    paths through :meth:`PathResolver.expand` (env vars + ``~`` → host
+    home), so an unexpanded ``~/...`` here is corruption rather than a
+    legitimate shape.
     """
     if not value:
         raise ValueError(f"absolute path must not be empty: {value!r}")
     if value.startswith("~"):
         raise ValueError(f"absolute path must be expanded, not tilde-prefixed: {value!r}")
-    pp = PurePosixPath(value)
-    pw = PureWindowsPath(value)
-    if not (pp.is_absolute() or pw.is_absolute()):
-        raise ValueError(f"absolute path must start with a root: {value!r}")
-    if ".." in pp.parts or ".." in pw.parts:
+    host_path = Path(value)
+    if not host_path.is_absolute():
+        raise ValueError(f"absolute path must be absolute on this host platform: {value!r}")
+    if ".." in host_path.parts:
         raise ValueError(f"absolute path must not contain '..': {value!r}")
+    # `parts` for a filesystem root is a single-element tuple:
+    # ``('/')`` on POSIX, ``('C:\\\\',)`` on Windows,
+    # ``('\\\\\\\\server\\share\\\\',)`` for a UNC share. Real live
+    # paths the writer emits always have at least one additional
+    # segment (e.g. ``/home/u/.claude``). Rejecting root-only forms
+    # keeps the corruption boundary as fail-fast as possible —
+    # nothing the writer produces should land here, and accepting
+    # them would let a hand-edited journal point compensation at
+    # the filesystem root.
+    if len(host_path.parts) <= 1:
+        raise ValueError(f"absolute path must not be a filesystem root: {value!r}")
     return value
 
 

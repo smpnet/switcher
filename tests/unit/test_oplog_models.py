@@ -2,6 +2,7 @@
 """Tests for op-log Pydantic models (spec §2.1)."""
 
 import json
+import sys
 from datetime import UTC, datetime
 from typing import Any
 
@@ -199,32 +200,30 @@ def test_mapping_intent_tool_id_rejects_unsafe_names(unsafe_id: str):
         _MappingIntent.model_validate(payload)
 
 
-# Paths that ``validate_absolute_path`` rejects for the journal's
-# ``live_path`` field. Mirror of ``_UNSAFE_NAMES`` for the path-shape
-# class of corruption rather than the name-shape class.
-_UNSAFE_LIVE_PATHS = [
+# Paths that ``validate_absolute_path`` rejects regardless of host
+# platform — wrong shape (relative, tilde, traversal) is corruption
+# everywhere.
+_UNSAFE_LIVE_PATHS_ANY_HOST = [
     "foo",  # bare relative
     "../escape",  # traversal
     "rel/path",  # relative multi-segment
     "~/rel",  # unexpanded tilde
     "~",
     "~user/rel",  # ~username form (also rejected by expand())
-    "/home/u/../escape",  # traversal in otherwise-absolute path
-    "C:..\\escape",  # Windows drive-relative traversal
+    "C:..\\escape",  # drive-relative traversal — not absolute on either
     "",  # empty (also caught by NonEmptyStr, but pinned here too)
 ]
 
 
-@pytest.mark.parametrize("unsafe_live_path", _UNSAFE_LIVE_PATHS)
+@pytest.mark.parametrize("unsafe_live_path", _UNSAFE_LIVE_PATHS_ANY_HOST)
 def test_mapping_intent_live_path_rejects_non_canonical_absolute(unsafe_live_path: str):
     """``live_path`` is later trusted by ``classify_mapping`` as a real
-    absolute path via ``Path(intent.live_path)``. The intent writer always
-    runs the value through ``PathResolver.expand()`` first, which
-    produces a canonical absolute path (POSIX ``/...`` or Windows
-    ``C:\\...``) — but the journal must enforce that contract at the
-    corruption boundary too. A hand-edited entry like ``"../escape"``,
-    ``"~/rel"``, or ``"foo"`` would otherwise survive validation and let
-    compensation reason about cwd-relative / unintended paths.
+    absolute path via ``Path(intent.live_path)``. The intent writer
+    always runs the value through ``PathResolver.expand()`` first, which
+    produces a canonical absolute path. The journal must enforce that
+    contract at the corruption boundary too; a hand-edited entry like
+    ``"../escape"``, ``"~/rel"``, or ``"foo"`` would otherwise survive
+    validation and let compensation reason about cwd-relative paths.
     """
     payload = {
         "tool_id": "claude",
@@ -237,21 +236,70 @@ def test_mapping_intent_live_path_rejects_non_canonical_absolute(unsafe_live_pat
         _MappingIntent.model_validate(payload)
 
 
-@pytest.mark.parametrize(
-    "good_live_path",
-    [
-        "/home/u/.claude",  # POSIX absolute
-        "/Users/foo/.claude",  # POSIX absolute (macOS)
-        "C:\\Users\\foo\\.claude",  # Windows absolute
-        "C:/Users/foo/.claude",  # Windows absolute, forward slashes
-        "\\\\server\\share\\.claude",  # UNC
-    ],
-)
-def test_mapping_intent_live_path_accepts_canonical_absolute(good_live_path: str):
-    """Cross-platform sanity check: the canonical shapes the writer
-    actually produces (host-dependent, but journal may be inspected
-    cross-platform) must validate cleanly.
+def test_mapping_intent_live_path_rejects_filesystem_root():
+    """A bare filesystem root (``/`` on POSIX, ``C:\\`` on Windows)
+    is structurally absolute and traversal-free, but the writer never
+    emits a root-only path — real values look like
+    ``/home/u/.claude``. Rejecting roots keeps the corruption
+    boundary maximally fail-fast: a hand-edited journal can't point
+    compensation at ``/`` and silently operate from there.
     """
+    if sys.platform == "win32":
+        root = "C:\\"
+    else:
+        root = "/"
+    payload = {
+        "tool_id": "claude",
+        "mapping_index": 0,
+        "live_path": root,
+        "profile_subdir": "claude",
+        "original_kind": "real-dir",
+    }
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(payload)
+
+
+def test_mapping_intent_live_path_rejects_host_native_traversal():
+    """``..`` segments inside an otherwise-absolute host-native path are
+    still corruption — they let compensation reason about a path
+    outside the intended location. Use the host's separator so the
+    parts list actually contains ``".."``.
+    """
+    if sys.platform == "win32":
+        bad = "C:\\Users\\foo\\..\\escape"
+    else:
+        bad = "/home/u/../escape"
+    payload = {
+        "tool_id": "claude",
+        "mapping_index": 0,
+        "live_path": bad,
+        "profile_subdir": "claude",
+        "original_kind": "real-dir",
+    }
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(payload)
+
+
+# Host-native acceptance: only the shapes the host's pathlib.Path
+# considers absolute. Cross-platform "absolute" forms get rejected
+# because classify_mapping later does ``Path(intent.live_path)``,
+# which would silently parse a cross-platform shape as relative
+# against CWD and misclassify the mapping.
+_POSIX_ABSOLUTE_LIVE_PATHS = [
+    "/home/u/.claude",
+    "/Users/foo/.claude",
+    "/var/lib/foo",
+]
+_WINDOWS_ABSOLUTE_LIVE_PATHS = [
+    "C:\\Users\\foo\\.claude",
+    "C:/Users/foo/.claude",
+    "\\\\server\\share\\.claude",
+]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-shaped accept set")
+@pytest.mark.parametrize("good_live_path", _POSIX_ABSOLUTE_LIVE_PATHS)
+def test_mapping_intent_live_path_accepts_posix_absolute_on_posix(good_live_path: str):
     payload = {
         "tool_id": "claude",
         "mapping_index": 0,
@@ -261,6 +309,60 @@ def test_mapping_intent_live_path_accepts_canonical_absolute(good_live_path: str
     }
     intent = _MappingIntent.model_validate(payload)
     assert intent.live_path == good_live_path
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-shaped accept set")
+@pytest.mark.parametrize("good_live_path", _WINDOWS_ABSOLUTE_LIVE_PATHS)
+def test_mapping_intent_live_path_accepts_windows_absolute_on_windows(good_live_path: str):
+    payload = {
+        "tool_id": "claude",
+        "mapping_index": 0,
+        "live_path": good_live_path,
+        "profile_subdir": "claude",
+        "original_kind": "real-dir",
+    }
+    intent = _MappingIntent.model_validate(payload)
+    assert intent.live_path == good_live_path
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows-shaped on POSIX is corruption")
+@pytest.mark.parametrize("cross_platform", _WINDOWS_ABSOLUTE_LIVE_PATHS)
+def test_mapping_intent_live_path_rejects_windows_shape_on_posix(cross_platform: str):
+    """A Windows-absolute path on a POSIX host is not absolute to the
+    host's ``pathlib.Path`` — ``Path("C:/Users/me").is_absolute()`` is
+    False under PosixPath, so the classifier would treat it as a
+    cwd-relative path and silently misclassify the mapping (Hermes
+    reproduced this returning UNTOUCHED instead of refusing). Reject
+    at the corruption boundary so the validator's contract matches
+    what the runtime consumer actually does.
+    """
+    payload = {
+        "tool_id": "claude",
+        "mapping_index": 0,
+        "live_path": cross_platform,
+        "profile_subdir": "claude",
+        "original_kind": "real-dir",
+    }
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(payload)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="POSIX-shaped on Windows is corruption")
+@pytest.mark.parametrize("cross_platform", _POSIX_ABSOLUTE_LIVE_PATHS)
+def test_mapping_intent_live_path_rejects_posix_shape_on_windows(cross_platform: str):
+    """Mirror of the POSIX case: a POSIX-rooted path on Windows is
+    current-drive-relative, not absolute, so ``Path(...).is_absolute()``
+    is False and the classifier would misroute the mapping.
+    """
+    payload = {
+        "tool_id": "claude",
+        "mapping_index": 0,
+        "live_path": cross_platform,
+        "profile_subdir": "claude",
+        "original_kind": "real-dir",
+    }
+    with pytest.raises(ValidationError):
+        _MappingIntent.model_validate(payload)
 
 
 @pytest.mark.parametrize(

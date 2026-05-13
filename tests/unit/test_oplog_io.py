@@ -144,6 +144,44 @@ def test_read_records_invalid_utf8_raises_corrupt(tmp_path: Path):
         io.read_records()
 
 
+def test_read_records_cross_platform_live_path_raises_corrupt(tmp_path: Path):
+    """End-to-end regression for the live_path host-native contract.
+    A journal carrying a non-host-native absolute path (Windows-shaped
+    on POSIX or vice versa) must surface as OpLogCorruptError when
+    read, rather than slipping through validation and letting
+    classify_mapping silently misclassify the mapping. Pin the
+    behavior at the OpLogIO boundary so the contract holds for every
+    consumer that reaches the disk through this façade.
+    """
+    if sys.platform == "win32":
+        cross_platform_path = "/home/u/.claude"
+    else:
+        cross_platform_path = "C:\\Users\\me\\.claude"
+    payload = json.dumps(
+        [
+            {
+                "op": "init",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "target_ids": ["claude"],
+                "profile_name": "current",
+                "mappings": [
+                    {
+                        "tool_id": "claude",
+                        "mapping_index": 0,
+                        "live_path": cross_platform_path,
+                        "profile_subdir": "claude",
+                        "original_kind": "real-dir",
+                    }
+                ],
+            }
+        ]
+    )
+    (tmp_path / "oplog.json").write_text(payload, encoding="utf-8")
+    io = OpLogIO(tmp_path)
+    with pytest.raises(OpLogCorruptError):
+        io.read_records()
+
+
 def test_read_records_non_list_top_level_raises_corrupt(tmp_path: Path):
     """A valid JSON value that isn't a list (e.g. an object) is a
     distinct corruption path from malformed JSON — it parses but fails
