@@ -1212,9 +1212,22 @@ class ProfileService:
                     )
 
         if from_dir_exists:
-            # Intent written, store.rename never completed. Roll FORWARD —
-            # the user committed to this rename when the intent record landed.
-            # No-op interpretation would silently drop the user's rename.
+            # Intent written, store.rename never completed (or completed
+            # only its first step — the metadata rewrite — before the
+            # dir replace failed). Roll FORWARD by re-running store.rename:
+            # the user committed to this rename when the intent record
+            # landed, and a no-op interpretation would silently drop it.
+            #
+            # Replay is safe because FileProfileStore.rename is documented
+            # idempotent for retry (store.py:162-167): the metadata
+            # rewrite is the same content on a second pass, and a
+            # half-completed prior call where metadata.name already says
+            # `to` is reconciled by store.get's name/dir mismatch repair
+            # (store.py:131-138) so the read returns a clean Profile.
+            # If the underlying failure that broke the first attempt has
+            # cleared (transient FS error, race resolved), the second
+            # pass commits cleanly; if it persists, the user sees the
+            # same error and can investigate.
             self._store.rename(record.from_, record.to)
 
         # Step 2: re-point any affected entry that still references `from`.
