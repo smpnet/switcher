@@ -5,6 +5,8 @@ vacuum (spec §2.1, §2.6)."""
 from __future__ import annotations
 
 import json
+import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,34 @@ from switcher.errors import OpLogCorruptError
 from switcher.oplog import (
     OpLogIO,
     _RenameOp,
+)
+
+
+def _file_symlinks_available() -> bool:
+    """Probe at module-import time whether the runner can create file
+    symlinks. Always True on POSIX; depends on the SeCreateSymbolicLink
+    privilege (or Developer Mode) on Windows. Without the privilege,
+    ``Path.symlink_to(target)`` raises OSError before our code under
+    test runs at all.
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            probe_dir = Path(d)
+            target = probe_dir / "_t"
+            target.write_text("")
+            link = probe_dir / "_l"
+            link.symlink_to(target)
+        return True
+    except OSError:
+        return False
+
+
+_FILE_SYMLINKS_AVAILABLE = _file_symlinks_available()
+_skip_no_file_symlinks = pytest.mark.skipif(
+    not _FILE_SYMLINKS_AVAILABLE,
+    reason="file symlink creation requires privilege/Developer Mode on Windows",
 )
 
 
@@ -66,6 +96,7 @@ def test_read_records_unknown_op_raises_corrupt(tmp_path: Path):
         io.read_records()
 
 
+@_skip_no_file_symlinks
 def test_read_records_dangling_symlink_raises_corrupt(tmp_path: Path):
     """Any symlink at the journal path is corruption — see the
     non-dangling test below for why. Dangling is the easier shape to
@@ -78,6 +109,7 @@ def test_read_records_dangling_symlink_raises_corrupt(tmp_path: Path):
         io.read_records()
 
 
+@_skip_no_file_symlinks
 def test_read_records_valid_symlink_raises_corrupt(tmp_path: Path):
     """A symlink at the journal path pointing at a real file would
     read fine — but ``_write_records`` uses ``tmp.replace(self._path)``
@@ -280,6 +312,7 @@ def test_vacuum_with_only_in_flight_is_noop(tmp_path: Path):
     assert mtime_before == mtime_after
 
 
+@_skip_no_file_symlinks
 def test_vacuum_dangling_symlink_raises_corrupt(tmp_path: Path):
     """vacuum_completed must share read_records's corruption surface.
     Its own ``Path.exists()`` early return would otherwise hide a

@@ -747,6 +747,13 @@ class OpLogIO:
         ``Path.replace`` is atomic on POSIX and Windows for
         same-filesystem renames; the tmp file shares the parent dir, so
         the rename never crosses filesystems.
+
+        Single-process: the tmp suffix is fixed (``oplog.json.tmp``),
+        so a concurrent second writer would trample the first writer's
+        tmp file even though the final replace is still atomic. The
+        spec is a single-user CLI with no concurrent ops, which makes
+        per-write suffix uniqueness unnecessary; callers that need
+        multi-writer safety are out of scope for the recovery journal.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = dump_records(records)
