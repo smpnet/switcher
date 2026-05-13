@@ -185,13 +185,17 @@ def test_in_flight_rescan_mutating_raises_rescan_in_progress() -> None:
 # -- hint formatting --------------------------------------------------------
 
 
-def test_format_in_progress_hint_init_mentions_profile_and_continue_abort() -> None:
+def test_format_in_progress_hint_init_mentions_profile_and_manual_recovery() -> None:
     text = _format_in_progress_hint(_init_record())
     assert "init" in text
     assert "2026-05-12-current" in text
     assert "claude" in text
-    assert "--continue" in text
-    assert "--abort" in text
+    assert "Manual recovery required" in text
+    # init's --continue/--abort flags don't ship until Phase 6 / PR4;
+    # in a PR3-only deployment they're unknown to the CLI. The hint
+    # documents the future surface without pointing the user at flags
+    # the running binary doesn't have (abby blocking review).
+    assert "follow-on release" in text
 
 
 def test_format_in_progress_hint_rescan_fresh_mentions_fresh_profile() -> None:
@@ -199,24 +203,45 @@ def test_format_in_progress_hint_rescan_fresh_mentions_fresh_profile() -> None:
     assert "rescan" in text
     assert "claude" in text
     assert "fresh-profile" in text
-    assert "--continue" in text
-    assert "--abort" in text
+    assert "Manual recovery required" in text
+    assert "follow-on release" in text
 
 
 def test_format_in_progress_hint_rescan_into_mentions_into_target() -> None:
     text = _format_in_progress_hint(_rescan_record_into())
     assert "rescan" in text
-    assert "--into shared" in text
+    # No "--into shared" bare-flag wording — that flag is fine on its
+    # own as a rescan invocation, but the hint stays version-agnostic:
+    # name the target profile, don't tell the user to run any specific
+    # CLI shape that varies by switcher version.
+    assert "shared" in text
     assert "claude" in text
-    assert "--continue" in text
-    assert "--abort" in text
+    assert "Manual recovery required" in text
+
+
+def test_format_in_progress_hint_does_not_reference_nonexistent_flags() -> None:
+    """A PR3 binary doesn't expose `init --continue/--abort` or
+    `rescan --continue/--abort`. The hint must not direct the user to
+    run them — they would fail with "no such option" and burn the
+    user's first recovery attempt (abby blocking review). When PR4 /
+    PR5 add the flags, the hint text gets updated alongside."""
+    init_text = _format_in_progress_hint(_init_record())
+    rescan_fresh_text = _format_in_progress_hint(_rescan_record_fresh())
+    rescan_into_text = _format_in_progress_hint(_rescan_record_into())
+    # Substring `--continue` / `--abort` (with leading hyphens) is the
+    # CLI-flag form the user would actually type; the prose mentions
+    # the *commands* without the flag-prefix to document the
+    # forthcoming compensation surface.
+    for text in (init_text, rescan_fresh_text, rescan_into_text):
+        assert "--continue" not in text
+        assert "--abort" not in text
 
 
 def test_format_in_progress_hint_rescan_into_multi_value_marks_corrupt() -> None:
     """A hand-edited journal could carry into_mode=True with multiple
     distinct target_profiles values. _RescanOp's validators don't enforce
-    the spec's singleton invariant, so the hint must not emit a bogus
-    `switcher rescan --into a, b` (abby review). Marker-text only — the
+    the spec's singleton invariant, so the hint must not emit a single
+    bogus profile name (abby review). Marker-text only — the
     profiles_desc line below still shows the full mapping."""
     record = _RescanOp.model_validate(
         {
@@ -236,8 +261,6 @@ def test_format_in_progress_hint_rescan_into_multi_value_marks_corrupt() -> None
     assert "corrupt" in text
     assert "alpha" in text
     assert "beta" in text
-    # No bogus `--into alpha, beta` shape that the CLI couldn't accept.
-    assert "--into alpha, beta" not in text
 
 
 # -- end-to-end CLI propagation smoke -------------------------------------
@@ -279,5 +302,4 @@ def test_status_with_in_flight_init_exits_3_and_prints_hint(
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 3, result.stdout
     assert "Interrupted `switcher init`" in result.stdout
-    assert "--continue" in result.stdout
-    assert "--abort" in result.stdout
+    assert "Manual recovery required" in result.stdout

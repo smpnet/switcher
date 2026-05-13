@@ -134,14 +134,15 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
     consistent across multiple invocations of the same broken state.
     Rename has no hint — it is auto-compensated transparently.
 
-    The hint references ``switcher init --continue/--abort`` and
-    ``switcher rescan --continue/--abort``. Those flags ship in
-    follow-on PRs (init compensation = Phase 6; rescan compensation =
-    Phase 7). Until they land, ``service.init`` and ``service.rescan``
-    do NOT write op-log intent records — so the journal never carries
-    an in-flight ``_InitOp`` or ``_RescanOp`` in a PR3-only deployment,
-    and this hint surface is unreachable. The flags become functional
-    in lockstep with the records becoming writable.
+    The hint deliberately does NOT name `--continue` / `--abort` because
+    those flags don't ship until init/rescan compensation lands (Phase 6
+    / Phase 7 = PR4 / PR5). A PR3-only build can still encounter an
+    in-flight ``_InitOp`` / ``_RescanOp`` via hand-edited journals,
+    mixed-version installs, or version downgrades; pointing the user at
+    a flag that the binary doesn't expose would fail with "no such
+    option" and burn their first recovery attempt (abby review). The
+    text says "manual recovery required" and references the future
+    compensation surface so the user knows what to look for.
     """
     if isinstance(record, _InitOp):
         targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
@@ -150,8 +151,8 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
             f"(started {record.started_at.isoformat()}).\n"
             f"  Profile: {record.profile_name}\n"
             f"  Targets: {targets}\n"
-            f"Run `switcher init --continue` to finish the capture, or\n"
-            f"`switcher init --abort` to restore the pre-init state."
+            f"Manual recovery required on this switcher version. Guided "
+            f"continue/abort handlers for init ship in a follow-on release."
         )
     if isinstance(record, _RescanOp):
         targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
@@ -164,14 +165,16 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
             # into the SAME existing profile, so set(target_profiles.values())
             # should be a singleton. Reaching the multi-value branch implies
             # a hand-edited / corrupt journal — emit a marker rather than a
-            # bogus "switcher rescan --into a, b" command the CLI won't
-            # accept (abby review). _RescanOp validators don't enforce this
-            # singleton today; the hint stays robust against that gap.
+            # spurious profile name (abby review). _RescanOp validators
+            # don't enforce this singleton today; the hint stays robust
+            # against that gap.
             into_targets = sorted(set(record.target_profiles.values()))
             if len(into_targets) == 1:
-                mode_desc = f"--into {into_targets[0]}"
+                mode_desc = f"into existing profile {into_targets[0]!r}"
             else:
-                mode_desc = f"--into (corrupt: multiple distinct values {into_targets!r})"
+                mode_desc = (
+                    f"into existing profile (corrupt: multiple distinct values {into_targets!r})"
+                )
         else:
             mode_desc = "fresh-profile"
         profiles_desc = ", ".join(
@@ -182,8 +185,8 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
             f"(started {record.started_at.isoformat()}).\n"
             f"  Mode: {mode_desc} (target profiles: {profiles_desc})\n"
             f"  Targets: {targets}\n"
-            f"Run `switcher rescan --continue` to finish the capture, or\n"
-            f"`switcher rescan --abort` to restore the pre-rescan state."
+            f"Manual recovery required on this switcher version. Guided "
+            f"continue/abort handlers for rescan ship in a follow-on release."
         )
     raise AssertionError(f"unexpected in-flight record type: {type(record).__name__}")
 
