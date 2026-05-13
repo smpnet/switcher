@@ -263,6 +263,19 @@ def test_vacuum_with_only_in_flight_is_noop(tmp_path: Path):
     assert mtime_before == mtime_after
 
 
+def test_vacuum_dangling_symlink_raises_corrupt(tmp_path: Path):
+    """vacuum_completed must share read_records's corruption surface.
+    Its own ``Path.exists()`` early return would otherwise hide a
+    dangling oplog.json symlink under the "nothing to vacuum" branch,
+    silently recovering from external interference and undercutting
+    the read-path policy in a place that's easy to miss.
+    """
+    (tmp_path / "oplog.json").symlink_to(tmp_path / "does-not-exist")
+    io = OpLogIO(tmp_path)
+    with pytest.raises(OpLogCorruptError):
+        io.vacuum_completed()
+
+
 def test_vacuum_clears_file_when_all_completed(tmp_path: Path):
     io = OpLogIO(tmp_path)
     record = _make_rename_op()

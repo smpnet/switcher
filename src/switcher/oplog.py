@@ -699,9 +699,19 @@ class OpLogIO:
         Idempotent. If no completed records are present, the file is
         not rewritten — keeps mtime stable for callers that gate on it
         and avoids needless disk writes.
+
+        Delegates through :meth:`read_records` for the absent / valid /
+        corrupt decision rather than re-checking ``Path.exists()``
+        here: that duplicate guard previously hid a dangling
+        ``oplog.json`` symlink under the empty-list branch, which
+        contradicts the read-path policy of surfacing external
+        interference as :class:`OpLogCorruptError`. One read entry
+        point keeps both paths aligned.
+
+        Raises:
+            OpLogCorruptError: anything read_records raises for —
+                dangling symlink, malformed JSON, schema mismatch, etc.
         """
-        if not self._path.exists():
-            return
         records = self.read_records()
         kept = [r for r in records if r.completed_at is None]
         if len(kept) != len(records):
