@@ -460,4 +460,10 @@ def test_atomic_write_uses_tmp_plus_rename(tmp_path: Path, monkeypatch: pytest.M
     assert rename_calls, "append_record must use atomic tmp+rename"
     src, dst = rename_calls[-1]
     assert dst.endswith("oplog.json")
-    assert "tmp" in src or src.endswith(".tmp")
+    # Assert on the filename, not on the full path: a substring check
+    # against `src` would match the ``/tmp/...`` directory pytest's
+    # tmp_path lives under even if the actual file were misnamed.
+    # mkstemp's output shape is ``<prefix><random><suffix>``, so the
+    # tmp filename starts with ``oplog.json.`` and ends with ``.tmp``.
+    src_name = Path(src).name
+    assert src_name.startswith("oplog.json.") and src_name.endswith(".tmp"), src_name
