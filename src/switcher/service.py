@@ -21,6 +21,7 @@ from switcher.errors import (
     AlreadyLinkedError,
     NothingToInitializeError,
     NoToolsManagedError,
+    OpLogCorruptError,
     PathNotADirectoryError,
     ProfileExistsError,
     ProfileIsActiveError,
@@ -37,6 +38,12 @@ from switcher.errors import (
 )
 from switcher.links import move_or_seed_dir, remove_link, restore_real_dir, swap_link
 from switcher.models import Profile, Tool
+
+# Op-log record classes are namespace-private to oplog.py (the underscore marks
+# them as internal-to-switcher, not a user-facing surface). Service is the
+# legitimate cross-module consumer that builds and dispatches them; the
+# per-line suppression keeps the convention without leaking module-wide.
+from switcher.oplog import _RenameOp  # pyright: ignore[reportPrivateUsage]
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import find_tool
 from switcher.store import ProfileStore
@@ -1082,6 +1089,72 @@ class ProfileService:
         # because the canonical state (store dir + active map) is already
         # consistent; the cache is a derived index, not load-bearing for
         # recovery (recovery path is `use(<new>)` regardless).
+        self._store.set_active_live_paths(self._derive_cache_for_active(active))
+
+    def _compensate_rename(self, record: _RenameOp) -> None:
+        """Idempotent disk-truth roll-forward of a partial rename (spec §2.3).
+
+        Derives progress from disk on every call:
+          - from_dir_exists, to_dir_exists determine whether step 1 (store.rename) ran.
+          - Active map contents determine whether step 2 (set_active) ran.
+          - swap_link is idempotent on already-correct links, so step 3 is replayed
+            unconditionally for every affected_id in the registry.
+
+        Refuses if BOTH `from` and `to` dirs exist (data in two places, ambiguous)
+        or NEITHER exists (manual intervention since intent).
+
+        Important: the intent record is written BEFORE store.rename runs. The
+        `from_dir_exists AND NOT to_dir_exists` state means: intent was written,
+        but store.rename never ran (crash between append_record and store.rename,
+        OR inside store.rename before the directory replace). Compensation rolls
+        FORWARD by running store.rename ourselves — the user asked for this
+        rename and the intent record commits us to completing it.
+        """
+        from_dir_exists = self._store.profile_dir(record.from_).exists()
+        to_dir_exists = self._store.profile_dir(record.to).exists()
+
+        if from_dir_exists and to_dir_exists:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: both "
+                f"profile dirs exist on disk; manual recovery required"
+            )
+        if not from_dir_exists and not to_dir_exists:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"neither profile dir exists on disk; manual recovery required"
+            )
+        if from_dir_exists:
+            # Intent written, store.rename never completed. Roll FORWARD —
+            # the user committed to this rename when the intent record landed.
+            # No-op interpretation would silently drop the user's rename.
+            self._store.rename(record.from_, record.to)
+
+        # Step 2: re-point any affected entry that still references `from`.
+        active = dict(self._store.get_active())
+        affected_still_at_old = [
+            tid for tid in record.affected_ids if active.get(tid) == record.from_
+        ]
+        if affected_still_at_old:
+            for tid in affected_still_at_old:
+                active[tid] = record.to
+            self._store.set_active(active)
+            active = dict(self._store.get_active())
+
+        # Step 3: swap_link for every affected tool whose active entry is `to`
+        # and is in the registry (orphans skip link-fixup — same as the
+        # original rename method).
+        for tid in record.affected_ids:
+            if active.get(tid) != record.to:
+                continue
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                continue
+            for i, dm in enumerate(tool.config_dirs):
+                target = self._store.profile_dir(record.to) / dm.profile_subdir
+                live = self._resolver.tool_dir(tool, i)
+                swap_link(target, live)
+
+        # Refresh the live-paths cache (the original rename does this too).
         self._store.set_active_live_paths(self._derive_cache_for_active(active))
 
     def delete(self, name: str) -> None:
