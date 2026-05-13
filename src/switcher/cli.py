@@ -160,8 +160,18 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
         # one profile per tool — label it explicitly so the user knows
         # which mode the interrupted op was in.
         if record.into_mode:
+            # Spec invariant: into-mode rescan captures every target tool
+            # into the SAME existing profile, so set(target_profiles.values())
+            # should be a singleton. Reaching the multi-value branch implies
+            # a hand-edited / corrupt journal — emit a marker rather than a
+            # bogus "switcher rescan --into a, b" command the CLI won't
+            # accept (abby review). _RescanOp validators don't enforce this
+            # singleton today; the hint stays robust against that gap.
             into_targets = sorted(set(record.target_profiles.values()))
-            mode_desc = f"--into {', '.join(into_targets)}"
+            if len(into_targets) == 1:
+                mode_desc = f"--into {into_targets[0]}"
+            else:
+                mode_desc = f"--into (corrupt: multiple distinct values {into_targets!r})"
         else:
             mode_desc = "fresh-profile"
         profiles_desc = ", ".join(

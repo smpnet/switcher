@@ -212,6 +212,34 @@ def test_format_in_progress_hint_rescan_into_mentions_into_target() -> None:
     assert "--abort" in text
 
 
+def test_format_in_progress_hint_rescan_into_multi_value_marks_corrupt() -> None:
+    """A hand-edited journal could carry into_mode=True with multiple
+    distinct target_profiles values. _RescanOp's validators don't enforce
+    the spec's singleton invariant, so the hint must not emit a bogus
+    `switcher rescan --into a, b` (abby review). Marker-text only — the
+    profiles_desc line below still shows the full mapping."""
+    record = _RescanOp.model_validate(
+        {
+            "op": "rescan",
+            "started_at": _now(),
+            "target_ids": ["claude", "copilot"],
+            "target_profiles": {"claude": "alpha", "copilot": "beta"},
+            "into_mode": True,
+            "previous_tools": {
+                "alpha": {"claude": True},
+                "beta": {"copilot": True},
+            },
+            "mappings": [],
+        }
+    )
+    text = _format_in_progress_hint(record)
+    assert "corrupt" in text
+    assert "alpha" in text
+    assert "beta" in text
+    # No bogus `--into alpha, beta` shape that the CLI couldn't accept.
+    assert "--into alpha, beta" not in text
+
+
 # -- end-to-end CLI propagation smoke -------------------------------------
 #
 # One smoke test exercises the full hook path: callback → hook →
