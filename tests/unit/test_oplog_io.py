@@ -502,6 +502,29 @@ def test_cancel_intent_rejects_completed_record_argument(tmp_path: Path):
         io.cancel_intent(completed)
 
 
+def test_cancel_intent_rejects_when_disk_record_already_completed(tmp_path: Path):
+    """Caller passes an in-flight reference (completed_at=None) but the
+    on-disk record with the same (op, started_at) is already completed.
+    The caller is holding a stale snapshot taken before some other code
+    path already transitioned the record. Distinct from the
+    completed-argument case (`completed_at` set on the caller's reference)
+    and from the no-match / corruption cases — surface as ValueError so
+    the caller learns its reference is stale, rather than OpLogCorruptError
+    which would falsely accuse the journal."""
+    io = OpLogIO(tmp_path)
+    record = _make_rename_op()
+    io.append_record(record)
+    # Some other code path completed the record between the caller's
+    # initial read and now (modeled directly here for unit isolation).
+    io.mark_completed(record)
+    with pytest.raises(ValueError, match="already completed"):
+        io.cancel_intent(record)
+    # Disk state untouched: completed record still present.
+    on_disk: list[dict[str, Any]] = json.loads((tmp_path / "oplog.json").read_text())
+    assert len(on_disk) == 1
+    assert on_disk[0]["completed_at"] is not None
+
+
 def test_cancel_intent_raises_corrupt_on_externally_mutated_record(tmp_path: Path):
     """If the on-disk record changed between the caller's read and the
     cancellation, refuse rather than blessing the mutation — same
