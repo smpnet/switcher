@@ -210,3 +210,45 @@ def test_format_in_progress_hint_rescan_into_mentions_into_target() -> None:
     assert "claude" in text
     assert "--continue" in text
     assert "--abort" in text
+
+
+# -- end-to-end CLI propagation smoke -------------------------------------
+#
+# One smoke test exercises the full hook path: callback → hook →
+# typer.Exit → CliRunner exit code. The integration suite in Phase 9
+# covers the matrix; this single test catches the propagation wiring
+# (a regression here would silence ALL hook surface for read-only
+# commands).
+
+
+from pathlib import Path  # noqa: E402  (group end-to-end imports near use)
+
+from typer.testing import CliRunner  # noqa: E402
+
+from switcher.cli import app  # noqa: E402
+from switcher.oplog import OpLogIO  # noqa: E402
+
+
+def test_status_with_in_flight_init_exits_3_and_prints_hint(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """End-to-end smoke for spec §2.2 read-only dispatch.
+
+    Initializes switcher (which writes + completes its own init record),
+    then injects a second in-flight `_InitOp` into the journal to mimic
+    an interrupted run. `status` must vacuum the completed record,
+    surface the recovery hint, and exit 3 — proving the hook is wired
+    in and that typer.Exit propagates through handle_errors.
+    """
+    runner = CliRunner()
+    setup = runner.invoke(app, ["init"])
+    assert setup.exit_code == 0, setup.stdout
+
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(_init_record())
+
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 3, result.stdout
+    assert "Interrupted `switcher init`" in result.stdout
+    assert "--continue" in result.stdout
+    assert "--abort" in result.stdout

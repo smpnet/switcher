@@ -169,9 +169,7 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
     raise AssertionError(f"unexpected in-flight record type: {type(record).__name__}")
 
 
-def _detect_or_compensate_oplog(  # pyright: ignore[reportUnusedFunction]
-    deps: Deps, *, allow_mutation: bool
-) -> None:
+def _detect_or_compensate_oplog(deps: Deps, *, allow_mutation: bool) -> None:
     """Op-log detection hook. Called at the top of every command callback.
 
     Always vacuums completed records first so a stale "completed" snapshot
@@ -239,6 +237,7 @@ def version() -> None:
 def list_cmd() -> None:
     """List all profiles. `*` marks any tool's active profile."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=False)
     profiles = deps.store.list()
     active = set(deps.store.get_active().values())
     if not profiles:
@@ -256,6 +255,7 @@ def status(
 ) -> None:
     """Show currently-active profiles per tool, plus live-path cache state."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=False)
     active = deps.store.get_active()
     if not active:
         # Distinguish two empty-active-map states (Hermes review):
@@ -417,6 +417,7 @@ def init(
     # the user before failing. The state-invariant takes priority over
     # filter validation; emitting the same error for every init variant
     # keeps the CLI surface consistent.
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     if deps.store.list():
         raise StateAlreadyInitializedError("switcher is already initialized")
 
@@ -514,7 +515,9 @@ def use(
         only_list = [t.strip() for t in only.split(",") if t.strip()]
         if not only_list:
             raise typer.BadParameter("--only must contain at least one tool id")
-    get_deps().service.use(name, only_list)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
+    deps.service.use(name, only_list)
     if only_list is None:
         console.print(f"Using profile {name!r} for all currently-managed tools")
     else:
@@ -525,7 +528,9 @@ def use(
 @handle_errors
 def create(name: str) -> None:
     """Create a new profile, seeding credentials from the current active profile."""
-    get_deps().service.create(name)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
+    deps.service.create(name)
     console.print(f"Created profile {name!r}")
 
 
@@ -533,7 +538,9 @@ def create(name: str) -> None:
 @handle_errors
 def save(name: str) -> None:
     """Snapshot current live config into a new profile."""
-    get_deps().service.save(name)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
+    deps.service.save(name)
     console.print(f"Saved live config as {name!r}")
 
 
@@ -541,7 +548,9 @@ def save(name: str) -> None:
 @handle_errors
 def rename(old: str, new: str) -> None:
     """Rename a profile. Active tools auto-relink to the new name."""
-    get_deps().service.rename(old, new)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
+    deps.service.rename(old, new)
     console.print(f"Renamed {old!r} -> {new!r}")
 
 
@@ -554,7 +563,9 @@ def delete(
     """Delete a profile. Refuses if the profile is active for any tool."""
     if not force and not typer.confirm(f"Delete profile {name!r}?"):
         raise typer.Exit(code=0)
-    get_deps().service.delete(name)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
+    deps.service.delete(name)
     console.print(f"Deleted profile {name!r}")
 
 
@@ -562,7 +573,9 @@ def delete(
 @handle_errors
 def which(tool: str) -> None:
     """Show which profile a specific tool is currently using."""
-    name = get_deps().service.which(tool)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=False)
+    name = deps.service.which(tool)
     console.print(name)
 
 
@@ -580,6 +593,7 @@ def uninstall(
 ) -> None:
     """Inverse of init: replace every active symlink with a real directory."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     report = deps.service.uninstall(
         purge=purge,
         yes=yes,
@@ -631,6 +645,7 @@ def unmanage(
 ) -> None:
     """Restore a single tool's live path and remove it from the active map."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     report = deps.service.unmanage(tool, dry_run=dry_run, force=force)
     if dry_run:
         console.print(f"Would unmanage {report.tool_id!r}:")
@@ -692,6 +707,7 @@ def rescan(
         raise typer.BadParameter("--all and --only are mutually exclusive")
 
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
 
     # Preflight: surface StateNotInitializedError BEFORE the new prompt /
     # warning logic touches the user (Hermes review). Otherwise bare
@@ -762,6 +778,7 @@ def prune(
 ) -> None:
     """Delete orphan profiles."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
 
     # First call is always a dry-run to enumerate orphans + sizes.
     preview = deps.service.prune(dry_run=True)
@@ -812,6 +829,7 @@ def tools_scaffold(
 ) -> None:
     """Write a stub TOML for a new user tool."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     target = (
         Path(out).expanduser() if out else deps.store.state_dir() / "registry.d" / f"{tool_id}.toml"
     )
@@ -899,8 +917,13 @@ def _build_tools_table_rows(deps: Deps) -> list[_ToolsTableRow]:
 def tools_main(ctx: typer.Context) -> None:
     """List supported tools and per-OS config paths."""
     if ctx.invoked_subcommand is not None:
+        # Subcommand path: that callback (e.g. tools_scaffold) owns its own
+        # op-log hook, so skip here to avoid two read_in_flight calls per
+        # invocation. The early return preserves the existing fall-through
+        # to the subcommand.
         return
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=False)
     rows = _build_tools_table_rows(deps)
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID")
