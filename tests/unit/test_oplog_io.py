@@ -67,14 +67,31 @@ def test_read_records_unknown_op_raises_corrupt(tmp_path: Path):
 
 
 def test_read_records_dangling_symlink_raises_corrupt(tmp_path: Path):
-    """``Path.exists()`` follows symlinks, so a dangling symlink at the
-    journal path returns False and would otherwise fall through to the
-    "no journal" branch — silently recovering from external
-    interference. The journal's contract is fail-fast at the corruption
-    boundary; surface this as OpLogCorruptError so callers don't
-    proceed as if no journal exists and overwrite the evidence.
+    """Any symlink at the journal path is corruption — see the
+    non-dangling test below for why. Dangling is the easier shape to
+    notice because ``Path.exists()`` already returns False; covered
+    explicitly so the broken-link sub-case stays pinned.
     """
     (tmp_path / "oplog.json").symlink_to(tmp_path / "does-not-exist")
+    io = OpLogIO(tmp_path)
+    with pytest.raises(OpLogCorruptError):
+        io.read_records()
+
+
+def test_read_records_valid_symlink_raises_corrupt(tmp_path: Path):
+    """A symlink at the journal path pointing at a real file would
+    read fine — but ``_write_records`` uses ``tmp.replace(self._path)``
+    which replaces the symlink ITSELF with a regular file in
+    state_dir, orphaning whatever the symlink pointed at. Letting the
+    read path silently accept this shape forks journal state on the
+    first write. Reject the whole shape (broken OR resolving), and
+    let the user decide whether to undo the symlink or move state
+    dirs. Matches read_records' fail-fast contract with the write
+    path's actual behavior.
+    """
+    external = tmp_path / "external.json"
+    external.write_text("[]", encoding="utf-8")
+    (tmp_path / "oplog.json").symlink_to(external)
     io = OpLogIO(tmp_path)
     with pytest.raises(OpLogCorruptError):
         io.read_records()

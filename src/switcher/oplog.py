@@ -559,24 +559,28 @@ class OpLogIO:
         """Return every record on disk; empty list if the file is absent.
 
         Raises:
-            OpLogCorruptError: file is unreadable, present as a dangling
-                symlink, empty (tmp-then-rename writes never produce
-                that shape), not valid JSON, not a JSON array at the
-                top level, or fails schema validation.
+            OpLogCorruptError: file is unreadable, present as a symlink
+                of any kind (see below), empty (tmp-then-rename writes
+                never produce that shape), not valid JSON, not a JSON
+                array at the top level, or fails schema validation.
         """
+        # Any symlink at the journal path is corruption — checked
+        # before `exists()` because the latter follows symlinks and
+        # would obscure both the dangling case (`exists()` False) and
+        # the valid case (`exists()` True; the read here would succeed
+        # against the symlink target). Reading is fine, but the write
+        # path uses `tmp.replace(self._path)` which replaces the
+        # symlink itself with a regular file in state_dir, orphaning
+        # whatever the symlink pointed at and forking journal state on
+        # the first append / mark_completed / vacuum. Rejecting the
+        # whole shape (rather than only broken links) keeps the read
+        # and write policies aligned.
+        if self._path.is_symlink():
+            raise OpLogCorruptError(
+                f"oplog at {self._path} is a symlink; the journal must be a "
+                f"real file in the state directory. Manual recovery required."
+            )
         if not self._path.exists():
-            # `Path.exists()` follows symlinks, so a dangling symlink at
-            # the journal path is False here even though something is
-            # plainly present. Treat that as corruption rather than
-            # silently returning [] — callers would otherwise proceed as
-            # if no journal exists and could overwrite the evidence. A
-            # symlink pointing at a real file falls through to the
-            # normal read path and is treated as valid (a user putting
-            # state on another disk is legitimate).
-            if self._path.is_symlink():
-                raise OpLogCorruptError(
-                    f"oplog at {self._path} is a dangling symlink; manual recovery required"
-                )
             return []
         try:
             blob = self._path.read_text(encoding="utf-8")
