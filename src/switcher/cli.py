@@ -16,14 +16,28 @@ from rich.console import Console
 from rich.table import Table
 
 from switcher.errors import (
+    InitInProgressError,
     NothingToInitializeError,
+    RescanInProgressError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
     SwitcherError,
     UnknownToolError,
 )
 from switcher.models import Tool
-from switcher.oplog import OpLogIO
+
+# Op-log record classes (`_InitOp`, `_RenameOp`, `_RescanOp`) are namespace-
+# private to oplog.py; the CLI detection hook (spec §2.2) is a legitimate
+# cross-module consumer that dispatches on them. Per-line basedpyright
+# suppressions keep the privacy intent explicit at the import site rather
+# than leaking module-wide — mirrors the pattern in service.py.
+from switcher.oplog import (
+    OpLogIO,
+    OpLogRecord,
+    _InitOp,  # pyright: ignore[reportPrivateUsage]
+    _RenameOp,  # pyright: ignore[reportPrivateUsage]
+    _RescanOp,  # pyright: ignore[reportPrivateUsage]
+)
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
 from switcher.service import InitReport, ProfileService, UninstallMappingState
@@ -108,6 +122,100 @@ def handle_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
             raise typer.Exit(code=130) from e
 
     return wrapper
+
+
+# -- op-log detection hook (spec §2.2) --------------------------------------
+
+
+def _format_in_progress_hint(record: OpLogRecord) -> str:
+    """Render the user-facing recovery hint for an in-flight init/rescan.
+
+    Same text for read-only and mutating callers so the wording stays
+    consistent across multiple invocations of the same broken state.
+    Rename has no hint — it is auto-compensated transparently.
+    """
+    if isinstance(record, _InitOp):
+        targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
+        return (
+            f"Interrupted `switcher init` detected "
+            f"(started {record.started_at.isoformat()}).\n"
+            f"  Profile: {record.profile_name}\n"
+            f"  Targets: {targets}\n"
+            f"Run `switcher init --continue` to finish the capture, or\n"
+            f"`switcher init --abort` to restore the pre-init state."
+        )
+    if isinstance(record, _RescanOp):
+        targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
+        # into_mode rescan routes every target to a single existing
+        # profile; surface that target by name. Fresh-mode rescan creates
+        # one profile per tool — label it explicitly so the user knows
+        # which mode the interrupted op was in.
+        if record.into_mode:
+            into_targets = sorted(set(record.target_profiles.values()))
+            mode_desc = f"--into {', '.join(into_targets)}"
+        else:
+            mode_desc = "fresh-profile"
+        profiles_desc = ", ".join(
+            f"{tid}->{prof}" for tid, prof in sorted(record.target_profiles.items())
+        )
+        return (
+            f"Interrupted `switcher rescan` detected "
+            f"(started {record.started_at.isoformat()}).\n"
+            f"  Mode: {mode_desc} (target profiles: {profiles_desc})\n"
+            f"  Targets: {targets}\n"
+            f"Run `switcher rescan --continue` to finish the capture, or\n"
+            f"`switcher rescan --abort` to restore the pre-rescan state."
+        )
+    raise AssertionError(f"unexpected in-flight record type: {type(record).__name__}")
+
+
+def _detect_or_compensate_oplog(  # pyright: ignore[reportUnusedFunction]
+    deps: Deps, *, allow_mutation: bool
+) -> None:
+    """Op-log detection hook. Called at the top of every command callback.
+
+    Always vacuums completed records first so a stale "completed" snapshot
+    cannot masquerade as in-flight. Then:
+
+    - In-flight `_RenameOp`: auto-compensates via
+      ``service._compensate_rename`` REGARDLESS of ``allow_mutation``.
+      The service method is idempotent disk-truth roll-forward of state
+      the user already committed (spec §2.3); a read-only command
+      surfacing that state cleanly is better than refusing. The service
+      method owns its own ``mark_completed`` call (service.py:1265) —
+      the hook MUST NOT replicate it (a second mark_completed would
+      raise on the already-completed record).
+    - In-flight `_InitOp` / `_RescanOp`:
+        - ``allow_mutation=False`` (status / list / which / tools_main):
+          prints the recovery hint and raises ``typer.Exit(code=3)``.
+          ``handle_errors`` does not catch ``typer.Exit``, so the exit
+          code propagates correctly.
+        - ``allow_mutation=True`` (init / rescan / use / save / create /
+          rename / delete / uninstall / unmanage / prune / tools_scaffold):
+          raises ``InitInProgressError`` / ``RescanInProgressError``.
+          The init / rescan callbacks special-case these around their
+          ``--continue`` / ``--abort`` dispatch in later PRs; every
+          other mutating callback lets the error bubble to
+          ``handle_errors`` (stderr + exit 1).
+
+    Spec §2.2.
+    """
+    deps.oplog.vacuum_completed()
+    in_flight = deps.oplog.read_in_flight()
+    if in_flight is None:
+        return
+    if isinstance(in_flight, _RenameOp):
+        deps.service._compensate_rename(in_flight)  # pyright: ignore[reportPrivateUsage]
+        return
+    if not allow_mutation:
+        console.print(_format_in_progress_hint(in_flight))
+        raise typer.Exit(code=3)
+    if isinstance(in_flight, _InitOp):
+        raise InitInProgressError(_format_in_progress_hint(in_flight))
+    # OpLogRecord is the discriminated union of _InitOp | _RenameOp | _RescanOp;
+    # only _RescanOp remains here. No fallback assertion — basedpyright would
+    # flag the redundant isinstance and an unreachable branch is dead code.
+    raise RescanInProgressError(_format_in_progress_hint(in_flight))
 
 
 # -- simple read-only commands ----------------------------------------------
