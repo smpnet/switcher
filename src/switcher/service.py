@@ -29,6 +29,7 @@ from switcher.errors import (
     RescanCaptureError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
+    StorageError,
     ToolHasNoActiveProfileError,
     ToolNotInProfileError,
     ToolNotManagedError,
@@ -1086,13 +1087,21 @@ class ProfileService:
         # except Exception here would silently swallow the recovery record
         # for those compensable failures.
         #
-        # cancel_intent is best-effort: if the same FS error that broke
-        # the rename also breaks oplog writes, prefer the original
-        # exception so the user sees the root cause, not a follow-on.
+        # cancel_intent is best-effort for the I/O class of failures only:
+        # if the same FS error that broke the rename also breaks the
+        # journal's tmp+rename write (StorageError), prefer the original
+        # rename exception so the user sees the root cause, not the
+        # follow-on. OpLogCorruptError surfaces a different concern —
+        # the journal was externally modified between our append_record
+        # and the cancel attempt — and must propagate (the race exception
+        # becomes the implicit __context__ so the traceback has both).
+        # Suppressing OpLogCorruptError here would hide journal corruption
+        # behind a transient race and undermine the "surface corruption
+        # loudly" contract cancel_intent itself enforces.
         try:
             self._store.rename(old, new)
         except (UnknownProfileError, ProfileExistsError):
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(StorageError):
                 oplog.cancel_intent(intent)
             raise
         # Persist the active-map update IMMEDIATELY after the dir rename:

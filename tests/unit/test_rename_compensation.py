@@ -322,6 +322,36 @@ def test_rename_preserves_intent_on_post_mutation_exception(
     assert not after.profile_dir(name).exists()
 
 
+def test_rename_pre_mutation_cancel_propagates_oplog_corruption(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """If the journal was externally corrupted between append_record and the
+    pre-mutation cancel_intent attempt, the OpLogCorruptError must surface
+    — not be silently swallowed by the best-effort suppression. The race
+    exception (ProfileExistsError) becomes the implicit __context__ so
+    the user has the full picture in the traceback, but corruption is
+    the urgent thing to surface — abby-review batch-1 pass-4 finding."""
+    name = service.init().profile_name
+    # Patch cancel_intent to raise OpLogCorruptError (simulating: external
+    # rewrite of the journal between our append_record and our cancel
+    # attempt). Patch store.rename to raise ProfileExistsError to drive
+    # the pre-mutation branch.
+    with (
+        patch.object(
+            service._store,
+            "rename",
+            side_effect=ProfileExistsError("simulated race"),
+        ),
+        patch.object(
+            OpLogIO,
+            "cancel_intent",
+            side_effect=OpLogCorruptError("journal corrupted between append and cancel"),
+        ),
+        pytest.raises(OpLogCorruptError, match="journal corrupted"),
+    ):
+        service.rename(name, "client-A")
+
+
 def test_rename_preserves_intent_when_mark_completed_fails(
     service: ProfileService, tmp_state: Path
 ) -> None:
