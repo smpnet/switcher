@@ -1070,65 +1070,69 @@ class ProfileService:
             }
         )
         oplog.append_record(intent)
-        # Sync exceptions during the mutation block (EACCES on the dir
-        # replace, race that landed `to` between preflight and store.rename,
-        # transient swap_link failure, etc.) return control to the caller
-        # — the user gets the error and decides what to do next. The
-        # journal exists for *crash* recovery; without explicit cleanup,
-        # the next CLI command would auto-compensate this stale intent on
-        # behalf of work the user has already been told failed. cancel_intent
-        # is best-effort: if the same FS error that broke the rename also
-        # breaks oplog writes, prefer the original exception so the user
-        # sees the root-cause message rather than a journal-write follow-on.
+        # Cancellation scope is narrow on purpose. store.rename has explicit
+        # pre-mutation guards at the top of its body (UnknownProfileError
+        # if `old` vanished; ProfileExistsError if `to` appeared between
+        # OUR preflight and store.rename's own check) — both raised before
+        # any FS write. For those races, the disk is untouched, so dropping
+        # the in-flight intent prevents the next CLI command from
+        # "compensating" work that never started. Every OTHER exception
+        # (mid-store.rename OSError after the metadata write but before
+        # the dir replace, set_active failure after store.rename committed
+        # the move, swap_link failure mid-loop, mark_completed itself
+        # failing) may have left durable partial state — those are exactly
+        # the cases the journal exists to recover, so the intent must
+        # survive. abby-review batch-1 pass-3 blocking finding: a broad
+        # except Exception here would silently swallow the recovery record
+        # for those compensable failures.
+        #
+        # cancel_intent is best-effort: if the same FS error that broke
+        # the rename also breaks oplog writes, prefer the original
+        # exception so the user sees the root cause, not a follow-on.
         try:
             self._store.rename(old, new)
-            # Persist the active-map update IMMEDIATELY after the dir rename:
-            # once both succeed, the rename is logically committed and any
-            # subsequent swap_link failure is recoverable via `use(<new>)`.
-            # Running set_active LAST (after the swap loop) would leave the
-            # active map pointing at a name that no longer exists in the store
-            # whenever swap_link fails mid-loop — an unrecoverable state.
-            # Orphan tool IDs (in active but not in the registry) get
-            # re-pointed too, since their active entry must stay consistent
-            # with the store regardless of relink-ability.
-            for tid in affected_ids:
-                active[tid] = new
-            # Step 2: commit the active-map update. set_active is the wrapper
-            # that round-trips the existing on-disk active_live_paths cache,
-            # so an already-populated cache survives. The migration flush
-            # comes AFTER swap_link below — at this point the symlinks still
-            # point at `<old>` (Path.resolve() returns the stored target
-            # verbatim, even when it no longer exists), so the strict
-            # validator can't yet produce a usable cache entry.
-            self._store.set_active(active)
-            for tid in affected_ids:
-                tool = find_tool(self._registry, tid)
-                if tool is None:
-                    continue
-                for i, dm in enumerate(tool.config_dirs):
-                    target = self._store.profile_dir(new) / dm.profile_subdir
-                    live = self._resolver.tool_dir(tool, i)
-                    swap_link(target, live)
-            # Post-relink migration flush: now that every affected symlink
-            # points into <new>, _derive_cache_for_active can validate them
-            # against the post-rename active map. This is a second atomic
-            # write — safe because the canonical state (store dir + active
-            # map) is already consistent; the cache is a derived index, not
-            # load-bearing for recovery (recovery path is `use(<new>)`
-            # regardless).
-            self._store.set_active_live_paths(self._derive_cache_for_active(active))
-
-            # v0.1.5: mark the intent record completed.
-            oplog.mark_completed(intent)
-        except Exception:
-            # Drop the in-flight intent so the next CLI command does not
-            # auto-compensate work the user has already been told failed.
-            # Suppress cancel_intent failures (e.g. EACCES on oplog.json
-            # caused by the same condition that broke the rename) — the
-            # original exception is what the user needs to see.
+        except (UnknownProfileError, ProfileExistsError):
             with contextlib.suppress(Exception):
                 oplog.cancel_intent(intent)
             raise
+        # Persist the active-map update IMMEDIATELY after the dir rename:
+        # once both succeed, the rename is logically committed and any
+        # subsequent swap_link failure is recoverable via `use(<new>)`.
+        # Running set_active LAST (after the swap loop) would leave the
+        # active map pointing at a name that no longer exists in the store
+        # whenever swap_link fails mid-loop — an unrecoverable state.
+        # Orphan tool IDs (in active but not in the registry) get
+        # re-pointed too, since their active entry must stay consistent
+        # with the store regardless of relink-ability.
+        for tid in affected_ids:
+            active[tid] = new
+        # Step 2: commit the active-map update. set_active is the wrapper
+        # that round-trips the existing on-disk active_live_paths cache,
+        # so an already-populated cache survives. The migration flush
+        # comes AFTER swap_link below — at this point the symlinks still
+        # point at `<old>` (Path.resolve() returns the stored target
+        # verbatim, even when it no longer exists), so the strict
+        # validator can't yet produce a usable cache entry.
+        self._store.set_active(active)
+        for tid in affected_ids:
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                continue
+            for i, dm in enumerate(tool.config_dirs):
+                target = self._store.profile_dir(new) / dm.profile_subdir
+                live = self._resolver.tool_dir(tool, i)
+                swap_link(target, live)
+        # Post-relink migration flush: now that every affected symlink
+        # points into <new>, _derive_cache_for_active can validate them
+        # against the post-rename active map. This is a second atomic
+        # write — safe because the canonical state (store dir + active
+        # map) is already consistent; the cache is a derived index, not
+        # load-bearing for recovery (recovery path is `use(<new>)`
+        # regardless).
+        self._store.set_active_live_paths(self._derive_cache_for_active(active))
+
+        # v0.1.5: mark the intent record completed.
+        oplog.mark_completed(intent)
 
     def _compensate_rename(self, record: _RenameOp) -> None:
         """Idempotent disk-truth roll-forward of a partial rename (spec §2.3).

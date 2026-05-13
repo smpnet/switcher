@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from switcher.errors import OpLogCorruptError, PathNotADirectoryError
+from switcher.errors import OpLogCorruptError, PathNotADirectoryError, ProfileExistsError
 from switcher.models import Tool
 from switcher.oplog import OpLogIO, _RenameOp
 from switcher.paths import PathResolver
@@ -217,29 +217,99 @@ def test_rename_writes_intent_and_marks_completed(service: ProfileService, tmp_s
     assert oplog.read_records() == []
 
 
-def test_rename_cancels_intent_on_sync_exception(service: ProfileService, tmp_state: Path) -> None:
-    """A synchronous exception during the rename mutation block must drop
-    the in-flight intent record so the next CLI command does not auto-
-    compensate work the user has already been told failed.
+def test_rename_cancels_intent_on_pre_mutation_exception(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """A synchronous exception from store.rename's explicit pre-mutation
+    guards (UnknownProfileError / ProfileExistsError — raised before any
+    FS write) must drop the in-flight intent record. The disk is
+    untouched; the next CLI command should NOT auto-compensate work
+    that never started.
 
-    The original exception MUST propagate; cancel_intent runs as
-    best-effort cleanup. Without this, a normal failed rename becomes a
-    persistent recovery state — abby-review batch-1 finding."""
+    Without this, a normal failed rename becomes a persistent recovery
+    state — abby-review batch-1 pass-2 finding."""
     name = service.init().profile_name
-    # Force store.rename to fail synchronously after the intent record has
-    # been appended. Patch the bound method on the service's store so the
-    # failure happens *during* service.rename's mutation block, after
-    # oplog.append_record but before any later mutation.
+    # Race a ProfileExistsError out of store.rename: pre-flight passed
+    # because `client-A` did not exist, but it appeared between preflight
+    # and store.rename. ProfileExistsError raises BEFORE any mutation in
+    # store.rename, so cancellation is safe.
     with (
         patch.object(
             service._store,
             "rename",
-            side_effect=OSError("simulated sync failure"),
+            side_effect=ProfileExistsError("simulated race"),
         ),
-        pytest.raises(OSError, match="simulated sync failure"),
+        pytest.raises(ProfileExistsError, match="simulated race"),
     ):
         service.rename(name, "client-A")
-    # Intent record must be gone — no compensation should run on next CLI.
     oplog = OpLogIO(tmp_state)
     assert oplog.read_in_flight() is None
     assert oplog.read_records() == []
+
+
+def test_rename_preserves_intent_on_post_mutation_exception(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """A synchronous exception that lands AFTER store.rename has already
+    mutated persistent state must NOT cancel the intent — compensation
+    needs the in-flight record to roll forward from the partial state.
+
+    abby-review batch-1 pass-3 blocking finding: the broad
+    `except Exception` originally introduced for pass-2 swallowed the
+    recovery record for partial-mutation failures. The narrowed cancel
+    path now only fires for store.rename's explicit pre-mutation guards;
+    set_active / swap_link / mark_completed failures leave the intent
+    intact."""
+    name = service.init().profile_name
+    # Let store.rename succeed (so persistent state mutates), then force
+    # a failure on the very next step (set_active). The intent record
+    # must survive so the next CLI command can roll the rename forward.
+    with (
+        patch.object(
+            service._store,
+            "set_active",
+            side_effect=OSError("simulated post-rename failure"),
+        ),
+        pytest.raises(OSError, match="simulated post-rename failure"),
+    ):
+        service.rename(name, "client-A")
+    oplog = OpLogIO(tmp_state)
+    in_flight = oplog.read_in_flight()
+    assert in_flight is not None, (
+        "intent must survive mid-mutation failure — compensation needs it "
+        "to roll the rename forward"
+    )
+    assert in_flight.op == "rename"
+    # Sanity: store.rename DID happen — the partial-state shape compensation
+    # is supposed to handle.
+    after = FileProfileStore(tmp_state)
+    assert after.profile_dir("client-A").exists()
+    assert not after.profile_dir(name).exists()
+
+
+def test_rename_preserves_intent_when_mark_completed_fails(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """If oplog.mark_completed itself fails after every rename mutation
+    succeeded, the intent record must still survive — same reason as
+    post-mutation: compensation can verify the disk state is consistent
+    and retry the mark_completed on the next CLI invocation. Cancelling
+    here would erase journal evidence of a fully-applied rename and
+    leave the user with no recovery path if they did need to audit it."""
+    name = service.init().profile_name
+    real_mark_completed = OpLogIO.mark_completed
+
+    def fail_mark_completed(self: OpLogIO, *args: object, **kwargs: object) -> None:
+        raise OSError("simulated mark_completed failure")
+
+    with (
+        patch.object(OpLogIO, "mark_completed", new=fail_mark_completed),
+        pytest.raises(OSError, match="simulated mark_completed failure"),
+    ):
+        service.rename(name, "client-A")
+    # Restore the real implementation so the assertion below uses it.
+    OpLogIO.mark_completed = real_mark_completed  # type: ignore[method-assign]
+    oplog = OpLogIO(tmp_state)
+    in_flight = oplog.read_in_flight()
+    assert in_flight is not None
+    assert in_flight.op == "rename"
