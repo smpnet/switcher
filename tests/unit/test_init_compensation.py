@@ -201,7 +201,7 @@ def test_continue_refuses_on_ambiguous_mapping(
 
 
 def test_continue_with_no_in_flight_raises_no_in_progress(
-    service: ProfileService, tmp_state: Path
+    service: ProfileService,
 ) -> None:
     """`switcher init --continue` against an empty journal → NoInProgressInitError."""
     with pytest.raises(NoInProgressInitError):
@@ -358,7 +358,7 @@ def test_init_cancels_intent_on_pre_mutation_create_failure(
 
 
 def test_init_preserves_intent_on_post_mutation_failure(
-    service: ProfileService, tmp_home: Path, tmp_state: Path
+    service: ProfileService, tmp_state: Path
 ) -> None:
     """A failure AFTER ``_store.create(current_name, ...)`` already
     mutated FS state (here: a ``_capture_tool`` OSError) must NOT
@@ -993,7 +993,7 @@ def test_continue_does_not_short_circuit_when_active_has_extra_entry(
 
 
 def test_continue_does_not_short_circuit_when_zero_mapping_tool_has_stale_cache(
-    service: ProfileService, tmp_home: Path, tmp_state: Path
+    service: ProfileService, tmp_state: Path
 ) -> None:
     """Symmetric to ``test_..._when_cache_is_stale`` but covers the
     zero-mapping tool case: a target_id with no mappings expects

@@ -225,6 +225,17 @@ class FileProfileStore:
         rename) would silently strip the [] shape from the cache —
         regressing the preservation contract abort already honors.
         CR pass-2 major.
+
+        Validation is NOT relaxed by the raw reader (abby pass-4
+        non-blocking concern): ``_load_active_live_paths`` shares the
+        same StorageError-on-malformed-shape core regardless of
+        ``drop_empty``. The only behavioral difference is whether a
+        per-tool ``[]`` is treated as data (raw) or as a sentinel for
+        absence (normalizing). Malformed cache entries (non-string
+        keys, non-list values, non-string list elements) still raise
+        on read and are never re-committed; stale-but-valid entries
+        round-trip the same way through either reader, so the
+        broadening abby observed is the ``[]`` sentinel only.
         """
         self.set_active_state(mapping, self.get_active_live_paths_raw())
 
