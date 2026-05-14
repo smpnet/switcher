@@ -28,7 +28,7 @@ from switcher.models import Tool
 from switcher.oplog import OpLogIO, _InitOp, _MappingIntent, _RenameOp, _RescanOp
 from switcher.paths import PathResolver
 from switcher.registry import build_registry
-from switcher.service import ProfileService
+from switcher.service import InitAlreadyCompletedReport, ProfileService
 from switcher.store import FileProfileStore
 
 
@@ -541,6 +541,35 @@ def test_abort_validates_all_mappings_before_mutating_any(
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
+def test_continue_short_circuit_returns_already_completed_report(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """``init(continue_=True)`` short-circuit returns
+    ``InitAlreadyCompletedReport`` (kind="continue") rather than
+    ``None`` — same observability contract as the abort short-circuit,
+    so the CLI can print "Init was already committed; journal cleaned
+    up" rather than the generic "continue completed" message."""
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    store.create("vanilla", {"claude": True})
+    store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    result = service.init(continue_=True)
+
+    assert isinstance(result, InitAlreadyCompletedReport)
+    assert result.kind == "continue"
+    assert result.profile_name == profile_name
+
+
 def test_abort_short_circuits_when_already_completed(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
@@ -575,8 +604,15 @@ def test_abort_short_circuits_when_already_completed(
     record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
     OpLogIO(tmp_state).append_record(record)
 
-    service.init(abort=True)
+    result = service.init(abort=True)
 
+    # The short-circuit returns an InitAlreadyCompletedReport so the
+    # CLI can disambiguate from a successful rollback. Without this,
+    # `init --abort` would look like a successful rollback while the
+    # init is still in place — abby-review pass-15 blocker.
+    assert isinstance(result, InitAlreadyCompletedReport)
+    assert result.kind == "abort"
+    assert result.profile_name == profile_name
     # Abort did NOT run: live still symlinked, target data intact,
     # profile dir present, active map untouched.
     assert claude_live.is_symlink()

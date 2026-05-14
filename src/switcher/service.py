@@ -707,11 +707,17 @@ class ProfileService:
     # Operations ------------------------------------------------------------
 
     # v0.1.5: callers using the default (compensation-flag-free) shape
-    # still get a non-None InitReport. The compensation branches (which
-    # return None) require an explicit continue_/abort=True at the call
-    # site — overload narrowing keeps existing tests like
+    # still get a non-None InitReport. The compensation branches return
+    # one of three shapes:
+    #   - InitAlreadyCompletedReport — short-circuit fired (journal
+    #     was committed but log-unmarked; mark_completed ran; no
+    #     compensation needed).
+    #   - None — compensation actually ran (continue replayed mappings
+    #     and step 6-7, or abort reversed mappings and cleaned up).
+    # The overload narrowing keeps existing tests like
     # `service.init().profile_name` typing cleanly without per-site
-    # `assert is not None` noise.
+    # `assert is not None` noise; recovery callers (continue_=True /
+    # abort=True) get the three-shape union and must handle it.
     @overload
     def init(
         self,
@@ -734,7 +740,7 @@ class ProfileService:
         skipped_via_interactive: Sequence[str] = (),
         continue_: bool = False,
         abort: bool = False,
-    ) -> InitReport | None: ...
+    ) -> InitReport | InitAlreadyCompletedReport | None: ...
 
     def init(
         self,
@@ -745,7 +751,7 @@ class ProfileService:
         skipped_via_interactive: Sequence[str] = (),
         continue_: bool = False,
         abort: bool = False,
-    ) -> InitReport | None:
+    ) -> InitReport | InitAlreadyCompletedReport | None:
         """v0.1.4: target_ids filters which detected tools to capture.
 
         **Return-shape note (v0.1.5):** the default path returns an
@@ -853,8 +859,20 @@ class ProfileService:
                 # Spec §2.2 "committed but log-unmarked" — the original
                 # init's work is fully visible on disk; mark the record
                 # completed without running any per-mapping mutation.
+                # Surface the short-circuit as a distinct return shape
+                # so the CLI can disambiguate between actual
+                # compensation (None) and journal-cleanup-only
+                # (InitAlreadyCompletedReport). Critical for the
+                # abort path: without this, `init --abort` on an
+                # already-committed init looks identical to a
+                # successful rollback while the init is actually still
+                # in place — the user would need `switcher uninstall`
+                # to reverse it.
                 oplog.mark_completed(in_flight)
-                return None
+                return InitAlreadyCompletedReport(
+                    profile_name=in_flight.profile_name,
+                    kind="continue" if continue_ else "abort",
+                )
             if continue_:
                 self._compensate_init_continue(in_flight)
             else:
@@ -2753,6 +2771,31 @@ class InitReport:
     requested_but_not_installed: list[str]
     skipped_via_skip_flag: list[str]
     skipped_via_interactive: list[str]
+
+
+@dataclass(frozen=True)
+class InitAlreadyCompletedReport:
+    """Return shape of ``ProfileService.init(continue_=True | abort=True)``
+    when the journal record was already fully completed (committed but
+    log-unmarked) — spec §2.2 "committed but log-unmarked" path.
+
+    Surfaces the short-circuit case as a distinct return value so
+    the CLI can disambiguate between "compensation ran" (return None)
+    and "the journal was just cleaned up; the underlying init was
+    already on disk before the crash" (this report). Without this
+    distinction, ``init --abort`` would be a silent no-op on a
+    committed init — the user would think they reversed the init
+    when in fact the init is still in place.
+
+    profile_name: the dated-current profile the journal record was for.
+    kind: which recovery flag triggered the short-circuit. CLI tailors
+        the message; the abort variant points the user at
+        ``switcher uninstall`` if they actually want to reverse the
+        committed init.
+    """
+
+    profile_name: str
+    kind: Literal["continue", "abort"]
 
 
 @dataclass
