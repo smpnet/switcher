@@ -1126,6 +1126,19 @@ class ProfileService:
         forward progress, or the active map didn't yet cover
         target_ids; running the per-tool seed + active-map writes is
         idempotent on already-complete data anyway.
+
+        **Active/cache REPLACE contract.** Step 7's
+        ``set_active_state`` writes the FULL active map and live-paths
+        cache derived from ``record.target_ids`` — same shape a clean
+        init produces. Any unrelated existing entries in ``active`` or
+        ``active_live_paths`` (drift from external mutation since
+        intent, residue from a prior partially-cleaned run, etc.) are
+        REPLACED, not merged. This intentional asymmetry with
+        ``_compensate_init_abort`` — which clears only
+        ``record.target_ids``-owned entries and preserves external
+        state — reflects the spec's "abort surfaces externally-mutated
+        state for inspection" vs. "continue commits the journal's
+        recorded intent" stance.
         """
         profile_dir = self._store.profile_dir(record.profile_name)
         vanilla_dir = self._store.profile_dir("vanilla")
