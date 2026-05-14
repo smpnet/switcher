@@ -927,21 +927,41 @@ class ProfileService:
 
         # Pre-mutation cancel scope (mirrors service.rename): the first
         # `_store.create(current_name, ...)` is the entry point to all FS
-        # mutation. Its only pre-mutation exit is `ProfileExistsError`
-        # from `profile_dir.exists()` — raised before `d.mkdir`, so the
-        # disk is untouched. Init's own pre-flight (`_store.list()` empty)
-        # makes that path effectively unreachable today, but a race
-        # between pre-flight and this call (another process / hand-edited
-        # state) would land here, and turning a no-op failure into a
-        # persistent "compensate the init that never started" prompt
-        # blocks every subsequent retry. cancel_intent drops the record
-        # for that class of failure only — every OTHER exception (mid-
-        # `mkdir`, capture loop, `_store.create("vanilla")` AFTER the
-        # capture loop committed FS state, set_active_state, mark_completed
-        # itself) leaves durable partial state the journal exists to
-        # recover. Suppression scope matches rename's: best-effort on
-        # StorageError, propagate OpLogCorruptError (race-on-the-journal-
-        # itself signal that must surface loudly).
+        # mutation. The catch is narrow on purpose — ProfileExistsError
+        # is the ONLY exception we can prove leaves the disk
+        # untouched, so it's the only one safe to interpret as "the
+        # init never started":
+        #
+        #   - ProfileExistsError (CAUGHT): _store.create's first line
+        #     is `if self.profile_dir(name).exists(): raise`, before
+        #     any Profile model construction or mkdir. The disk is
+        #     untouched; the intent must be canceled or the next
+        #     command forces "compensate the init that never started".
+        #   - ValueError from Profile(name=current_name, ...) (NOT
+        #     caught): unreachable in practice — current_name is
+        #     `now().strftime("%Y-%m-%d") + "-current"` which always
+        #     passes Profile.name validation. Catching defensively
+        #     would obscure the unreachable-branch property.
+        #   - OSError from `d.mkdir(parents=True, exist_ok=True)`
+        #     (NOT caught): mid-mutation. `parents=True` means mkdir
+        #     can succeed at intermediate dirs before failing at the
+        #     target, leaving partial FS state. Cancelling the intent
+        #     here would drop the recovery record for a state that
+        #     genuinely needs it. Mirrors rename's `OSError` posture
+        #     (set_active failure inside store.rename preserves the
+        #     intent for the same reason).
+        #   - OSError from _atomic_write inside _store.create (NOT
+        #     caught): create's own try/finally runs shutil.rmtree(d,
+        #     ignore_errors=True) on this path — `ignore_errors=True`
+        #     means d MAY remain on partial cleanup failure. Treat
+        #     as potentially-mid-mutation and preserve intent.
+        #
+        # Suppression scope matches rename's: best-effort on
+        # StorageError (if the same FS error broke both store.create
+        # and cancel_intent's tmp+rename write, prefer the original
+        # ProfileExistsError so the user sees the root cause);
+        # OpLogCorruptError propagates as a race-on-the-journal-itself
+        # signal that must surface loudly.
         try:
             self._store.create(current_name, {t.id: True for t in installed})
         except ProfileExistsError:
@@ -972,10 +992,11 @@ class ProfileService:
         )
 
     def _check_init_already_completed(self, record: _InitOp) -> bool:
-        """Return True if the init's work is fully visible on disk: every
-        mapping classifies COMPLETE, active.keys() covers target_ids,
-        AND both profile dirs (dated-current + vanilla) are real
-        directories.
+        """Return True ONLY if every observable post-init invariant
+        holds on disk: both profile dirs are real directories, every
+        mapping classifies COMPLETE, ``active`` covers target_ids,
+        AND ``active_live_paths`` matches the journal's expected
+        shape per-target.
 
         Spec §2.2 "committed but log-unmarked" path — a crash between
         the final ``set_active_state`` and ``mark_completed`` leaves
@@ -993,6 +1014,15 @@ class ProfileService:
         ``_compensate_init_abort`` surfaces a corrupt vanilla as
         OpLogCorruptError in its validation pass.
 
+        ``active_live_paths`` is verified against the journal's
+        per-target expectations too — without that check, a missing
+        / stale cache entry would short-circuit and permanently skip
+        the cache-rebuild step ``_compensate_init_continue`` would
+        run. ``[]`` cache entries are normalized to "absent" at
+        ``get_active_live_paths`` read time, so the comparison is
+        against the post-normalization view (non-empty entries only,
+        matching the journal's grouped live_paths_by_tool).
+
         The profile-dir checks reject link shapes too: ``is_dir()``
         follows symlinks, so a symlink-to-dir at either profile path
         satisfies it alone — without the explicit ``is_link`` refusal
@@ -1007,7 +1037,33 @@ class ProfileService:
             if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
                 return False
         active = self._store.get_active()
-        return all(active.get(tid) == record.profile_name for tid in record.target_ids)
+        if not all(active.get(tid) == record.profile_name for tid in record.target_ids):
+            return False
+        # Cache invariant: every target_id's live_paths must match
+        # the journal's snapshot. The journal's per-tool expectation
+        # is the sorted-by-mapping_index list of live_paths from
+        # record.mappings; tools with zero mappings expect [] (which
+        # `get_active_live_paths` normalizes to "absent"). Reading
+        # the cache and comparing against this expectation catches
+        # both missing-key and stale-value drift.
+        live_paths_by_tool: dict[str, list[tuple[int, str]]] = {}
+        for mapping in record.mappings:
+            live_paths_by_tool.setdefault(mapping.tool_id, []).append(
+                (mapping.mapping_index, mapping.live_path)
+            )
+        expected_nonempty: dict[str, list[str]] = {
+            tid: [p for _, p in sorted(entries)] for tid, entries in live_paths_by_tool.items()
+        }
+        actual_cache = self._store.get_active_live_paths()
+        # `actual_cache` only contains keys with non-empty values
+        # (get_active_live_paths normalizes [] to absent); compare
+        # against the non-empty slice of the journal expectation.
+        # Tools that appear in target_ids with zero mappings get
+        # cache[tid] = [] at write time and appear absent from
+        # actual_cache — that's the expected post-normalization view,
+        # so a target_id with no mappings is implicitly satisfied
+        # regardless of actual_cache containing it.
+        return all(actual_cache.get(tid) == expected for tid, expected in expected_nonempty.items())
 
     def _compensate_init_continue(self, record: _InitOp) -> None:
         """Replay any non-COMPLETE mapping per the §2.1.1 continue

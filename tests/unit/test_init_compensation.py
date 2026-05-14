@@ -657,6 +657,44 @@ def test_abort_idempotent_second_call_raises_no_in_progress(
         service.init(abort=True)
 
 
+def test_continue_does_not_short_circuit_when_cache_is_stale(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """The "committed but log-unmarked" short-circuit must also
+    validate ``active_live_paths`` against the journal's expected
+    shape — a stale cache entry would otherwise short-circuit
+    recovery and permanently skip the cache-rebuild step.
+
+    Test stages every other completion signal (mapping COMPLETE,
+    active matches, vanilla present) BUT writes a wrong path into
+    the cache. Continue must fall through to compensation, which
+    rebuilds the cache from the journal."""
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    store.create("vanilla", {"claude": True})
+    # Stage a STALE cache value (wrong path) — the journal's expected
+    # path is str(claude_live); we deliberately write a different one
+    # so the short-circuit's cache-shape check fails.
+    store.set_active_state({"claude": profile_name}, {"claude": ["/wrong/path"]})
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(continue_=True)
+
+    # Compensation rebuilt the cache from the journal.
+    config = json.loads((tmp_state / "config.json").read_text())
+    assert config["active_live_paths"]["claude"] == [str(claude_live)]
+    # Record marked completed.
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
 def test_continue_does_not_short_circuit_when_vanilla_is_missing(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
