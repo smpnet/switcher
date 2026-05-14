@@ -121,9 +121,55 @@ def test_continue_all_untouched_runs_full_replay(
 
     service.init(continue_=True)
 
-    assert claude_live.is_symlink()
+    # service._resolver.is_link is the project convention for "managed
+    # link" (covers POSIX symlinks AND Windows junctions). Path.is_symlink
+    # alone would fail on Windows because swap_link creates a junction,
+    # not a symbolic link — Windows CI failure + Hermes pass-PR blocker.
+    assert service._resolver.is_link(claude_live)
     assert (profile_dir / "claude" / "settings.json").read_text() == '{"original": true}'
     assert store.get_active().get("claude") == profile_name
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
+def test_continue_recreates_profile_when_crash_was_before_first_store_create(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Earliest crash window: ``oplog.append_record(intent)`` succeeded
+    but the first ``_store.create(record.profile_name, ...)`` never ran
+    (kill-9 between those two steps). ``profile_dir`` does NOT exist
+    on disk.
+
+    Continue must recreate the profile via ``_store.create`` before
+    replaying mappings — otherwise the mapping replay would mkdir
+    ``profile_dir/<subdir>`` (via move_or_seed_dir) without writing
+    ``metadata.json``, leaving ``active[tid] = record.profile_name``
+    pointing at a dir that ``_store.get`` can't load. CR pass-PR-1
+    critical: the user would dead-end on the next ``switcher use``
+    with UnknownProfileError, journal already cleared.
+    """
+    claude_live = tmp_home / ".claude"
+    (claude_live / "settings.json").write_text('{"original": true}')
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # NO store.create — simulating the crash BEFORE step 4 ran.
+    # profile_dir does not exist on disk yet.
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+    assert not store.profile_dir(profile_name).exists()  # precondition
+
+    service.init(continue_=True)
+
+    # Profile recreated through the canonical store API: dir + metadata.
+    profile = store.get(profile_name)
+    assert profile.name == profile_name
+    assert profile.tools == {"claude": True}
+    # Mappings replayed: live → managed link, target populated.
+    profile_dir = store.profile_dir(profile_name)
+    assert service._resolver.is_link(claude_live)
+    assert (profile_dir / "claude" / "settings.json").read_text() == '{"original": true}'
+    # Active map covers target_ids, pointing at the now-existent profile.
+    assert store.get_active().get("claude") == profile_name
+    # Journal cleaned up.
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
@@ -173,7 +219,9 @@ def test_continue_handles_move_done_link_missing_state(
 
     service.init(continue_=True)
 
-    assert claude_live.is_symlink()
+    # Junction-aware check (same Windows-CI / Hermes rationale as
+    # test_continue_all_untouched_runs_full_replay).
+    assert service._resolver.is_link(claude_live)
     assert (target / "settings.json").read_text() == '{"already_moved": true}'
     assert OpLogIO(tmp_state).read_in_flight() is None
 
@@ -214,19 +262,13 @@ def test_continue_with_no_in_flight_raises_no_in_progress(
         service.init(continue_=True)
 
 
-def test_continue_routes_user_to_rescan_when_in_flight_is_rescan(
-    service: ProfileService, tmp_state: Path
-) -> None:
-    """If the journal holds an in-flight ``_RescanOp`` and the user
-    runs ``switcher init --continue``, raise RescanInProgressError
-    pointing at the rescan recovery surface rather than silently
-    refusing with a generic "wrong type" error.
-
+def _rescan_in_flight_record() -> _RescanOp:
+    """Shared in-flight record for the rescan-routing tests below.
     PR4 ships init's --continue/--abort; rescan's matching flags land
-    in PR5 (Phase 7), so the message is version-agnostic — it names
-    the COMMAND (rescan) but doesn't promise specific flag shapes the
-    PR4 binary doesn't expose. CR pass-6 major carry-forward."""
-    record = _RescanOp.model_validate(
+    in PR5 (Phase 7), so the error message names the COMMAND but not
+    specific flags. CR pass-6 major carry-forward; CR pass-PR-1 nit
+    (test-split) means continue and abort get their own test bodies."""
+    return _RescanOp.model_validate(
         {
             "op": "rescan",
             "started_at": _now(),
@@ -237,38 +279,49 @@ def test_continue_routes_user_to_rescan_when_in_flight_is_rescan(
             "mappings": [],
         }
     )
-    OpLogIO(tmp_state).append_record(record)
 
-    # Message names the rescan command but NOT specific flags (PR5
-    # ships those). Asserting both: "rescan" appears so the user knows
-    # which subsystem owns the in-flight record; "--continue/--abort"
-    # do NOT appear so a PR4 binary doesn't direct users at flags it
-    # can't satisfy.
-    with pytest.raises(RescanInProgressError) as excinfo_c:
+
+def test_continue_routes_user_to_rescan_when_in_flight_is_rescan(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """`switcher init --continue` with an in-flight ``_RescanOp`` raises
+    RescanInProgressError pointing at the rescan recovery surface (by
+    command name, not by flag — PR4 doesn't ship rescan's flags)."""
+    OpLogIO(tmp_state).append_record(_rescan_in_flight_record())
+
+    with pytest.raises(RescanInProgressError) as excinfo:
         service.init(continue_=True)
-    assert "rescan" in str(excinfo_c.value).lower()
-    assert "--continue" not in str(excinfo_c.value)
-    assert "--abort" not in str(excinfo_c.value)
-    with pytest.raises(RescanInProgressError) as excinfo_a:
-        service.init(abort=True)
-    assert "rescan" in str(excinfo_a.value).lower()
-    assert "--continue" not in str(excinfo_a.value)
-    assert "--abort" not in str(excinfo_a.value)
-    # Journal: rescan record still in flight after both refused calls.
+    msg = str(excinfo.value)
+    assert "rescan" in msg.lower()
+    assert "--continue" not in msg
+    assert "--abort" not in msg
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
-def test_continue_refuses_with_oplog_corrupt_on_unexpected_in_flight_type(
+def test_abort_routes_user_to_rescan_when_in_flight_is_rescan(
     service: ProfileService, tmp_state: Path
 ) -> None:
-    """If the journal holds an in-flight ``_RenameOp`` and the user
-    runs ``switcher init --continue/--abort``, refuse loudly with
-    ``OpLogCorruptError``. Reaching this state means a prior CLI
-    command's detection hook (which auto-compensates rename) didn't
-    run — likely a stale binary or a hand-edited journal. The
-    defensive refusal is documented in service.init's continue/abort
-    dispatch table."""
-    record = _RenameOp.model_validate(
+    """`switcher init --abort` with an in-flight ``_RescanOp`` raises
+    RescanInProgressError — same routing as --continue, symmetric
+    behavior. Separate test body per CR pass-PR-1 test-split nit."""
+    OpLogIO(tmp_state).append_record(_rescan_in_flight_record())
+
+    with pytest.raises(RescanInProgressError) as excinfo:
+        service.init(abort=True)
+    msg = str(excinfo.value)
+    assert "rescan" in msg.lower()
+    assert "--continue" not in msg
+    assert "--abort" not in msg
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def _rename_in_flight_record() -> _RenameOp:
+    """Shared in-flight record for the OpLogCorrupt tests below.
+    Reaching this state means a prior CLI command's detection hook
+    (which auto-compensates rename) didn't run — stale binary or
+    hand-edited journal. The defensive refusal is in service.init's
+    continue/abort dispatch table."""
+    return _RenameOp.model_validate(
         {
             "op": "rename",
             "started_at": _now(),
@@ -277,13 +330,31 @@ def test_continue_refuses_with_oplog_corrupt_on_unexpected_in_flight_type(
             "affected_ids": ["claude"],
         }
     )
-    OpLogIO(tmp_state).append_record(record)
+
+
+def test_continue_refuses_with_oplog_corrupt_on_unexpected_in_flight_type(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """`switcher init --continue` with an in-flight ``_RenameOp``
+    refuses loudly with OpLogCorruptError — the auto-compensation
+    contract for rename was violated, so manual recovery is required."""
+    OpLogIO(tmp_state).append_record(_rename_in_flight_record())
 
     with pytest.raises(OpLogCorruptError, match="unexpected in-flight op type"):
         service.init(continue_=True)
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_abort_refuses_with_oplog_corrupt_on_unexpected_in_flight_type(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """`switcher init --abort` with an in-flight ``_RenameOp`` refuses
+    with OpLogCorruptError — symmetric to --continue. Separate test
+    body per CR pass-PR-1 test-split nit."""
+    OpLogIO(tmp_state).append_record(_rename_in_flight_record())
+
     with pytest.raises(OpLogCorruptError, match="unexpected in-flight op type"):
         service.init(abort=True)
-    # Journal: rename record still in flight.
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
@@ -775,6 +846,52 @@ def test_continue_refuses_and_keeps_journal_when_current_profile_metadata_missin
     # (don't mutate when the recovery path can't actually heal).
     assert profile_dir.is_dir()
     assert claude_live.is_symlink()
+
+
+def test_continue_preflights_config_before_any_filesystem_mutation(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """``_compensate_init_continue`` must read config.json in its
+    validation pass — BEFORE move_or_seed_dir / swap_link / vanilla
+    create / credential seeding run. If config.json is malformed, the
+    StorageError must surface BEFORE any destructive work, leaving
+    the disk recoverable for a manual retry.
+
+    Symmetric to test_abort_preflights_config_before_any_filesystem_mutation.
+    Hermes pass-PR-1 blocker: previously continue would replay mappings
+    (convert live to a symlink), create profiles/vanilla, reseed
+    credentials, and only then call set_active_state — which loads
+    config.json. Malformed config raised StorageError half-way through,
+    leaving live converted but journal still in flight.
+    """
+    # Pre-state: untouched live dir, profile already created (so the
+    # short-circuit's metadata check passes), mapping classifies UNTOUCHED.
+    # This means short-circuit returns False (mapping not COMPLETE) and
+    # compensation runs.
+    claude_live = tmp_home / ".claude"
+    (claude_live / "settings.json").write_text('{"original": true}')
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
+    store.create("vanilla", {"claude": True})
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    # Corrupt config.json AFTER setup. set_active_state at the tail of
+    # compensation would otherwise raise StorageError ONLY after mutating
+    # live + creating profile content. Preflight should surface it now.
+    (tmp_state / "config.json").write_text("{not valid json")
+
+    with pytest.raises(StorageError):
+        service.init(continue_=True)
+
+    # Pre-mutation state preserved: live still a real dir, not converted
+    # to a symlink/junction by a half-applied swap_link.
+    assert claude_live.is_dir()
+    assert not service._resolver.is_link(claude_live)
+    assert (claude_live / "settings.json").read_text() == '{"original": true}'
+    # Journal stays in flight — no mark_completed reached.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
 def test_abort_preflights_config_before_any_filesystem_mutation(

@@ -1198,6 +1198,19 @@ class ProfileService:
         profile_dir = self._store.profile_dir(record.profile_name)
         vanilla_dir = self._store.profile_dir("vanilla")
 
+        # Preflight config.json BEFORE any FS mutation (Hermes pass-PR-1
+        # blocker, symmetric to _compensate_init_abort's pass-7 fix).
+        # Compensation's tail-end ``set_active_state`` loads config.json
+        # via ``_load_config``; a malformed config.json would raise
+        # StorageError there, but only AFTER replaying mappings
+        # (move_or_seed_dir, swap_link), creating/regenerating vanilla,
+        # and reseeding credentials. The half-applied state (live
+        # converted to a managed link, journal still in flight) is
+        # exactly what the abort-side preflight was designed to avoid.
+        # An early read forces the parse so corruption surfaces before
+        # any destructive work runs.
+        self._store.get_active()
+
         # First-pass validation (no FS mutation). Two checks, both
         # MUST run before any per-mapping mutation — otherwise a
         # corrupt vanilla profile dir would only surface AFTER live
@@ -1242,6 +1255,18 @@ class ProfileService:
                     f"Manual recovery required: delete {profile_dir} and "
                     f"re-run `switcher init --continue`."
                 ) from e
+        else:
+            # Earliest crash window (CR pass-PR-1 critical): the journal
+            # holds an intent for a profile the store never got to
+            # create. Without this branch the mapping replay below would
+            # mkdir profile_dir/<subdir> (via move_or_seed_dir) without
+            # writing metadata.json, leaving active[tid] = profile_name
+            # pointing at a dir that _store.get can't load — and the
+            # journal would be marked completed at the tail, clearing
+            # the recovery record. Recreate through the canonical store
+            # API so the post-recovery state matches what a clean init
+            # would have produced.
+            self._store.create(record.profile_name, dict.fromkeys(record.target_ids, True))
         for intent in record.mappings:
             target = profile_dir / intent.profile_subdir
             # Per-target shape refusal. `classify_mapping` returns
