@@ -528,7 +528,8 @@ def test_abort_short_circuits_when_already_completed(
     between continue and abort would silently reverse a committed init.
     """
     # Set up the post-set_active_state-pre-mark_completed shape: live
-    # is a symlink to a populated target, active map covers target_ids.
+    # is a symlink to a populated target, vanilla profile exists,
+    # active map covers target_ids.
     claude_live = tmp_home / ".claude"
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
@@ -538,6 +539,11 @@ def test_abort_short_circuits_when_already_completed(
     target.mkdir(parents=True)
     (target / "settings.json").write_text('{"committed": true}')
     _symlink_dir(target, claude_live)
+    # Vanilla profile is part of the "fully completed" shape — without
+    # it, _check_init_already_completed correctly returns False and we
+    # fall through to compensation. See
+    # test_continue_does_not_short_circuit_when_vanilla_is_missing.
+    store.create("vanilla", {"claude": True})
     store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
     record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
     OpLogIO(tmp_state).append_record(record)
@@ -549,6 +555,7 @@ def test_abort_short_circuits_when_already_completed(
     assert claude_live.is_symlink()
     assert (target / "settings.json").read_text() == '{"committed": true}'
     assert profile_dir.exists()
+    assert store.profile_dir("vanilla").is_dir()
     assert store.get_active().get("claude") == profile_name
     # Journal: record marked completed (next vacuum drops it).
     assert OpLogIO(tmp_state).read_in_flight() is None
@@ -648,6 +655,48 @@ def test_abort_idempotent_second_call_raises_no_in_progress(
     assert (claude_live / "settings.json").exists() is False  # live untouched (was empty)
     with pytest.raises(NoInProgressInitError):
         service.init(abort=True)
+
+
+def test_continue_does_not_short_circuit_when_vanilla_is_missing(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """The "committed but log-unmarked" short-circuit must require
+    BOTH the dated-current AND the vanilla profile dirs to be present.
+
+    Vanilla is part of the init workflow (step 6), so a missing
+    vanilla means the work isn't fully complete. Short-circuiting
+    here would mark the journal completed and skip the vanilla
+    recovery step — leaving state that recovery considers "done" but
+    is actually incomplete.
+
+    Test stages every other completion signal (mapping COMPLETE,
+    active map covers target_ids) BUT deletes the vanilla profile.
+    Continue must fall through to compensation, which re-creates
+    vanilla."""
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
+    # Don't create vanilla. _check_init_already_completed sees mapping
+    # COMPLETE + active matches BUT vanilla missing → return False →
+    # continue runs the compensation path → vanilla gets created.
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(continue_=True)
+
+    # Vanilla was created by the fallthrough path.
+    assert store.profile_dir("vanilla").is_dir()
+    # Mapping still COMPLETE; live still symlinked; record completed.
+    assert claude_live.is_symlink()
+    assert (target / "settings.json").read_text() == '{"committed": true}'
+    assert OpLogIO(tmp_state).read_in_flight() is None
 
 
 def test_continue_refuses_when_target_subdir_is_symlink(

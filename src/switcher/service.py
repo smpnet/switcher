@@ -973,16 +973,36 @@ class ProfileService:
 
     def _check_init_already_completed(self, record: _InitOp) -> bool:
         """Return True if the init's work is fully visible on disk: every
-        mapping classifies COMPLETE AND active.keys() covers target_ids.
+        mapping classifies COMPLETE, active.keys() covers target_ids,
+        AND both profile dirs (dated-current + vanilla) are real
+        directories.
 
-        Spec §2.2 "committed but log-unmarked" path — a crash between the
-        final ``set_active_state`` and ``mark_completed`` leaves the disk
-        consistent but the journal stale. Continue/abort against this
-        state should be a no-op apart from marking the record completed.
+        Spec §2.2 "committed but log-unmarked" path — a crash between
+        the final ``set_active_state`` and ``mark_completed`` leaves
+        the disk consistent but the journal stale. Continue/abort
+        against this state should be a no-op apart from marking the
+        record completed.
+
+        Vanilla is part of the init workflow (step 6 in the normal
+        path), so a missing-or-corrupt vanilla profile means the work
+        ISN'T fully complete — the short-circuit must NOT fire there,
+        or continue would mark the journal completed and skip the
+        vanilla-recovery step. Falling through to
+        ``_compensate_init_continue`` re-creates a missing vanilla and
+        re-runs credential seeding; falling through to
+        ``_compensate_init_abort`` surfaces a corrupt vanilla as
+        OpLogCorruptError in its validation pass.
+
+        The profile-dir checks reject link shapes too: ``is_dir()``
+        follows symlinks, so a symlink-to-dir at either profile path
+        satisfies it alone — without the explicit ``is_link`` refusal
+        we'd bless an externally-mutated profile shape as healthy.
         """
+        for name in (record.profile_name, "vanilla"):
+            p = self._store.profile_dir(name)
+            if self._resolver.is_link(p) or not p.is_dir():
+                return False
         profile_dir = self._store.profile_dir(record.profile_name)
-        if not profile_dir.is_dir():
-            return False
         for intent in record.mappings:
             if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
                 return False
