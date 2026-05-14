@@ -1061,8 +1061,18 @@ class ProfileService:
         for intent in record.mappings:
             if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
                 return False
-        active = self._store.get_active()
-        if not all(active.get(tid) == record.profile_name for tid in record.target_ids):
+        # Active invariant: dict equality, not subset. A clean init's
+        # `set_active_state(active, ...)` REPLACES the active map with
+        # `{tid: profile_name for tid in target_ids}` — no leftover
+        # keys. An extra entry on disk (e.g., a stale entry from a
+        # previous init that didn't get cleaned up, or external
+        # mutation since intent) is drift; short-circuiting would mark
+        # the journal completed and let the stale entry survive
+        # indefinitely. The check mirrors the cache invariant below;
+        # both maps come out of the same atomic set_active_state
+        # write, so they should have the same exactness contract.
+        expected_active = dict.fromkeys(record.target_ids, record.profile_name)
+        if self._store.get_active() != expected_active:
             return False
         # Cache invariant: actual_cache must equal the journal's
         # expected non-empty slice exactly. Dict equality catches both

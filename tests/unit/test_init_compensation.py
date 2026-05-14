@@ -695,6 +695,51 @@ def test_continue_does_not_short_circuit_when_cache_is_stale(
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_continue_does_not_short_circuit_when_active_has_extra_entry(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Active map invariant: dict equality, not subset. A clean
+    init's ``set_active_state`` REPLACES the active map, so an
+    extra entry on disk is drift since intent (external mutation,
+    previous-run residue). Short-circuiting under that drift would
+    mark the journal completed and let the stale entry survive.
+
+    Test stages every other completion signal (mapping COMPLETE,
+    matching cache, vanilla present) BUT plants an EXTRA active
+    entry for a tool the journal doesn't reference. Continue must
+    fall through to compensation, which REPLACES the active map
+    with target_ids only."""
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    store.create("vanilla", {"claude": True})
+    # Active map carries the legitimate "claude" entry AND an extra
+    # "stale-tool" entry that target_ids doesn't reference. Cache
+    # mirrors the expectation only for claude. Short-circuit MUST
+    # fall through.
+    store.set_active_state(
+        {"claude": profile_name, "stale-tool": profile_name},
+        {"claude": [str(claude_live)]},
+    )
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(continue_=True)
+
+    # Compensation REPLACED active — only claude remains.
+    active = store.get_active()
+    assert active == {"claude": profile_name}, (
+        f"continue should have replaced active with target_ids only; got {active!r}"
+    )
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
 def test_continue_does_not_short_circuit_when_zero_mapping_tool_has_stale_cache(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
