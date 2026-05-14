@@ -532,6 +532,33 @@ def test_init_abort_with_filter_flag_rejected(
 # Dispatch ordering ---------------------------------------------------------
 
 
+def test_init_continue_vacuum_does_not_affect_in_flight_dispatch(
+    patched_deps: _FakeDeps,
+) -> None:
+    """abby pass-9 concern push-back: ``vacuum_completed`` before
+    ``service.init`` cannot drop an in-flight record, because vacuum
+    only acts on records where ``completed_at is not None`` (see
+    OpLogIO.vacuum_completed). ``read_in_flight`` filters on
+    ``completed_at is None`` independently — so the
+    InitAlreadyCompletedReport path (which fires when read_in_flight
+    returns a non-None record AND on-disk invariants match completed
+    state) is unaffected by vacuum timing.
+
+    Lock this contract: with a fake oplog that returns an _InitOp from
+    read_in_flight regardless of vacuum calls, the recovery dispatch
+    must still see the in-flight record and call service.init."""
+    patched_deps.oplog.in_flight = _init_record()
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--continue"])
+    assert result.exit_code == 0, _combined(result)
+    # vacuum_completed ran first (journal hygiene); read_in_flight
+    # observed the in-flight record AFTER vacuum.
+    assert patched_deps.oplog.calls == ["vacuum_completed", "read_in_flight"]
+    # Dispatch reached service.init with the recovery flag, not
+    # short-circuited via NoInProgressInitError.
+    assert len(patched_deps.service.init_calls) == 1
+
+
 def test_init_continue_dispatches_to_service_with_in_flight(
     patched_deps: _FakeDeps,
 ) -> None:

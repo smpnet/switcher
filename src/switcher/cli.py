@@ -553,6 +553,18 @@ def init(
         # RescanInProgressError / OpLogCorruptError / AbortPreflightError
         # — all SwitcherError subclasses that handle_errors routes
         # through err_console.
+        # vacuum_completed CANNOT drop the in-flight record this
+        # recovery path consumes (abby pass-9 concern push-back):
+        # vacuum acts only on records where `completed_at is not None`
+        # (oplog.py:vacuum_completed), and `read_in_flight` filters on
+        # `completed_at is None` independently. So a record that's
+        # still in-flight at recovery time survives vacuum; a record
+        # already mark_completed'd is invisible to `read_in_flight`
+        # regardless of vacuum, so the user-facing outcome
+        # (NoInProgressInitError on the post-mark_completed crash
+        # window) is unchanged. Vacuum is here purely as journal
+        # hygiene — drops stale completed records before the
+        # recovery dispatch reads.
         deps.oplog.vacuum_completed()
         in_flight = deps.oplog.read_in_flight()
         if isinstance(in_flight, _RenameOp):
