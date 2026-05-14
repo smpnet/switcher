@@ -756,13 +756,20 @@ class ProfileService:
 
         **Return-shape note (v0.1.5):** the default path returns an
         ``InitReport`` as before. The recovery path
-        (``continue_=True`` / ``abort=True``) returns ``None`` because
-        no fresh init happened — the call drove ``_compensate_init_*``
-        against an already-in-flight journal record. The ``@overload``
-        above keeps the default-args call site typed as
-        ``-> InitReport``; direct callers that pass either flag get
-        ``-> InitReport | None`` and must handle the recovery branch
-        explicitly.
+        (``continue_=True`` / ``abort=True``) returns one of:
+
+          - ``InitAlreadyCompletedReport`` — short-circuit fired
+            (journal was committed but log-unmarked; mark_completed
+            ran without invoking compensation). ``kind`` distinguishes
+            continue vs abort so the CLI can tailor the message.
+          - ``None`` — compensation actually ran (continue replayed
+            mappings and steps 6-7, or abort reversed mappings and
+            cleaned up active/cache).
+
+        The ``@overload`` above keeps the default-args call site
+        typed as ``-> InitReport``; direct callers that pass either
+        flag get ``-> InitReport | InitAlreadyCompletedReport | None``
+        and must handle the three-shape union explicitly.
 
         target_ids:
           None — capture every detected tool (v0.1.3 default-path behavior,

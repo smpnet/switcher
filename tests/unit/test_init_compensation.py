@@ -310,6 +310,27 @@ def test_abort_rejects_call_site_diff_list_args(
 # -- writer-side journal hygiene ---------------------------------------------
 
 
+def test_init_writes_intent_and_marks_completed(service: ProfileService, tmp_state: Path) -> None:
+    """Happy path: a fresh ``service.init()`` writes an ``_InitOp``
+    intent record before any FS mutation, then marks it completed
+    after the final ``set_active_state``. ``vacuum_completed`` drops
+    the completed record afterwards.
+
+    Mirrors ``test_rename_writes_intent_and_marks_completed`` —
+    catches regressions to the writer-side journaling that the
+    compensation matrix tests would only surface obliquely (by
+    accidentally seeing one journal record instead of zero)."""
+    service.init()
+
+    oplog = OpLogIO(tmp_state)
+    records = oplog.read_records()
+    assert len(records) == 1
+    assert records[0].op == "init"
+    assert records[0].completed_at is not None
+    oplog.vacuum_completed()
+    assert oplog.read_records() == []
+
+
 def test_init_cancels_intent_on_pre_mutation_create_failure(
     service: ProfileService, tmp_state: Path
 ) -> None:
