@@ -1178,16 +1178,26 @@ class ProfileService:
         # store.rename or relinking (CodeRabbit recurring review).
         # is_dir() narrows existence to "actual profile directory";
         # anything else (file, broken link, special) is corruption.
-        if from_path.exists() and not from_path.is_dir():
-            raise OpLogCorruptError(
-                f"interrupted rename {record.from_!r} -> {record.to!r}: "
-                f"{from_path} exists but is not a directory; manual recovery required"
-            )
-        if to_path.exists() and not to_path.is_dir():
-            raise OpLogCorruptError(
-                f"interrupted rename {record.from_!r} -> {record.to!r}: "
-                f"{to_path} exists but is not a directory; manual recovery required"
-            )
+        #
+        # is_dir() ALSO follows symlinks / Windows junctions through to
+        # their target — so a hand-edited profile dir that's actually a
+        # symlink pointing at an unrelated dir would slip past as
+        # "valid". Reject any link shape (cross-platform via
+        # `_resolver.is_link`) before the .is_dir() narrow (CodeRabbit
+        # PR review). The profile store invariant is "profile_dir is a
+        # real directory"; anything else came from outside switcher.
+        for label, path in (("from", from_path), ("to", to_path)):
+            if self._resolver.is_link(path):
+                raise OpLogCorruptError(
+                    f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                    f"{path} ({label}) is a symlink or junction, not a real "
+                    f"profile directory; manual recovery required"
+                )
+            if path.exists() and not path.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                    f"{path} exists but is not a directory; manual recovery required"
+                )
         from_dir_exists = from_path.is_dir()
         to_dir_exists = to_path.is_dir()
 
@@ -1230,25 +1240,33 @@ class ProfileService:
                         f"{live} exists but is not a directory; cannot relink"
                     )
 
-        # Drift guard: every id captured in record.affected_ids must
-        # currently map to either `from_` (pre-step-2 state) or `to`
-        # (post-step-2 state). Anything else — third profile,
-        # missing entry — is external mutation between intent-write and
-        # compensation, NOT a recovery state the journal predicted.
-        # Silently skipping those entries would clear the journal while
-        # leaving the rename only partially reconciled: the third-profile
-        # pointer survives, the user's original rename intent is
-        # forgotten (reviewer convergence: abby blocking + CodeRabbit
-        # recurring).
+        # Drift guards (run BEFORE the store.rename replay so a corrupt
+        # journal doesn't trigger further canonical-state mutation):
+        # the active map's affected slice must be in a coherent rename
+        # phase, and no UNEXPECTED active entries may reference either
+        # endpoint of the rename. The real `service.rename` sequence is
         #
-        # Runs BEFORE the store.rename replay (abby blocking pass 9):
-        # the replay mutates canonical state, and a drift-detected
-        # journal must NOT trigger further mutation. Otherwise an
-        # "intent written, store.rename never ran, active drifted"
-        # crash would turn into a different partial state (from dir
-        # gone, to dir created) before refusing — making manual
-        # recovery harder, not easier.
+        #   (1) store.rename(old, new)                  # profile dir move
+        #   (2) for tid in affected_ids: active[tid]=new  # in-memory rewrite
+        #   (3) store.set_active(active)                # atomic persist
+        #   (4) swap_link loop                          # live link relink
+        #
+        # The legitimate post-crash phases are therefore:
+        #   A. pre-(1): from dir exists, all affected at `from_`
+        #   B. post-(1) pre-(3): to dir exists, all affected at `from_`
+        #   C. post-(3): to dir exists, all affected at `to_`
+        # Anything else (mixed affected, affected at `to_` while from
+        # dir still exists, third-profile drift, unexpected extra refs
+        # to `from_/to_` outside affected_ids) cannot come from the
+        # real rename sequence. Auto-healing it would silently drop the
+        # user's original intent or bless externally-mutated state as
+        # recovered. Refuse loudly and leave the intent in flight.
+        # Hermes PR review convergence with CodeRabbit's earlier
+        # plateau on the same surface.
         active = dict(self._store.get_active())
+        affected_set = set(record.affected_ids)
+
+        # 1. Affected slice must live entirely within {from_, to}.
         drifted = {
             tid: active.get(tid)
             for tid in record.affected_ids
@@ -1259,6 +1277,54 @@ class ProfileService:
                 f"interrupted rename {record.from_!r} -> {record.to!r}: "
                 f"affected active-map entries drifted outside the expected "
                 f"{{{record.from_!r}, {record.to!r}}} set: {drifted!r}. "
+                f"Manual recovery required."
+            )
+
+        # 2. Phase coherence: every affected_id must be at the SAME
+        #    endpoint — `set_active` is atomic, so a split affected
+        #    set cannot be produced by the real rename sequence.
+        affected_phase = {active[tid] for tid in record.affected_ids}
+        if len(affected_phase) > 1:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"affected active-map entries are split across both endpoints "
+                f"{affected_phase!r} — `set_active` is atomic so this state "
+                f"cannot come from the real rename sequence. Manual recovery "
+                f"required."
+            )
+
+        # 3. from_dir_exists implies pre-(1): no affected entry should
+        #    already point at `to`. Affected-at-`to_` means step (2)
+        #    ran, which in turn means step (1) ran first — so `from`
+        #    dir must be gone. Seeing both is externally-mutated state.
+        if from_dir_exists and record.to in affected_phase:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"source dir {from_path} still exists, yet affected active-map "
+                f"entries already reference {record.to!r}. step (2) of the "
+                f"rename runs after step (1); this phase is unreachable from "
+                f"the real sequence. Manual recovery required."
+            )
+
+        # 4. No tool outside `affected_ids` may reference either rename
+        #    endpoint. Such an entry was not part of the journal's
+        #    "what to recover" snapshot: rolling the rename forward
+        #    would leave it pointing at `from_` (a profile name that's
+        #    about to disappear) or pre-bless a `to`-reference that
+        #    came from somewhere else. Either way, the journal would
+        #    get marked completed while canonical state remains
+        #    inconsistent (Hermes PR review robustness gap; CodeRabbit
+        #    recurring).
+        extra_refs = {
+            tid: profile
+            for tid, profile in active.items()
+            if tid not in affected_set and profile in {record.from_, record.to}
+        }
+        if extra_refs:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"active-map entries outside record.affected_ids still "
+                f"reference one of the rename endpoints: {extra_refs!r}. "
                 f"Manual recovery required."
             )
 

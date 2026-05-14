@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from switcher.errors import OpLogCorruptError, PathNotADirectoryError, ProfileExistsError
+from switcher.links import remove_link
 from switcher.models import Tool
 from switcher.oplog import OpLogIO, _RenameOp
 from switcher.paths import PathResolver
@@ -60,7 +61,15 @@ def test_compensate_rename_rolls_forward_when_intent_written_before_store_rename
     drop the user's rename request after the intent record committed to it.
     """
     name = service.init().profile_name
-    record = _make_record(name, "client-A", affected=[])
+    # Conftest seeds multiple tools (claude/copilot/github-copilot) all
+    # at `name` after init. Real `service.rename` would compute
+    # affected_ids = every tid with active[tid] == name. Mirror that
+    # snapshot in the test record so the new phase-coherence /
+    # extra-ref drift guards see a legitimate pre-step-1 state.
+    affected = sorted(
+        tid for tid, profile in FileProfileStore(tmp_state).get_active().items() if profile == name
+    )
+    record = _make_record(name, "client-A", affected=affected)
     oplog = OpLogIO(tmp_state)
     oplog.append_record(record)
     service._compensate_rename(record)
@@ -114,7 +123,10 @@ def test_compensate_rename_step1_done_step2_pending(
     cfg["active"] = dict.fromkeys(cfg["active"], name)
     cfg["active_live_paths"] = {}
     config_path.write_text(json.dumps(cfg))
-    record = _make_record(name, "client-A", affected=["claude"])
+    # affected_ids snapshot must cover EVERY tid the real
+    # `service.rename` would have captured (extra-refs guard).
+    affected = sorted(cfg["active"].keys())
+    record = _make_record(name, "client-A", affected=affected)
     oplog = OpLogIO(tmp_state)
     oplog.append_record(record)
     service._compensate_rename(record)
@@ -155,7 +167,12 @@ def test_compensate_rename_idempotent_when_already_complete(
     name = service.init().profile_name
     service.rename(name, "client-A")
     OpLogIO(tmp_state).vacuum_completed()
-    record = _make_record(name, "client-A", affected=["claude"])
+    # affected_ids must mirror every tid that was at `name` pre-rename
+    # (every tool the conftest seeded). After service.rename, those
+    # entries now point at "client-A"; the journal record's
+    # affected_ids snapshot must match the real-rename invariant.
+    affected = sorted(FileProfileStore(tmp_state).get_active().keys())
+    record = _make_record(name, "client-A", affected=affected)
     oplog = OpLogIO(tmp_state)
     oplog.append_record(record)
     service._compensate_rename(record)
@@ -179,7 +196,11 @@ def test_compensate_rename_handles_orphan_tool_ids(
     cfg = json.loads(config_path.read_text())
     cfg["active"]["unknown_tool"] = name
     config_path.write_text(json.dumps(cfg))
-    record = _make_record(name, "client-A", affected=["unknown_tool"])
+    # affected_ids covers every active tid pointing at `name` —
+    # the orphan and the conftest-seeded registered tools (extra-refs
+    # guard requires the snapshot to be exhaustive).
+    affected = sorted(tid for tid, profile in cfg["active"].items() if profile == name)
+    record = _make_record(name, "client-A", affected=affected)
     oplog = OpLogIO(tmp_state)
     oplog.append_record(record)
     service._compensate_rename(record)
@@ -208,18 +229,21 @@ def test_compensate_rename_refuses_when_live_path_is_real_dir(
     cfg["active"] = dict.fromkeys(cfg["active"], name)
     cfg["active_live_paths"] = {}
     config_path.write_text(json.dumps(cfg))
-    # User intervened: the live symlink was unlinked and replaced with a
-    # real directory between the crash and our compensation pass.
+    # User intervened: the live link was replaced with a real directory
+    # between the crash and our compensation pass. Use the project's
+    # link helpers — `Path.is_symlink()` returns False on Windows
+    # junctions, so the prior shutil.rmtree path would either delete
+    # THROUGH the junction (leaving the junction intact) or refuse,
+    # then fail the subsequent mkdir with FileExistsError (Windows CI
+    # blocker on 25858754403; CodeRabbit review).
     claude_live = tmp_home / ".claude"
-    if claude_live.is_symlink():
-        claude_live.unlink()
+    if service._resolver.is_link(claude_live):
+        remove_link(claude_live)
+    elif claude_live.is_dir():
+        shutil.rmtree(claude_live)
     elif claude_live.exists():
-        # Original conftest fixture seeded a real dir; remove the link/dir
-        # however it lands so we can pre-stage the bad shape.
-        if claude_live.is_dir():
-            shutil.rmtree(claude_live)
-        else:
-            claude_live.unlink()
+        claude_live.unlink()
+    assert not claude_live.exists()
     claude_live.mkdir()
     record = _make_record(name, "client-A", affected=["claude"])
     oplog = OpLogIO(tmp_state)
@@ -337,6 +361,121 @@ def test_compensate_rename_refuses_when_affected_id_missing_from_active(
     with pytest.raises(OpLogCorruptError):
         service._compensate_rename(record)
     assert oplog.read_in_flight() is not None
+
+
+def test_compensate_rename_refuses_when_affected_set_split_across_endpoints(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """`store.set_active` is atomic — a real rename can't produce an
+    active map where some affected_ids point at `from_` and others at
+    `to`. Reject the split state as corruption (Hermes PR review).
+    Stages two managed tools, then hand-edits the active map to put one
+    of them at the post-rename name while the other stays at the
+    pre-rename name."""
+    name = service.init().profile_name
+    # Add a second managed tool so affected_ids has >1 entry to split.
+    store_pre = FileProfileStore(tmp_state)
+    active_pre = dict(store_pre.get_active())
+    active_pre["copilot"] = name
+    store_pre.set_active(active_pre)
+    # Post-step-1 dir state: store.rename has run.
+    store_pre.rename(name, "client-A")
+    # Split phase: claude at old, copilot at new.
+    config_path = tmp_state / "config.json"
+    cfg = json.loads(config_path.read_text())
+    cfg["active"] = {"claude": name, "copilot": "client-A"}
+    cfg["active_live_paths"] = {}
+    config_path.write_text(json.dumps(cfg))
+    record = _make_record(name, "client-A", affected=["claude", "copilot"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
+    with pytest.raises(OpLogCorruptError, match="split"):
+        service._compensate_rename(record)
+    assert oplog.read_in_flight() is not None
+
+
+def test_compensate_rename_refuses_when_from_dir_exists_but_affected_at_to(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """Phase coherence: if the `from` dir still exists, step (1) of the
+    real rename sequence never finished, so step (2) (in-memory
+    active rewrite) couldn't have run. Any affected_id already
+    pointing at `to` is therefore externally mutated state, not a
+    crash window the journal predicted (Hermes PR review)."""
+    name = service.init().profile_name
+    # Pre-step-1 dir state: `from` dir still exists (no store.rename).
+    # But the active map already references `to` for the affected id.
+    config_path = tmp_state / "config.json"
+    cfg = json.loads(config_path.read_text())
+    cfg["active"] = {"claude": "client-A"}  # ahead of dir state
+    cfg["active_live_paths"] = {}
+    config_path.write_text(json.dumps(cfg))
+    # Need profile_dir("client-A") to NOT exist for the from-only branch
+    # to engage. (init() only created the current-named profile.)
+    record = _make_record(name, "client-A", affected=["claude"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
+    with pytest.raises(OpLogCorruptError):
+        service._compensate_rename(record)
+    assert oplog.read_in_flight() is not None
+    # Source dir untouched: drift guard ran before store.rename replay.
+    assert FileProfileStore(tmp_state).profile_dir(name).exists()
+
+
+def test_compensate_rename_refuses_extra_active_refs_outside_affected_ids(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """A tool outside record.affected_ids that still references the
+    rename's source or target profile is corruption that compensation
+    must not silently bless (Hermes PR review robustness gap;
+    CodeRabbit recurring). The journal's affected_ids snapshot is what
+    the compensation knows to repair; an unexpected extra reference
+    would survive the rename pointing at a profile name that's about
+    to disappear (or pre-claim the destination)."""
+    name = service.init().profile_name
+    # Add an unmanaged tool's active entry that points at the same
+    # profile but isn't in affected_ids. Hand-edit it in.
+    store_pre = FileProfileStore(tmp_state)
+    store_pre.rename(name, "client-A")  # post-step-1 dir state
+    config_path = tmp_state / "config.json"
+    cfg = json.loads(config_path.read_text())
+    # claude is in affected_ids; copilot is an unexpected extra ref.
+    cfg["active"] = {"claude": name, "copilot": name}
+    cfg["active_live_paths"] = {}
+    config_path.write_text(json.dumps(cfg))
+    record = _make_record(name, "client-A", affected=["claude"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
+    with pytest.raises(OpLogCorruptError, match=r"outside record\.affected_ids"):
+        service._compensate_rename(record)
+    assert oplog.read_in_flight() is not None
+
+
+def test_compensate_rename_refuses_when_profile_dir_is_symlink(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """The profile store invariant is 'profile_dir is a real directory'.
+    A symlink (or Windows junction) at profile_dir(from_) — pointing
+    anywhere — is external mutation and must not be auto-healed
+    (CodeRabbit PR review). is_dir() alone follows symlinks through to
+    the target, so we'd otherwise treat a redirected profile dir as
+    valid recovery state."""
+    name = service.init().profile_name
+    # Replace the profile dir with a symlink pointing at the same path's
+    # contents copied elsewhere. Easier: just unlink and symlink-to a
+    # newly created sibling dir.
+    profile_dir = FileProfileStore(tmp_state).profile_dir(name)
+    shadow = tmp_state / "shadow"
+    shutil.move(str(profile_dir), str(shadow))
+    try:
+        profile_dir.symlink_to(shadow)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted (likely Windows without Developer Mode)")
+    record = _make_record(name, "client-A", affected=["claude"])
+    oplog = OpLogIO(tmp_state)
+    oplog.append_record(record)
+    with pytest.raises(OpLogCorruptError, match="symlink or junction"):
+        service._compensate_rename(record)
 
 
 def test_rename_writes_intent_and_marks_completed(service: ProfileService, tmp_state: Path) -> None:
