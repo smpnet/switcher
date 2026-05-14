@@ -1267,8 +1267,40 @@ class ProfileService:
         # before any mutation ran. Idempotent on a vanilla profile
         # that already exists (e.g. init crashed AFTER vanilla
         # creation but BEFORE set_active_state).
+        #
+        # Empty-leftover repair (CR pass-3 major): a mkdir-only
+        # leftover from a ``_store.create("vanilla", ...)`` failure
+        # whose ``shutil.rmtree(d, ignore_errors=True)`` rollback was
+        # silenced (rare Windows file-lock window) leaves the dir
+        # without metadata.json. Treat empty dirs as "needs
+        # regeneration" — delete + recreate through the canonical
+        # store API. Dirs with content but no metadata are too risky
+        # to overwrite (could nuke user data); surface those as
+        # OpLogCorruptError so the user manually inspects. Validating
+        # vanilla as a profile (not just a directory) is the narrower
+        # form of CR's pass-2 metadata concern — scoped here because
+        # compensation CAN heal vanilla (we own its content) but
+        # CANNOT regenerate the dated-current profile (holds user
+        # data captured from live dirs).
         if not vanilla_dir.is_dir():
             self._store.create("vanilla", dict.fromkeys(record.target_ids, True))
+        else:
+            try:
+                self._store.get("vanilla")
+            except (UnknownProfileError, StorageError) as e:
+                # Empty leftover: safe to delete + recreate.
+                if not any(vanilla_dir.iterdir()):
+                    self._store.delete("vanilla")
+                    self._store.create("vanilla", dict.fromkeys(record.target_ids, True))
+                else:
+                    raise OpLogCorruptError(
+                        f"interrupted init continue: 'vanilla' profile at "
+                        f"{vanilla_dir} has no readable metadata.json but "
+                        f"contains other files; refusing to overwrite. "
+                        f"Manual recovery required: inspect {vanilla_dir} "
+                        f"and either delete it or restore metadata.json "
+                        f"before re-running `switcher init --continue`."
+                    ) from e
         for tid in record.target_ids:
             tool = find_tool(self._registry, tid)
             if tool is None:

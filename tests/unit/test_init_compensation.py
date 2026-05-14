@@ -366,14 +366,16 @@ def test_init_preserves_intent_on_post_mutation_failure(
     drive the recovery surface. The cancel scope is narrow on purpose:
     only the pre-mutation ProfileExistsError window triggers it."""
     real_capture = service._capture_tool
+    call_count = 0
 
     def _failing_capture(profile: str, tool: object) -> list[str]:
-        # Run the real capture for the first call so we leave actual
-        # post-mutation state behind, then fail on the second call to
-        # exit init mid-loop. Without real mutation, the test would be
-        # exercising the pre-mutation path again.
-        if not getattr(_failing_capture, "_fired", False):
-            _failing_capture._fired = True  # type: ignore[attr-defined]
+        # First call runs the real capture so post-mutation state lands
+        # on disk; the second call fails to exit init mid-loop. Without
+        # the real mutation on call 1, the test would be exercising the
+        # pre-mutation path again.
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
             return real_capture(profile, tool)  # type: ignore[arg-type]
         raise OSError("simulated post-create failure")
 
@@ -646,6 +648,71 @@ def test_abort_short_circuits_when_already_completed(
     assert store.get_active().get("claude") == profile_name
     # Journal: record marked completed (next vacuum drops it).
     assert OpLogIO(tmp_state).read_in_flight() is None
+
+
+def test_continue_regenerates_vanilla_when_empty_leftover_dir(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Vanilla profile dir present but empty (no metadata.json) =
+    mkdir-only leftover from a ``_store.create("vanilla", ...)``
+    failure whose rollback was silenced (rmtree-ignore-errors window).
+    Continue MUST detect this case and regenerate vanilla through the
+    canonical ``_store.create`` path instead of treating an empty
+    leftover as a healthy profile.
+
+    Without this, the next ``switcher use`` would surface
+    UnknownProfileError on what looked like a successful recovery.
+    CR pass-3 major (narrower restatement of the pass-2 metadata
+    concern, scoped to vanilla where compensation CAN heal — the
+    dir is in our control, unlike the dated-current profile which
+    holds user data we cannot regenerate).
+    """
+    claude_live = tmp_home / ".claude"
+    (claude_live / "user-data.json").write_text('{"user": true}')
+    profile_name = "2026-05-12-current"
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+    # Set up the partial state: empty vanilla profile dir (mkdir-only
+    # leftover), nothing else. _compensate_init_continue will:
+    # 1. validate profile-dir shapes (vanilla dir exists, not link → ok)
+    # 2. run per-mapping mutation (live → target migration)
+    # 3. reach the vanilla check: dir exists but no metadata → recreate.
+    store = FileProfileStore(tmp_state)
+    vanilla_dir = store.profile_dir("vanilla")
+    vanilla_dir.mkdir(parents=True)
+
+    service.init(continue_=True)
+
+    # Vanilla regenerated through store.create — metadata.json now
+    # exists and store.get returns a valid Profile.
+    profile = store.get("vanilla")
+    assert profile.name == "vanilla"
+    assert profile.tools == {"claude": True}
+
+
+def test_continue_refuses_vanilla_with_data_but_no_metadata(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Vanilla profile dir with content but no metadata.json is
+    unsafe to auto-regenerate: that would silently overwrite the
+    user's data. Refuse loudly so the user manually inspects.
+    Distinct from the empty-leftover case above.
+    """
+    claude_live = tmp_home / ".claude"
+    (claude_live / "user-data.json").write_text('{"user": true}')
+    profile_name = "2026-05-12-current"
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+    store = FileProfileStore(tmp_state)
+    vanilla_dir = store.profile_dir("vanilla")
+    vanilla_dir.mkdir(parents=True)
+    (vanilla_dir / "stray-content.txt").write_text("user file we cannot lose")
+
+    with pytest.raises(OpLogCorruptError, match="vanilla"):
+        service.init(continue_=True)
+    # Refusal happens BEFORE mark_completed: journal record stays in
+    # flight so the user can retry after manual cleanup.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
 def test_continue_serializes_empty_cache_entry_for_zero_mapping_tool(
