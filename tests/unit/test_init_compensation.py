@@ -773,6 +773,49 @@ def test_abort_clears_active_and_cache_for_target_ids(
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_abort_preserves_unrelated_zero_mapping_cache_entry(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A zero-mapping tool unrelated to the in-flight init has its
+    cache serialized as ``[]``. Abort's cleanup must preserve that
+    entry on disk — without the raw accessor, ``get_active_live_paths``
+    would have normalized ``[]`` to absent and the rewrite would have
+    silently dropped the key. External state outside
+    ``record.target_ids`` MUST stay untouched."""
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"data": true}')
+    _symlink_dir(target, claude_live)
+    store.create("vanilla", {"claude": True})
+    # Stage: active has "claude" (the journal's target_id) AND
+    # "registry-only-tool" (unrelated, zero-mapping). cache has
+    # "claude": [path] AND "registry-only-tool": []. Abort's cleanup
+    # should clear "claude" and leave "registry-only-tool": [] alone.
+    store.set_active_state(
+        {"claude": profile_name, "registry-only-tool": "other-profile"},
+        {"claude": [str(claude_live)], "registry-only-tool": []},
+    )
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(abort=True)
+
+    # External state preserved: active still has the unrelated entry,
+    # cache still serializes [] for the unrelated zero-mapping tool.
+    config = json.loads((tmp_state / "config.json").read_text())
+    assert config["active"].get("registry-only-tool") == "other-profile"
+    assert "registry-only-tool" in config["active_live_paths"]
+    assert config["active_live_paths"]["registry-only-tool"] == []
+    # Owned target_id cleared.
+    assert "claude" not in config["active"]
+    assert "claude" not in config["active_live_paths"]
+
+
 def test_abort_idempotent_second_call_raises_no_in_progress(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

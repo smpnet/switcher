@@ -1448,13 +1448,22 @@ class ProfileService:
         # that's no longer a switcher symlink. Clear ONLY the
         # target_ids this run owns — external state outside the
         # journal's target_ids snapshot stays untouched (mirrors
-        # rename's orphan-tolerance contract and respects the
-        # consultant's "abort surfaces externally-mutated state
-        # for inspection" stance). `.pop(_, None)` is the safe
-        # idempotent form: tids that never landed in active/cache
-        # (crash before `set_active_state`) skip cleanly.
+        # rename's orphan-tolerance contract and respects the spec's
+        # "abort surfaces externally-mutated state for inspection"
+        # stance). `.pop(_, None)` is the safe idempotent form:
+        # tids that never landed in active/cache (crash before
+        # `set_active_state`) skip cleanly.
+        #
+        # Cache read goes through `get_active_live_paths_raw` (NOT
+        # `get_active_live_paths`) on purpose: the latter normalizes
+        # serialized `[]` entries to "absent", so the round-trip
+        # through `set_active_state` would silently drop any
+        # unrelated zero-mapping tool whose cache value is `[]` —
+        # exactly the external state abort is supposed to preserve.
+        # The raw accessor keeps those entries observable so the
+        # rewrite can leave them in place.
         active = self._store.get_active()
-        cache = self._store.get_active_live_paths()
+        cache = self._store.get_active_live_paths_raw()
         for tid in record.target_ids:
             active.pop(tid, None)
             cache.pop(tid, None)

@@ -51,6 +51,12 @@ class ProfileStore(Protocol):
     def set_active_live_paths(self, mapping: Mapping[str, list[str]]) -> None: ...
     def get_active_live_paths(self) -> dict[str, list[str]]: ...
 
+    # v0.1.5: raw read — preserves [] entries that get_active_live_paths
+    # normalizes to "absent". Required by abort's cleanup so it doesn't
+    # silently drop unrelated zero-mapping cache entries when rewriting
+    # the cache without the target_ids it owns.
+    def get_active_live_paths_raw(self) -> dict[str, list[str]]: ...
+
     def update_profile_tools(self, name: str, tools: Mapping[str, bool]) -> None: ...
 
     def profile_dir(self, name: str) -> Path: ...
@@ -245,10 +251,36 @@ class FileProfileStore:
           - per-tool entry contains non-string elements
           - per-tool key is not a string
         """
+        result, _ = self._load_active_live_paths(drop_empty=True)
+        return result
+
+    def get_active_live_paths_raw(self) -> dict[str, list[str]]:
+        """v0.1.5: same validation as ``get_active_live_paths``, but
+        preserves per-tool ``[]`` entries instead of normalizing them
+        to absence. Required by the abort cleanup in
+        ``ProfileService._compensate_init_abort``: that path strips
+        ``record.target_ids`` from the cache and rewrites the
+        remainder, and the normalized read would silently drop any
+        unrelated zero-mapping tool whose serialized cache value is
+        ``[]`` — abort would then mutate state outside the
+        target_ids it owns.
+        """
+        result, _ = self._load_active_live_paths(drop_empty=False)
+        return result
+
+    def _load_active_live_paths(
+        self, *, drop_empty: bool
+    ) -> tuple[dict[str, list[str]], dict[str, object]]:
+        """Shared validation core. Returns the validated cache plus
+        the raw config dict so callers that need the full top-level
+        document (e.g. partial-rewrite paths) don't have to re-load
+        it. ``drop_empty=True`` normalizes ``[]`` to absent
+        (``get_active_live_paths`` semantics); ``drop_empty=False``
+        keeps them (``get_active_live_paths_raw`` semantics)."""
         data = self._load_config()
         raw = data.get("active_live_paths")
         if raw is None:
-            return {}
+            return {}, data
         if not isinstance(raw, dict):
             raise StorageError(
                 f"config.json: 'active_live_paths' must be an object or null, "
@@ -258,8 +290,18 @@ class FileProfileStore:
         for k, v in cast("dict[object, object]", raw).items():
             if not isinstance(k, str):
                 raise StorageError("config.json: 'active_live_paths' keys must be strings")
-            if v is None or v == []:
-                continue  # normalize to absence; eligible for derivation
+            if v is None:
+                if not drop_empty:
+                    # Null is interchangeable with [] on disk; normalize
+                    # the in-memory shape to [] so the raw view is
+                    # round-trippable through set_active_state without
+                    # surfacing the null/[] distinction to callers.
+                    result[k] = []
+                continue
+            if v == []:
+                if not drop_empty:
+                    result[k] = []
+                continue
             if not isinstance(v, list):
                 raise StorageError(
                     f"config.json: 'active_live_paths[{k}]' must be a list, null, "
@@ -273,7 +315,7 @@ class FileProfileStore:
                     )
                 paths.append(p)
             result[k] = paths
-        return result
+        return result, data
 
     def update_profile_tools(self, name: str, tools: Mapping[str, bool]) -> None:
         """Re-write a profile's metadata.json with an updated tools map.
