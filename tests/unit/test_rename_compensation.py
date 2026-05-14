@@ -481,8 +481,13 @@ def test_compensate_rename_refuses_when_profile_dir_is_symlink(
 def test_rename_writes_intent_and_marks_completed(service: ProfileService, tmp_state: Path) -> None:
     """A successful rename appends an intent record and marks it
     completed; vacuum then drops it. End-to-end covers the writer
-    side of the op-log integration."""
+    side of the op-log integration.
+
+    v0.1.5 PR4: init now also writes+completes an _InitOp record, so
+    we vacuum after init to isolate the rename's contribution to the
+    journal."""
     name = service.init().profile_name
+    OpLogIO(tmp_state).vacuum_completed()  # drop init's completed record
     service.rename(name, "client-A")
     oplog = OpLogIO(tmp_state)
     records = oplog.read_records()
@@ -503,8 +508,12 @@ def test_rename_cancels_intent_on_pre_mutation_exception(
     that never started.
 
     Without this, a normal failed rename becomes a persistent recovery
-    state — abby-review batch-1 pass-2 finding."""
+    state — abby-review batch-1 pass-2 finding.
+
+    v0.1.5 PR4: init writes+completes its own _InitOp record, so we
+    vacuum after init to isolate the rename's contribution."""
     name = service.init().profile_name
+    OpLogIO(tmp_state).vacuum_completed()  # drop init's completed record
     # Race a ProfileExistsError out of store.rename: pre-flight passed
     # because `client-A` did not exist, but it appeared between preflight
     # and store.rename. ProfileExistsError raises BEFORE any mutation in
