@@ -396,9 +396,9 @@ def test_set_active_preserves_empty_cache_entries_for_zero_mapping_tools(
     # Inject the legacy null directly so set_active_state's input-shape
     # normalization (which only sees the typed dict[str, list[str]])
     # doesn't strip it. Reading via raw normalizes the null to [].
-    config = json.loads((state_dir / "config.json").read_text())
+    config = json.loads((state_dir / "config.json").read_text(encoding="utf-8"))
     config["active_live_paths"]["legacy-null-tool"] = None
-    (state_dir / "config.json").write_text(json.dumps(config))
+    (state_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
     # Active-only wrapper write (e.g., rename re-pointing active entries).
     s.set_active({"copilot": "A", "zero-mapping-tool": "C", "legacy-null-tool": "D"})

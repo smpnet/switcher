@@ -107,12 +107,15 @@ def test_continue_all_untouched_runs_full_replay(
     and finish steps 6-7 (vanilla profile + active map)."""
     claude_live = tmp_home / ".claude"
     (claude_live / "settings.json").write_text('{"original": true}')
-    # Plant the dated-current profile dir (init step 4) but no per-mapping
-    # capture has happened — target subdir absent.
+    # Plant the dated-current profile via store.create (writes the dir
+    # AND metadata.json — matches what init step 4 produces). The
+    # compensation refusal added in CR pass-10 / abby pass-10 requires
+    # readable metadata; mkdir-only scaffolds would surface as
+    # OpLogCorruptError instead of running the test's replay path.
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
-    profile_dir.mkdir(parents=True)
     record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
     OpLogIO(tmp_state).append_record(record)
 
@@ -134,6 +137,7 @@ def test_continue_skips_already_complete_mapping(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -159,6 +163,7 @@ def test_continue_handles_move_done_link_missing_state(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -723,6 +728,55 @@ def test_check_does_not_short_circuit_when_vanilla_metadata_unreadable(
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_continue_refuses_and_keeps_journal_when_current_profile_metadata_missing(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """abby pass-10 blocker: the pass-7 short-circuit check keeps the
+    journal record in flight on missing current-profile metadata, but
+    that's only half the story — compensation must ALSO refuse, or
+    the recovery path runs idempotent no-op compensation and clears
+    the journal anyway, leaving the user dead-ended.
+
+    Concrete trigger:
+    - crash window: mappings COMPLETE, set_active_state done,
+      mark_completed NOT yet run.
+    - record.profile_name's metadata.json is missing/corrupt
+      (rmtree-silent-failure on _store.create's rollback).
+    - user runs `switcher init --continue`.
+
+    Expected: OpLogCorruptError raised in compensation's validation
+    pass; journal stays in flight; user can manually delete the
+    broken profile dir and retry.
+    """
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # Build the "completed except metadata" state via store.create
+    # (writes metadata), then sabotage it.
+    store.create(profile_name, {"claude": True})
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    store.create("vanilla", {"claude": True})
+    store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
+    # Sabotage current-profile metadata only.
+    (profile_dir / "metadata.json").unlink()
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="metadata"):
+        service.init(continue_=True)
+    # Journal stays in flight — user can fix the dir manually and retry.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+    # No mark_completed reached, so the disk state is preserved as-is
+    # (don't mutate when the recovery path can't actually heal).
+    assert profile_dir.is_dir()
+    assert claude_live.is_symlink()
+
+
 def test_abort_preflights_config_before_any_filesystem_mutation(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
@@ -859,8 +913,7 @@ def test_continue_serializes_empty_cache_entry_for_zero_mapping_tool(
     than going through the store API."""
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
-    profile_dir = store.profile_dir(profile_name)
-    profile_dir.mkdir(parents=True)
+    store.create(profile_name, {"registry-only-tool": True})
     record = _make_init_record(profile_name, ["registry-only-tool"], mappings=[])
     OpLogIO(tmp_state).append_record(record)
 
@@ -893,8 +946,7 @@ def test_continue_writes_symmetric_active_and_cache_for_orphan_tool(
     (phantom_live / "settings.json").write_text('{"phantom": true}')
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
-    profile_dir = store.profile_dir(profile_name)
-    profile_dir.mkdir(parents=True)
+    store.create(profile_name, {"phantom": True})
     phantom_mapping = _MappingIntent.model_validate(
         {
             "tool_id": "phantom",
@@ -1054,6 +1106,7 @@ def test_continue_does_not_short_circuit_when_cache_is_stale(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -1094,6 +1147,7 @@ def test_continue_does_not_short_circuit_when_active_has_extra_entry(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -1136,8 +1190,7 @@ def test_continue_does_not_short_circuit_when_zero_mapping_tool_has_stale_cache(
     map doesn't carry."""
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
-    profile_dir = store.profile_dir(profile_name)
-    profile_dir.mkdir(parents=True)
+    store.create(profile_name, {"registry-only-tool": True})
     store.create("vanilla", {"registry-only-tool": True})
     # Stale cache: zero-mapping tool expects [] but actual cache has
     # a non-empty path. Short-circuit MUST fall through.
@@ -1177,6 +1230,7 @@ def test_continue_does_not_short_circuit_when_vanilla_is_missing(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -1216,8 +1270,8 @@ def test_continue_refuses_when_target_subdir_is_symlink(
     claude_live = tmp_home / ".claude"
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
-    profile_dir.mkdir(parents=True)
     # Plant a symlink at profile_dir/claude pointing somewhere unrelated.
     elsewhere = tmp_state / "elsewhere"
     elsewhere.mkdir(parents=True)

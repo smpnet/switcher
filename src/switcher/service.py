@@ -1218,6 +1218,30 @@ class ProfileService:
                     f"interrupted init continue: {name!r} profile at {p} exists "
                     f"but is not a directory; manual recovery required"
                 )
+        # Current-profile metadata refusal (abby pass-10 blocker).
+        # Without this, a state where mappings classify COMPLETE but
+        # record.profile_name's metadata.json is missing/corrupt
+        # would run idempotent no-op compensation and mark_completed,
+        # clearing the journal and leaving the user dead-ended on
+        # the next `switcher use` (UnknownProfileError, no recovery
+        # record left). Refuse loudly so the journal stays in flight
+        # and the user can manually delete the broken dir + retry.
+        # Vanilla's metadata IS handled by the empty-leftover repair
+        # path below — we can regenerate vanilla (no user data); we
+        # CANNOT regenerate the dated-current profile (user data
+        # captured from live dirs).
+        if profile_dir.is_dir():
+            try:
+                self._store.get(record.profile_name)
+            except (UnknownProfileError, StorageError) as e:
+                raise OpLogCorruptError(
+                    f"interrupted init continue: profile {record.profile_name!r} "
+                    f"at {profile_dir} is present but metadata.json is missing "
+                    f"or unreadable ({e}); compensation cannot regenerate the "
+                    f"profile (it captured user data from live dirs). "
+                    f"Manual recovery required: delete {profile_dir} and "
+                    f"re-run `switcher init --continue`."
+                ) from e
         for intent in record.mappings:
             target = profile_dir / intent.profile_subdir
             # Per-target shape refusal. `classify_mapping` returns
@@ -1497,7 +1521,11 @@ class ProfileService:
             elif state is MappingDiskState.MOVE_DONE_LINK_MISSING:
                 if intent.original_kind == "real-dir":
                     move_or_seed_dir(target, live)
-                elif intent.original_kind == "missing":
+                elif intent.original_kind == "missing" and target.exists():
+                    # Defensive exists() guard mirrors the COMPLETE
+                    # branch above — protects against a target
+                    # disappearing between classification and mutation
+                    # (race / external removal). CR pass-10 nit.
                     shutil.rmtree(target)
 
         # Profile-delete. Both dated-current and vanilla — init
