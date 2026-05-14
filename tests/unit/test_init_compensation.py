@@ -21,9 +21,10 @@ from switcher.errors import (
     NoInProgressInitError,
     OpLogCorruptError,
     ProfileExistsError,
+    RescanInProgressError,
 )
 from switcher.models import Tool
-from switcher.oplog import OpLogIO, _InitOp, _MappingIntent
+from switcher.oplog import OpLogIO, _InitOp, _MappingIntent, _RenameOp, _RescanOp
 from switcher.paths import PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
@@ -203,6 +204,70 @@ def test_continue_with_no_in_flight_raises_no_in_progress(
     """`switcher init --continue` against an empty journal → NoInProgressInitError."""
     with pytest.raises(NoInProgressInitError):
         service.init(continue_=True)
+
+
+def test_continue_routes_user_to_rescan_when_in_flight_is_rescan(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """If the journal holds an in-flight ``_RescanOp`` and the user
+    runs ``switcher init --continue``, route them to the matching
+    ``switcher rescan --continue`` command rather than silently
+    refusing with a generic "wrong type" error.
+
+    abby-review pass-3 regression guard: this user-facing recovery-
+    steering branch must stay covered so a future refactor doesn't
+    quietly land users on a manual-recovery prompt for an op that
+    has an automated recovery command available."""
+    record = _RescanOp.model_validate(
+        {
+            "op": "rescan",
+            "started_at": _now(),
+            "target_ids": ["claude"],
+            "target_profiles": {"claude": "2026-05-12-rescan-1"},
+            "into_mode": False,
+            "previous_tools": None,
+            "mappings": [],
+        }
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(RescanInProgressError, match="rescan --continue"):
+        service.init(continue_=True)
+    with pytest.raises(RescanInProgressError, match="rescan --continue"):
+        service.init(abort=True)
+    # Journal: rescan record still in flight after both refused calls.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_continue_refuses_with_oplog_corrupt_on_unexpected_in_flight_type(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """If the journal holds an in-flight ``_RenameOp`` and the user
+    runs ``switcher init --continue/--abort``, refuse loudly with
+    ``OpLogCorruptError``. Reaching this state means a prior CLI
+    command's detection hook (which auto-compensates rename) didn't
+    run — likely a stale binary or a hand-edited journal. The
+    defensive refusal is documented in service.init's continue/abort
+    dispatch table.
+
+    abby-review pass-3 regression guard."""
+    record = _RenameOp.model_validate(
+        {
+            "op": "rename",
+            "started_at": _now(),
+            "from": "old",
+            "to": "new",
+            "affected_ids": ["claude"],
+        }
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="unexpected in-flight op type"):
+        service.init(continue_=True)
+    with pytest.raises(OpLogCorruptError, match="unexpected in-flight op type"):
+        service.init(abort=True)
+    # Journal: rename record still in flight.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
 def test_continue_and_abort_mutually_exclusive_at_service_layer(

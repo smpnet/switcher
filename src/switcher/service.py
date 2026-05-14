@@ -748,6 +748,18 @@ class ProfileService:
     ) -> InitReport | None:
         """v0.1.4: target_ids filters which detected tools to capture.
 
+        **Return-shape note (v0.1.5):** the default path returns an
+        ``InitReport`` as before. The recovery path
+        (``continue_=True`` / ``abort=True``) returns ``None`` because
+        no fresh init happened — the call drove ``_compensate_init_*``
+        against an already-in-flight journal record. The ``@overload``
+        above keeps the default-args call site typed as
+        ``-> InitReport``; direct callers that pass either flag get
+        ``-> InitReport | None`` and must handle the recovery branch
+        explicitly. abby-review pass-3 doc-suggestion: documented near
+        the summary so direct callers don't miss the shape change
+        buried in the v0.1.5 paragraph below.
+
         target_ids:
           None — capture every detected tool (v0.1.3 default-path behavior,
             including the empty-detect-warn case).
@@ -764,14 +776,22 @@ class ProfileService:
         mutex with ``--only`` / ``--skip`` / ``--interactive`` before
         reaching the service. When either flag is set, the body reads
         the in-flight ``_InitOp`` from the journal and dispatches to
-        ``_compensate_init_continue`` / ``_compensate_init_abort``;
-        ``return None`` (not an ``InitReport``) signals the recovery
-        path completed. The normal path writes an ``_InitOp`` intent
-        record BEFORE ``_store.create`` and marks it completed after
-        the final ``set_active_state``. A crash anywhere between leaves
-        a record the next CLI command's detection hook surfaces as
+        ``_compensate_init_continue`` / ``_compensate_init_abort``.
+        The normal path writes an ``_InitOp`` intent record BEFORE
+        ``_store.create`` and marks it completed after the final
+        ``set_active_state``. A crash anywhere between leaves a record
+        the next CLI command's detection hook surfaces as
         ``InitInProgressError`` (mutating) / exit 3 (read-only); the
         user resolves via ``switcher init --continue`` / ``--abort``.
+
+        Type-routing for the recovery dispatch (continue/abort with
+        an in-flight op of a different kind):
+          - ``_RescanOp`` in flight → ``RescanInProgressError`` (route
+            user to ``switcher rescan --continue/--abort``).
+          - ``_RenameOp`` in flight → ``OpLogCorruptError`` (the CLI
+            detection hook auto-compensates rename on every other
+            command; reaching here means the hook never got to drain
+            it, e.g. a stale binary or hand-edited journal).
         """
         # Defense-in-depth mutex (CLI enforces the same invariant ahead
         # of get_deps; this guard catches direct callers — tests,
