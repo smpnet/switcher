@@ -800,6 +800,26 @@ class ProfileService:
         # OpLogIO.append_record's completed-record rejection.
         if continue_ and abort:
             raise ValueError("init: continue_ and abort are mutually exclusive")
+        # Recovery scope comes from the in-flight journal record, NOT
+        # the call site — combining recovery flags with target_ids
+        # filtering or the informational diff lists would silently
+        # ignore the call-site args, leading a caller to believe
+        # recovery was scoped when it actually compensates the full
+        # journal entry. Refuse loudly. (CLI enforces this through
+        # typer's BadParameter; the service-layer guard is for direct
+        # callers — tests, alternate front-ends — that bypass the CLI.)
+        if (continue_ or abort) and (
+            target_ids is not None
+            or requested_but_not_installed
+            or skipped_via_skip_flag
+            or skipped_via_interactive
+        ):
+            raise ValueError(
+                "init: continue_/abort cannot be combined with target_ids, "
+                "requested_but_not_installed, skipped_via_skip_flag, or "
+                "skipped_via_interactive — recovery scope is taken from "
+                "the in-flight journal record, not the call site"
+            )
 
         oplog = OpLogIO(self._store.state_dir())
 

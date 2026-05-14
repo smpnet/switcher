@@ -280,6 +280,33 @@ def test_continue_and_abort_mutually_exclusive_at_service_layer(
         service.init(continue_=True, abort=True)
 
 
+def test_continue_rejects_call_site_target_ids(
+    service: ProfileService,
+) -> None:
+    """Recovery scope comes from the in-flight journal record, NOT
+    the call site. Combining ``continue_=True`` with ``target_ids``
+    is a caller bug — silently ignoring the filter would let the
+    caller believe recovery is scoped when it actually compensates
+    the full journal entry. The service refuses with ValueError."""
+    with pytest.raises(ValueError, match="continue_/abort cannot be combined"):
+        service.init(target_ids=["claude"], continue_=True)
+
+
+def test_abort_rejects_call_site_diff_list_args(
+    service: ProfileService,
+) -> None:
+    """Symmetric to ``target_ids`` rejection: the three informational
+    diff lists are call-site context for fresh-init reporting and
+    have no meaning during recovery. Passing them with
+    ``abort=True`` would silently discard the data."""
+    with pytest.raises(ValueError, match="continue_/abort cannot be combined"):
+        service.init(abort=True, requested_but_not_installed=["foo"])
+    with pytest.raises(ValueError, match="continue_/abort cannot be combined"):
+        service.init(abort=True, skipped_via_skip_flag=["foo"])
+    with pytest.raises(ValueError, match="continue_/abort cannot be combined"):
+        service.init(abort=True, skipped_via_interactive=["foo"])
+
+
 # -- writer-side journal hygiene ---------------------------------------------
 
 
@@ -675,9 +702,7 @@ def test_abort_clears_active_and_cache_for_target_ids(
     # Owned target_id was cleared.
     active = store.get_active()
     cache = store.get_active_live_paths()
-    assert "claude" not in active, (
-        f"abort must clear owned target_ids from active; got {active!r}"
-    )
+    assert "claude" not in active, f"abort must clear owned target_ids from active; got {active!r}"
     assert "claude" not in cache, f"abort must clear owned target_ids from cache; got {cache!r}"
     # External-state entries preserved.
     assert active.get("stale") == profile_name, (
