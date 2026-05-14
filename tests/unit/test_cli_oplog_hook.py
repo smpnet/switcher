@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import typer
@@ -24,6 +25,7 @@ import typer
 from switcher.cli import _detect_or_compensate_oplog, _format_in_progress_hint
 from switcher.errors import InitInProgressError, RescanInProgressError
 from switcher.oplog import OpLogRecord, _InitOp, _RenameOp, _RescanOp
+from switcher.service import InitAlreadyCompletedReport
 
 
 def _now() -> datetime:
@@ -120,12 +122,32 @@ class _FakeOpLog:
 
 @dataclass
 class _FakeService:
-    """Mirrors the slice of ProfileService the hook calls."""
+    """Mirrors the slice of ProfileService the hook calls.
+
+    v0.1.5 PR4: also records ``service.init(continue_=..., abort=...)``
+    invocations and a configurable return value so the init-recovery CLI
+    tests can exercise the InitAlreadyCompletedReport vs None branches
+    without MagicMock (project convention, per coding guidelines).
+    """
 
     compensate_rename_args: list[_RenameOp] = field(default_factory=list)
+    init_calls: list[dict[str, Any]] = field(default_factory=list)
+    init_return_value: Any = None
 
     def _compensate_rename(self, record: _RenameOp) -> None:
         self.compensate_rename_args.append(record)
+
+    def init(
+        self,
+        target_ids: object | None = None,
+        **kwargs: object,
+    ) -> Any:
+        # Capture full call shape so tests can assert ordering AND the
+        # exact (continue_, abort, target_ids) tuple — a regression where
+        # the CLI mistakenly forwarded --only / --skip would show up as
+        # a non-None target_ids in the recorded dict.
+        self.init_calls.append({"target_ids": target_ids, **kwargs})
+        return self.init_return_value
 
 
 @dataclass
@@ -247,17 +269,20 @@ def test_in_flight_rescan_mutating_raises_rescan_in_progress() -> None:
 # -- hint formatting --------------------------------------------------------
 
 
-def test_format_in_progress_hint_init_mentions_profile_and_manual_recovery() -> None:
+def test_format_in_progress_hint_init_names_recovery_flags() -> None:
+    """v0.1.5 PR4: init's --continue / --abort flags ship in this PR, so
+    the recovery hint names them directly. The string must point the
+    user at both options (continue replays mappings, abort reverses
+    pre-init state — the user picks based on whether they want the
+    init to succeed or be undone)."""
     text = _format_in_progress_hint(_init_record())
     assert "init" in text
     assert "2026-05-12-current" in text
     assert "claude" in text
-    assert "Manual recovery required" in text
-    # init's --continue/--abort flags don't ship until Phase 6 / PR4;
-    # in a PR3-only deployment they're unknown to the CLI. The hint
-    # documents the future surface without pointing the user at flags
-    # the running binary doesn't have (abby blocking review).
-    assert "follow-on release" in text
+    # Names BOTH flags — the user needs the choice surfaced, not just
+    # one option.
+    assert "switcher init --continue" in text
+    assert "switcher init --abort" in text
 
 
 def test_format_in_progress_hint_rescan_fresh_mentions_fresh_profile() -> None:
@@ -281,20 +306,17 @@ def test_format_in_progress_hint_rescan_into_mentions_into_target() -> None:
     assert "Manual recovery required" in text
 
 
-def test_format_in_progress_hint_does_not_reference_nonexistent_flags() -> None:
-    """A PR3 binary doesn't expose `init --continue/--abort` or
-    `rescan --continue/--abort`. The hint must not direct the user to
-    run them — they would fail with "no such option" and burn the
-    user's first recovery attempt (abby blocking review). When PR4 /
-    PR5 add the flags, the hint text gets updated alongside."""
-    init_text = _format_in_progress_hint(_init_record())
+def test_format_in_progress_hint_rescan_does_not_reference_nonexistent_flags() -> None:
+    """v0.1.5 PR4 ships init's --continue/--abort but rescan's flags
+    don't land until PR5 (Phase 7). A PR4 binary that emits the rescan
+    hint must NOT direct the user to `switcher rescan --continue/--abort`
+    — those flags would fail with "no such option" and burn the user's
+    first recovery attempt (abby blocking review carry-forward). When
+    PR5 ships, this test gets removed and the rescan hint test is
+    updated to mirror the init one above."""
     rescan_fresh_text = _format_in_progress_hint(_rescan_record_fresh())
     rescan_into_text = _format_in_progress_hint(_rescan_record_into())
-    # Substring `--continue` / `--abort` (with leading hyphens) is the
-    # CLI-flag form the user would actually type; the prose mentions
-    # the *commands* without the flag-prefix to document the
-    # forthcoming compensation surface.
-    for text in (init_text, rescan_fresh_text, rescan_into_text):
+    for text in (rescan_fresh_text, rescan_into_text):
         assert "--continue" not in text
         assert "--abort" not in text
 
@@ -371,7 +393,8 @@ def test_status_with_in_flight_init_exits_3_and_emits_hint(tmp_home: Path, tmp_s
     # mix_stderr config. Routing is asserted at the console-call
     # level in the err_console test below.
     assert "Interrupted `switcher init`" in result.output
-    assert "Manual recovery required" in result.output
+    # v0.1.5 PR4: init hint now names the recovery flags directly.
+    assert "switcher init --continue" in result.output
 
 
 def test_in_flight_hint_goes_through_err_console(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -402,3 +425,208 @@ def test_in_flight_hint_goes_through_err_console(monkeypatch: pytest.MonkeyPatch
     # Routing assertion: stderr got the hint, stdout did NOT.
     assert any("Interrupted `switcher init`" in c for c in err_calls)
     assert not any("Interrupted `switcher init`" in c for c in console_calls)
+
+
+# -- v0.1.5 PR4: init --continue / --abort flag dispatch ------------------
+#
+# Cover the new init CLI recovery surface (spec §2.2):
+# - Mutex matrix: --continue ⊥ --abort, and both ⊥ --only/--skip/--interactive.
+# - Dispatch ordering: the recovery branch MUST run BEFORE the generic
+#   _detect_or_compensate_oplog hook fires. Otherwise the hook would raise
+#   InitInProgressError on the in-flight _InitOp and the recovery flags
+#   would never reach service.init().
+# - Return-shape handling: InitAlreadyCompletedReport(kind="continue") vs
+#   kind="abort"; the abort kind must point the user at `switcher uninstall`
+#   (the committed init is still on disk; abort can't reverse it). None
+#   return = compensation ran; print success.
+
+
+def _combined(result: object) -> str:
+    """stdout + stderr concatenation for substring assertions.
+
+    Click 8.3 separates the two streams by default; BadParameter errors
+    land on stderr while service-layer SwitcherError messages land on
+    stderr through handle_errors. Tests that don't care which stream a
+    message hits use this helper — mirrors test_cli_init_flags._combined.
+    """
+    stdout = getattr(result, "stdout", "") or ""
+    stderr = getattr(result, "stderr", "") or ""
+    return stdout + stderr
+
+
+@pytest.fixture
+def patched_deps(monkeypatch: pytest.MonkeyPatch) -> _FakeDeps:
+    """Patch ``cli.get_deps`` to return a fake Deps with NO in-flight
+    record by default; tests that need an in-flight _InitOp set
+    ``fake.oplog.in_flight`` themselves.
+    """
+    from switcher import cli as cli_module
+
+    fake = _FakeDeps.with_in_flight(None)
+    monkeypatch.setattr(cli_module, "get_deps", lambda: fake)
+    return fake
+
+
+# Mutex matrix --------------------------------------------------------------
+
+
+def test_init_continue_and_abort_mutex(patched_deps: _FakeDeps) -> None:
+    """`--continue --abort` raises typer.BadParameter (exit 2). The mutex
+    check fires BEFORE get_deps reads any state, so no journal calls
+    happen on a usage error."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--continue", "--abort"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in _combined(result).lower()
+    assert patched_deps.service.init_calls == []
+
+
+@pytest.mark.parametrize(
+    "filter_args",
+    [
+        ["--only", "claude"],
+        ["--skip", "claude"],
+        ["--interactive"],
+    ],
+)
+def test_init_continue_with_filter_flag_rejected(
+    patched_deps: _FakeDeps, filter_args: list[str]
+) -> None:
+    """Recovery scope is taken from the in-flight journal record, NOT
+    the call site. Combining --continue with --only/--skip/--interactive
+    is a usage error — service.init() also refuses these combinations,
+    but the CLI's BadParameter gives a typer-formatted error before
+    reaching the service (cleaner UX than a SwitcherError traceback)."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--continue", *filter_args])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in _combined(result).lower()
+    assert patched_deps.service.init_calls == []
+
+
+@pytest.mark.parametrize(
+    "filter_args",
+    [
+        ["--only", "claude"],
+        ["--skip", "claude"],
+        ["--interactive"],
+    ],
+)
+def test_init_abort_with_filter_flag_rejected(
+    patched_deps: _FakeDeps, filter_args: list[str]
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--abort", *filter_args])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in _combined(result).lower()
+    assert patched_deps.service.init_calls == []
+
+
+# Dispatch ordering ---------------------------------------------------------
+
+
+def test_init_continue_dispatches_to_service_with_in_flight(
+    patched_deps: _FakeDeps,
+) -> None:
+    """`switcher init --continue` must bypass the generic
+    _detect_or_compensate_oplog hook (which would raise
+    InitInProgressError on the in-flight _InitOp) and dispatch directly
+    to service.init(continue_=True). The recovery branch's only
+    pre-service call is vacuum_completed (journal hygiene); it must
+    NOT call read_in_flight (the service does that itself)."""
+    patched_deps.oplog.in_flight = _init_record()
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--continue"])
+    assert result.exit_code == 0, _combined(result)
+    assert patched_deps.oplog.calls == ["vacuum_completed"]
+    assert patched_deps.service.init_calls == [
+        {"target_ids": None, "continue_": True, "abort": False}
+    ]
+    # Sanity: rename auto-compensation MUST NOT run on the recovery
+    # path — the hook is bypassed entirely.
+    assert patched_deps.service.compensate_rename_args == []
+
+
+def test_init_abort_dispatches_to_service_with_in_flight(
+    patched_deps: _FakeDeps,
+) -> None:
+    patched_deps.oplog.in_flight = _init_record()
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--abort"])
+    assert result.exit_code == 0, _combined(result)
+    assert patched_deps.oplog.calls == ["vacuum_completed"]
+    assert patched_deps.service.init_calls == [
+        {"target_ids": None, "continue_": False, "abort": True}
+    ]
+    assert patched_deps.service.compensate_rename_args == []
+
+
+# Return-shape handling -----------------------------------------------------
+
+
+def test_init_continue_already_completed_prints_journal_hint(
+    patched_deps: _FakeDeps,
+) -> None:
+    """InitAlreadyCompletedReport(kind='continue') signals the journal
+    record was committed before the crash — mark_completed ran without
+    invoking compensation. CLI tells the user the init is already
+    complete; no uninstall hint (init succeeded, nothing to reverse)."""
+    patched_deps.oplog.in_flight = _init_record()
+    patched_deps.service.init_return_value = InitAlreadyCompletedReport(
+        profile_name="2026-05-12-current", kind="continue"
+    )
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--continue"])
+    assert result.exit_code == 0, _combined(result)
+    out = _combined(result)
+    assert "2026-05-12-current" in out
+    assert "already" in out.lower()
+    # continue-kind message MUST NOT mention uninstall — that's only
+    # relevant for the abort kind, where the user expected reversal.
+    assert "switcher uninstall" not in out
+
+
+def test_init_abort_already_completed_points_at_uninstall(
+    patched_deps: _FakeDeps,
+) -> None:
+    """InitAlreadyCompletedReport(kind='abort') signals the user tried
+    to abort an init that had already committed. The CLI MUST tell
+    them: (a) the init is on disk, (b) abort can't reverse it,
+    (c) use `switcher uninstall` if they actually want reversal.
+    Without this, abort silently no-ops and the user thinks they
+    reversed an init that's still in place (spec §2.2 distinction)."""
+    patched_deps.oplog.in_flight = _init_record()
+    patched_deps.service.init_return_value = InitAlreadyCompletedReport(
+        profile_name="2026-05-12-current", kind="abort"
+    )
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--abort"])
+    assert result.exit_code == 0, _combined(result)
+    out = _combined(result)
+    assert "2026-05-12-current" in out
+    assert "switcher uninstall" in out
+
+
+def test_init_continue_compensation_ran_prints_success(
+    patched_deps: _FakeDeps,
+) -> None:
+    """service.init(continue_=True) returning None means compensation
+    actually ran (replayed mappings + step 6-7). CLI prints a
+    non-empty success indicator and exits 0."""
+    patched_deps.oplog.in_flight = _init_record()
+    patched_deps.service.init_return_value = None
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--continue"])
+    assert result.exit_code == 0, _combined(result)
+    assert _combined(result).strip() != ""
+
+
+def test_init_abort_compensation_ran_prints_success(
+    patched_deps: _FakeDeps,
+) -> None:
+    patched_deps.oplog.in_flight = _init_record()
+    patched_deps.service.init_return_value = None
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--abort"])
+    assert result.exit_code == 0, _combined(result)
+    assert _combined(result).strip() != ""
