@@ -648,6 +648,42 @@ def test_init_abort_drains_in_flight_rename_before_dispatch(
     assert result.exit_code == 1
 
 
+def test_init_continue_refuses_when_rename_drain_did_not_clear_journal(
+    patched_deps: _FakeDeps,
+) -> None:
+    """Defensive refresh after the rename drain: if the journal still
+    holds a _RenameOp after ``_compensate_rename`` returns, the service
+    method's contract (idempotent disk-truth roll-forward, including
+    mark_completed) has regressed. The CLI must NOT fall through to
+    ``service.init(...)`` — that would surface as OpLogCorruptError
+    from the service's "not an _InitOp" guard, masking the real
+    contract breakage. Raise the corruption signal HERE so the broken
+    contract surfaces at the CLI layer with a clear hint about the
+    rename-drain regression. abby pass-2 blocker.
+    """
+    rename = _rename_record()
+    patched_deps.oplog.in_flight = rename
+    # _compensate_rename is a no-op in this fake — simulates the
+    # regression abby is defending against: the method returns without
+    # touching the journal, so read_in_flight still surfaces the rename.
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--continue"])
+    assert patched_deps.service.compensate_rename_args == [rename]
+    # service.init MUST NOT be called: the contract breakage surfaces
+    # before dispatch.
+    assert patched_deps.service.init_calls == []
+    out = _combined(result).lower()
+    # The surfaced error names the rename-drain regression specifically
+    # (not the generic "unexpected in-flight op type" the service would
+    # produce). Asserting on the rename-specific wording catches a
+    # future change that downgrades back to the generic guard.
+    assert "rename" in out
+    assert "contract" in out or "did not drain" in out
+    # Exit 1 (handle_errors-routed SwitcherError), not 2 (typer
+    # BadParameter) or 3 (read-only hint exit).
+    assert result.exit_code == 1
+
+
 # Return-shape handling -----------------------------------------------------
 
 

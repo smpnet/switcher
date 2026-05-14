@@ -18,6 +18,7 @@ from rich.table import Table
 from switcher.errors import (
     InitInProgressError,
     NothingToInitializeError,
+    OpLogCorruptError,
     RescanInProgressError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
@@ -556,6 +557,22 @@ def init(
         in_flight = deps.oplog.read_in_flight()
         if isinstance(in_flight, _RenameOp):
             deps.service._compensate_rename(in_flight)  # pyright: ignore[reportPrivateUsage]
+            # Defensive refresh: service._compensate_rename owns
+            # mark_completed (service.py:1265), so a subsequent
+            # read_in_flight returns None on success. If the
+            # rename is still in flight after the drain call returned,
+            # the method's contract has regressed and silently falling
+            # through to service.init would mask it as a generic
+            # OpLogCorruptError from the "not an _InitOp" guard.
+            # Surface the contract breakage at the CLI layer with a
+            # clearer message. abby pass-2 blocker.
+            in_flight = deps.oplog.read_in_flight()
+            if isinstance(in_flight, _RenameOp):
+                raise OpLogCorruptError(
+                    "rename auto-compensation did not drain the in-flight "
+                    "journal record; service._compensate_rename contract "
+                    "regressed. Manual recovery required."
+                )
         result = deps.service.init(continue_=continue_, abort=abort)
         _print_init_recovery_result(result, abort=abort)
         return

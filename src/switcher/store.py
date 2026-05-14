@@ -214,8 +214,19 @@ class FileProfileStore:
         self._write_config(data)
 
     def set_active(self, mapping: Mapping[str, str]) -> None:
-        """Convenience wrapper. Preserves the existing on-disk active_live_paths."""
-        self.set_active_state(mapping, self.get_active_live_paths())
+        """Convenience wrapper. Preserves the existing on-disk active_live_paths.
+
+        Uses ``get_active_live_paths_raw`` so unrelated ``[]`` cache
+        entries (zero-mapping tools — see
+        ``test_continue_serializes_empty_cache_entry_for_zero_mapping_tool``)
+        survive active-only writes via this wrapper. Without the raw
+        reader, flows like ``ProfileService.rename`` (which uses
+        ``set_active`` to re-point active entries after a profile
+        rename) would silently strip the [] shape from the cache —
+        regressing the preservation contract abort already honors.
+        CR pass-2 major.
+        """
+        self.set_active_state(mapping, self.get_active_live_paths_raw())
 
     def get_active(self) -> dict[str, str]:
         path = self._config_path()

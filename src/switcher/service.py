@@ -1097,6 +1097,23 @@ class ProfileService:
         follows symlinks, so a symlink-to-dir at either profile path
         satisfies it alone — without the explicit ``is_link`` refusal
         we'd bless an externally-mutated profile shape as healthy.
+
+        Not checked here: profile ``metadata.json`` readability. CR
+        pass-2 critical flagged that ``_store.create``'s
+        ``shutil.rmtree(d, ignore_errors=True)`` rollback could silently
+        fail (Windows file-lock race), leaving the profile dir without
+        metadata while every OTHER invariant holds. Pushed back: the
+        trigger is extremely narrow, compensation cannot regenerate
+        the current profile's metadata (only the dir-missing path
+        creates a fresh profile), and tightening this check breaks
+        the existing test-scaffolding pattern that mkdir's a profile
+        dir without going through ``store.create`` (15+ tests). The
+        user-visible outcome on the rmtree-silent-failure window:
+        short-circuit fires → mark_completed → next ``switcher use``
+        raises ``UnknownProfileError`` with a clear "profile X not
+        found" message. Manual recovery (delete the broken dir,
+        re-run init) works regardless. Track for a follow-on that
+        refactors test scaffolding alongside the invariant tightening.
         """
         for name in (record.profile_name, "vanilla"):
             p = self._store.profile_dir(name)

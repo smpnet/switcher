@@ -362,6 +362,41 @@ def test_set_active_alone_preserves_existing_active_live_paths(tmp_path: Path) -
     assert s.get_active_live_paths() == {"copilot": ["/p"]}
 
 
+def test_set_active_preserves_empty_cache_entries_for_zero_mapping_tools(
+    tmp_path: Path,
+) -> None:
+    """v0.1.5 carry-forward of the [] preservation contract.
+
+    A zero-mapping tool (registry entry with no ``config_dirs``)
+    serializes as ``cache[tid] = []`` on disk — clean init writes that
+    shape deliberately (see ``test_continue_serializes_empty_cache_entry_for_zero_mapping_tool``).
+
+    Active-only writes via the ``set_active`` wrapper MUST preserve
+    those entries. The wrapper previously round-tripped through the
+    normalizing reader ``get_active_live_paths`` which drops ``[]``
+    entries — flows like ``ProfileService.rename`` (which calls
+    ``set_active`` to update the active map after a profile rename)
+    would then silently erase the zero-mapping cache state every
+    other layer (init compensation, abort) is now careful to preserve.
+
+    CR pass-2 major finding.
+    """
+    state_dir = _bare_state(tmp_path)
+    s = FileProfileStore(state_dir)
+    # Pre-stage a [] cache entry for a zero-mapping tool.
+    s.set_active_state(
+        {"copilot": "A", "zero-mapping-tool": "B"},
+        {"copilot": ["/p"], "zero-mapping-tool": []},
+    )
+    # Active-only wrapper write (e.g., rename re-pointing active entries).
+    s.set_active({"copilot": "A", "zero-mapping-tool": "C"})
+    # Raw reader sees both entries with their original shapes.
+    assert s.get_active_live_paths_raw() == {
+        "copilot": ["/p"],
+        "zero-mapping-tool": [],
+    }
+
+
 def test_set_active_live_paths_alone_preserves_existing_active(tmp_path: Path) -> None:
     state_dir = _bare_state(tmp_path)
     s = FileProfileStore(state_dir)
