@@ -193,7 +193,8 @@ def test_continue_refuses_on_ambiguous_mapping(
         service.init(continue_=True)
 
     # No mutation: both still in place; intent still in flight.
-    assert claude_live.is_dir() and not claude_live.is_symlink()
+    assert claude_live.is_dir()
+    assert not claude_live.is_symlink()
     assert (claude_live / "settings.json").read_text() == '{"live": true}'
     assert (target / "settings.json").read_text() == '{"target": true}'
     assert OpLogIO(tmp_state).read_in_flight() is not None
@@ -412,7 +413,8 @@ def test_abort_complete_mapping_real_dir(
 
     service.init(abort=True)
 
-    assert claude_live.is_dir() and not claude_live.is_symlink()
+    assert claude_live.is_dir()
+    assert not claude_live.is_symlink()
     assert (claude_live / "settings.json").read_text() == '{"original": true}'
     assert not profile_dir.exists()
     assert OpLogIO(tmp_state).read_in_flight() is None
@@ -488,7 +490,8 @@ def test_abort_move_done_link_missing_real_dir(
 
     service.init(abort=True)
 
-    assert claude_live.is_dir() and not claude_live.is_symlink()
+    assert claude_live.is_dir()
+    assert not claude_live.is_symlink()
     assert (claude_live / "settings.json").read_text() == '{"original": true}'
     assert not profile_dir.exists()
     assert OpLogIO(tmp_state).read_in_flight() is None
@@ -768,7 +771,8 @@ def test_abort_clears_active_and_cache_for_target_ids(
     # Profile dirs deleted; live restored.
     assert not profile_dir.exists()
     assert not store.profile_dir("vanilla").exists()
-    assert claude_live.is_dir() and not claude_live.is_symlink()
+    assert claude_live.is_dir()
+    assert not claude_live.is_symlink()
     assert (claude_live / "settings.json").read_text() == '{"data": true}'
     assert OpLogIO(tmp_state).read_in_flight() is None
 
@@ -833,7 +837,7 @@ def test_abort_idempotent_second_call_raises_no_in_progress(
     service.init(abort=True)
     OpLogIO(tmp_state).vacuum_completed()
 
-    assert (claude_live / "settings.json").exists() is False  # live untouched (was empty)
+    assert not (claude_live / "settings.json").exists()  # live untouched (was empty)
     with pytest.raises(NoInProgressInitError):
         service.init(abort=True)
 
@@ -1031,7 +1035,8 @@ def test_continue_refuses_when_target_subdir_is_symlink(
 
     # No mutation: live untouched, elsewhere data preserved, intent
     # still in flight.
-    assert claude_live.is_dir() and not claude_live.is_symlink()
+    assert claude_live.is_dir()
+    assert not claude_live.is_symlink()
     assert (elsewhere / "important.txt").read_text() == "user data"
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
@@ -1093,7 +1098,8 @@ def test_continue_refuses_when_vanilla_profile_dir_is_symlink(
 
     # No mutation: live still real dir, vanilla still symlink, intent
     # still in flight.
-    assert claude_live.is_dir() and not claude_live.is_symlink()
+    assert claude_live.is_dir()
+    assert not claude_live.is_symlink()
     assert vanilla_path.is_symlink()
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
