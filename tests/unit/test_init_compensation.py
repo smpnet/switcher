@@ -650,6 +650,72 @@ def test_abort_idempotent_second_call_raises_no_in_progress(
         service.init(abort=True)
 
 
+def test_continue_refuses_when_vanilla_profile_dir_is_symlink(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A symlink/junction at ``profiles/vanilla`` is corruption — the
+    profile-store invariant is "profile_dir is a real directory", and
+    a symlink there would let ``_seed_credentials`` copy files into
+    unrelated data. Continue must refuse with ``OpLogCorruptError``
+    rather than skip create-and-proceed."""
+    claude_live = tmp_home / ".claude"
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    profile_dir.mkdir(parents=True)
+    # Plant a symlink at profiles/vanilla pointing somewhere unrelated.
+    elsewhere = tmp_state / "elsewhere"
+    elsewhere.mkdir(parents=True)
+    vanilla_path = store.profile_dir("vanilla")
+    vanilla_path.parent.mkdir(parents=True, exist_ok=True)
+    vanilla_path.symlink_to(elsewhere, target_is_directory=True)
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="symlink or junction"):
+        service.init(continue_=True)
+
+    # No mutation: live still real dir, vanilla still symlink, intent
+    # still in flight.
+    assert claude_live.is_dir() and not claude_live.is_symlink()
+    assert vanilla_path.is_symlink()
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_abort_refuses_when_profile_dir_is_symlink(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A symlink/junction at ``profiles/<profile_name>`` makes the
+    abort profile-delete path unsafe — ``shutil.rmtree`` would follow
+    the symlink and trash unrelated data. Refuse with
+    ``OpLogCorruptError``; leave the partial state alone for manual
+    inspection."""
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # Plant a symlink at profiles/<profile_name>.
+    elsewhere = tmp_state / "elsewhere"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "important.txt").write_text("user data")
+    profile_path = store.profile_dir(profile_name)
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.symlink_to(elsewhere, target_is_directory=True)
+    record = _make_init_record(
+        profile_name, ["claude"], mappings=[]
+    )  # untouched mapping shape would classify UNTOUCHED via target absence
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="symlink or junction"):
+        service.init(abort=True)
+
+    # No mutation: symlink still in place, elsewhere intact, intent
+    # still in flight.
+    assert profile_path.is_symlink()
+    assert (elsewhere / "important.txt").read_text() == "user data"
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
 def test_abort_rejects_link_original_kind_defensively(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

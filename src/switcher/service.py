@@ -1013,8 +1013,28 @@ class ProfileService:
         idempotent on already-complete data anyway.
         """
         profile_dir = self._store.profile_dir(record.profile_name)
+        vanilla_dir = self._store.profile_dir("vanilla")
 
-        # First-pass scan: refuse on any AMBIGUOUS mapping. No mutation.
+        # First-pass validation (no FS mutation). Two checks, both
+        # MUST run before any per-mapping mutation — otherwise a
+        # corrupt vanilla profile dir would only surface AFTER live
+        # symlinks had already been swapped, leaving partial state.
+        # Profile-dir invariant: every profile path is either a real
+        # directory or absent. A symlink / junction / file at a
+        # profile path is corruption (would let _seed_credentials or
+        # _store.create write into / through external state).
+        for name, p in ((record.profile_name, profile_dir), ("vanilla", vanilla_dir)):
+            if self._resolver.is_link(p):
+                raise OpLogCorruptError(
+                    f"interrupted init continue: {name!r} profile at {p} is a "
+                    f"symlink or junction, not a real profile directory; "
+                    f"manual recovery required"
+                )
+            if p.exists() and not p.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted init continue: {name!r} profile at {p} exists "
+                    f"but is not a directory; manual recovery required"
+                )
         for intent in record.mappings:
             state = classify_mapping(intent, profile_dir)
             if state is MappingDiskState.AMBIGUOUS:
@@ -1046,10 +1066,13 @@ class ProfileService:
             # an unknown state.
             raise AssertionError(f"unhandled mapping state {state}")
 
-        # Step 6: vanilla profile + credential seeding. Idempotent on a
-        # vanilla profile that already exists (e.g. init crashed AFTER
-        # vanilla creation but BEFORE set_active_state).
-        if not self._store.profile_dir("vanilla").exists():
+        # Step 6: vanilla profile + credential seeding. Shape of
+        # vanilla_dir was already validated in the first-pass scan; a
+        # symlink / file at profiles/vanilla raised OpLogCorruptError
+        # before any mutation ran. Idempotent on a vanilla profile
+        # that already exists (e.g. init crashed AFTER vanilla
+        # creation but BEFORE set_active_state).
+        if not vanilla_dir.is_dir():
             self._store.create("vanilla", dict.fromkeys(record.target_ids, True))
         for tid in record.target_ids:
             tool = find_tool(self._registry, tid)
@@ -1121,8 +1144,27 @@ class ProfileService:
         crashed run.
         """
         profile_dir = self._store.profile_dir(record.profile_name)
+        vanilla_dir = self._store.profile_dir("vanilla")
 
         # VALIDATION pass. No FS mutation; states cached by index.
+        # Profile-dir shape check runs FIRST so a corrupt vanilla /
+        # dated-current path can't slip through to the per-mapping
+        # mutation pass. The profile-store invariant is "profile_dir
+        # is a real directory"; a symlink / junction / file at a
+        # profile path would let `_store.delete`'s `shutil.rmtree`
+        # follow the symlink and trash unrelated data.
+        for name, p in ((record.profile_name, profile_dir), ("vanilla", vanilla_dir)):
+            if self._resolver.is_link(p):
+                raise OpLogCorruptError(
+                    f"interrupted init abort: {name!r} profile at {p} is a "
+                    f"symlink or junction, not a real profile directory; "
+                    f"manual recovery required"
+                )
+            if p.exists() and not p.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted init abort: {name!r} profile at {p} exists "
+                    f"but is not a directory; manual recovery required"
+                )
         states: dict[int, MappingDiskState] = {}
         for i, intent in enumerate(record.mappings):
             state = classify_mapping(intent, profile_dir)
@@ -1195,12 +1237,13 @@ class ProfileService:
         # Profile-delete. Both dated-current and vanilla — init
         # pre-flight requires `_store.list()` to be empty, so any
         # `vanilla` profile on disk at abort time was created by this
-        # crashed run. Guarded with .exists() so a crash that never
-        # reached `_store.create("vanilla", ...)` doesn't trip
-        # UnknownProfileError here.
-        if self._store.profile_dir(record.profile_name).exists():
+        # crashed run. Shape of each profile dir was already validated
+        # in the VALIDATION pass; we only delete real-dir paths here
+        # (absent paths skip — a crash that never reached
+        # `_store.create("vanilla", ...)` doesn't have vanilla on disk).
+        if profile_dir.is_dir():
             self._store.delete(record.profile_name)
-        if self._store.profile_dir("vanilla").exists():
+        if vanilla_dir.is_dir():
             self._store.delete("vanilla")
 
     def use(self, profile_name: str, only: list[str] | None = None) -> None:
