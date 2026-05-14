@@ -650,6 +650,73 @@ def test_abort_idempotent_second_call_raises_no_in_progress(
         service.init(abort=True)
 
 
+def test_continue_refuses_when_target_subdir_is_symlink(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A symlink/junction at ``profile_dir/subdir`` is corruption —
+    the journal's invariant is "target is a real profile subdirectory".
+    The classifier's AMBIGUOUS fall-through would already block
+    mutation here, but the explicit per-target shape refusal gives a
+    clearer error and protects future refactors from missing the
+    AMBIGUOUS catch.
+
+    Stages a non-profile-store directory and symlinks
+    ``profile_dir/claude`` at it; continue must refuse before
+    ``move_or_seed_dir`` or ``swap_link`` could operate on the
+    escaped path."""
+    claude_live = tmp_home / ".claude"
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    profile_dir.mkdir(parents=True)
+    # Plant a symlink at profile_dir/claude pointing somewhere unrelated.
+    elsewhere = tmp_state / "elsewhere"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "important.txt").write_text("user data")
+    (profile_dir / "claude").symlink_to(elsewhere, target_is_directory=True)
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="symlink or junction"):
+        service.init(continue_=True)
+
+    # No mutation: live untouched, elsewhere data preserved, intent
+    # still in flight.
+    assert claude_live.is_dir() and not claude_live.is_symlink()
+    assert (elsewhere / "important.txt").read_text() == "user data"
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_abort_refuses_when_target_subdir_is_symlink(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A symlink/junction at ``profile_dir/subdir`` is corruption.
+    Abort must refuse before ``shutil.rmtree`` or ``move_or_seed_dir``
+    could operate on the escaped path. Same defense-in-depth as
+    ``test_continue_refuses_when_target_subdir_is_symlink``."""
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    profile_dir.mkdir(parents=True)
+    elsewhere = tmp_state / "elsewhere"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "important.txt").write_text("user data")
+    (profile_dir / "claude").symlink_to(elsewhere, target_is_directory=True)
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "missing")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="symlink or junction"):
+        service.init(abort=True)
+
+    # No mutation: elsewhere data preserved, profile dir still
+    # present with the corrupt symlink, intent in flight.
+    assert (elsewhere / "important.txt").read_text() == "user data"
+    assert (profile_dir / "claude").is_symlink()
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
 def test_continue_refuses_when_vanilla_profile_dir_is_symlink(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

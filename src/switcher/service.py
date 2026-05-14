@@ -1036,6 +1036,31 @@ class ProfileService:
                     f"but is not a directory; manual recovery required"
                 )
         for intent in record.mappings:
+            target = profile_dir / intent.profile_subdir
+            # Per-target shape refusal. `classify_mapping` returns
+            # AMBIGUOUS for link-shape targets (target_is_real_dir
+            # excludes them, target_missing excludes them, so the
+            # classifier falls to its final AMBIGUOUS branch) — the
+            # explicit check below gives a clearer error for that
+            # case and documents the corruption boundary at the
+            # mutation site rather than relying on a fall-through.
+            # Without this, a future refactor that adds a new
+            # classifier state could miss the AMBIGUOUS catch and
+            # let `move_or_seed_dir(target, ...)` or `swap_link(target,
+            # live)` operate on a path that escapes the profile store.
+            if self._resolver.is_link(target):
+                raise OpLogCorruptError(
+                    f"interrupted init continue: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} is "
+                    f"a symlink or junction, not a real profile "
+                    f"subdirectory; manual recovery required"
+                )
+            if target.exists() and not target.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted init continue: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} "
+                    f"exists but is not a directory; manual recovery required"
+                )
             state = classify_mapping(intent, profile_dir)
             if state is MappingDiskState.AMBIGUOUS:
                 raise OpLogCorruptError(
@@ -1167,6 +1192,26 @@ class ProfileService:
                 )
         states: dict[int, MappingDiskState] = {}
         for i, intent in enumerate(record.mappings):
+            target = profile_dir / intent.profile_subdir
+            # Per-target shape refusal — same defense-in-depth as
+            # _compensate_init_continue's first-pass. `shutil.rmtree`
+            # raises on a symlink at the top level (Python docs:
+            # "If path is a symbolic link, an OSError is raised"),
+            # but documenting the corruption boundary explicitly
+            # protects against future primitive substitutions.
+            if self._resolver.is_link(target):
+                raise OpLogCorruptError(
+                    f"interrupted init abort: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} is "
+                    f"a symlink or junction, not a real profile "
+                    f"subdirectory; manual recovery required"
+                )
+            if target.exists() and not target.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted init abort: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} "
+                    f"exists but is not a directory; manual recovery required"
+                )
             state = classify_mapping(intent, profile_dir)
             if state is MappingDiskState.AMBIGUOUS:
                 raise OpLogCorruptError(
