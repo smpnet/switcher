@@ -846,10 +846,15 @@ class ProfileService:
             # is rescan rather than init — `switcher init --continue` on
             # a rescan-in-flight would otherwise be silently rejected as
             # "wrong type" without telling the user how to actually recover.
+            # PR4 ships init's --continue/--abort; rescan's matching flags
+            # land in PR5 (Phase 7), so the message stays version-agnostic
+            # (don't name flags the binary doesn't expose — CR pass-6 major,
+            # carry-forward of the PR3 abby blocking review).
             if isinstance(in_flight, _RescanOp):
                 raise RescanInProgressError(
-                    "an interrupted rescan is in flight; run "
-                    "`switcher rescan --continue` or `switcher rescan --abort`"
+                    "an interrupted rescan is in flight; guided recovery "
+                    "for rescan ships in a follow-on release. Manual "
+                    "recovery required on this switcher version."
                 )
             # `_RenameOp` is auto-compensated by the CLI detection hook on
             # every other command; reaching here with one in flight means

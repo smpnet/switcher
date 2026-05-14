@@ -212,13 +212,14 @@ def test_continue_routes_user_to_rescan_when_in_flight_is_rescan(
     service: ProfileService, tmp_state: Path
 ) -> None:
     """If the journal holds an in-flight ``_RescanOp`` and the user
-    runs ``switcher init --continue``, route them to the matching
-    ``switcher rescan --continue`` command rather than silently
+    runs ``switcher init --continue``, raise RescanInProgressError
+    pointing at the rescan recovery surface rather than silently
     refusing with a generic "wrong type" error.
 
-    This user-facing recovery-steering branch must stay covered so a
-    future refactor doesn't quietly land users on a manual-recovery
-    prompt for an op that has an automated recovery command available."""
+    PR4 ships init's --continue/--abort; rescan's matching flags land
+    in PR5 (Phase 7), so the message is version-agnostic — it names
+    the COMMAND (rescan) but doesn't promise specific flag shapes the
+    PR4 binary doesn't expose. CR pass-6 major carry-forward."""
     record = _RescanOp.model_validate(
         {
             "op": "rescan",
@@ -232,10 +233,21 @@ def test_continue_routes_user_to_rescan_when_in_flight_is_rescan(
     )
     OpLogIO(tmp_state).append_record(record)
 
-    with pytest.raises(RescanInProgressError, match="rescan --continue"):
+    # Message names the rescan command but NOT specific flags (PR5
+    # ships those). Asserting both: "rescan" appears so the user knows
+    # which subsystem owns the in-flight record; "--continue/--abort"
+    # do NOT appear so a PR4 binary doesn't direct users at flags it
+    # can't satisfy.
+    with pytest.raises(RescanInProgressError) as excinfo_c:
         service.init(continue_=True)
-    with pytest.raises(RescanInProgressError, match="rescan --continue"):
+    assert "rescan" in str(excinfo_c.value).lower()
+    assert "--continue" not in str(excinfo_c.value)
+    assert "--abort" not in str(excinfo_c.value)
+    with pytest.raises(RescanInProgressError) as excinfo_a:
         service.init(abort=True)
+    assert "rescan" in str(excinfo_a.value).lower()
+    assert "--continue" not in str(excinfo_a.value)
+    assert "--abort" not in str(excinfo_a.value)
     # Journal: rescan record still in flight after both refused calls.
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
