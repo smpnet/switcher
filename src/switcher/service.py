@@ -1380,6 +1380,28 @@ class ProfileService:
         if vanilla_dir.is_dir():
             self._store.delete("vanilla")
 
+        # Active-map / cache cleanup. If init had progressed far
+        # enough to call `set_active_state`, the active map and the
+        # live_paths cache reference `record.profile_name` (and may
+        # have entries for every target_id). After abort restores
+        # the per-mapping live state and deletes the profile dirs,
+        # those active/cache entries would dangle: active claims
+        # management of a deleted profile, the cache holds a path
+        # that's no longer a switcher symlink. Clear ONLY the
+        # target_ids this run owns — external state outside the
+        # journal's target_ids snapshot stays untouched (mirrors
+        # rename's orphan-tolerance contract and respects the
+        # consultant's "abort surfaces externally-mutated state
+        # for inspection" stance). `.pop(_, None)` is the safe
+        # idempotent form: tids that never landed in active/cache
+        # (crash before `set_active_state`) skip cleanly.
+        active = self._store.get_active()
+        cache = self._store.get_active_live_paths()
+        for tid in record.target_ids:
+            active.pop(tid, None)
+            cache.pop(tid, None)
+        self._store.set_active_state(active, cache)
+
     def use(self, profile_name: str, only: list[str] | None = None) -> None:
         self._require_initialized()
         # v0.1.4 §3.1/§3.5: empty active map → loud failure rather than

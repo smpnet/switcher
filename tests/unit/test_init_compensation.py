@@ -635,6 +635,62 @@ def test_continue_writes_symmetric_active_and_cache_for_orphan_tool(
     assert cache.get("phantom") == [str(phantom_live)]
 
 
+def test_abort_clears_active_and_cache_for_target_ids(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Init progressed far enough to call ``set_active_state``, then
+    drift (extra active entry, stale cache) made
+    ``_check_init_already_completed`` return False. Abort runs the
+    full compensation path and MUST clear the active/cache entries
+    for the target_ids it owns — leaving them in place would have
+    active reference a deleted profile and cache hold a path that
+    is no longer a switcher symlink.
+
+    External-state preservation: entries OUTSIDE ``record.target_ids``
+    (e.g. an unrelated tool that got into active via external
+    mutation) stay untouched. The journal only owns its
+    target_ids."""
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"data": true}')
+    _symlink_dir(target, claude_live)
+    store.create("vanilla", {"claude": True})
+    # Stage drift: extra "stale" active entry that fails the
+    # _check_init_already_completed strict-equality test. Abort
+    # falls through to the full compensation path.
+    store.set_active_state(
+        {"claude": profile_name, "stale": profile_name},
+        {"claude": [str(claude_live)]},
+    )
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(abort=True)
+
+    # Owned target_id was cleared.
+    active = store.get_active()
+    cache = store.get_active_live_paths()
+    assert "claude" not in active, (
+        f"abort must clear owned target_ids from active; got {active!r}"
+    )
+    assert "claude" not in cache, f"abort must clear owned target_ids from cache; got {cache!r}"
+    # External-state entries preserved.
+    assert active.get("stale") == profile_name, (
+        f"abort must leave non-target_id active entries alone; got {active!r}"
+    )
+    # Profile dirs deleted; live restored.
+    assert not profile_dir.exists()
+    assert not store.profile_dir("vanilla").exists()
+    assert claude_live.is_dir() and not claude_live.is_symlink()
+    assert (claude_live / "settings.json").read_text() == '{"data": true}'
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
 def test_abort_idempotent_second_call_raises_no_in_progress(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
