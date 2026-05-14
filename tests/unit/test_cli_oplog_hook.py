@@ -23,7 +23,11 @@ import pytest
 import typer
 
 from switcher.cli import _detect_or_compensate_oplog, _format_in_progress_hint
-from switcher.errors import InitInProgressError, RescanInProgressError
+from switcher.errors import (
+    InitInProgressError,
+    NoInProgressInitError,
+    RescanInProgressError,
+)
 from switcher.oplog import OpLogRecord, _InitOp, _RenameOp, _RescanOp
 from switcher.service import InitAlreadyCompletedReport
 
@@ -133,6 +137,7 @@ class _FakeService:
     compensate_rename_args: list[_RenameOp] = field(default_factory=list)
     init_calls: list[dict[str, Any]] = field(default_factory=list)
     init_return_value: Any = None
+    init_side_effect: BaseException | None = None
 
     def _compensate_rename(self, record: _RenameOp) -> None:
         self.compensate_rename_args.append(record)
@@ -147,6 +152,8 @@ class _FakeService:
         # the CLI mistakenly forwarded --only / --skip would show up as
         # a non-None target_ids in the recorded dict.
         self.init_calls.append({"target_ids": target_ids, **kwargs})
+        if self.init_side_effect is not None:
+            raise self.init_side_effect
         return self.init_return_value
 
 
@@ -528,22 +535,23 @@ def test_init_abort_with_filter_flag_rejected(
 def test_init_continue_dispatches_to_service_with_in_flight(
     patched_deps: _FakeDeps,
 ) -> None:
-    """`switcher init --continue` must bypass the generic
-    _detect_or_compensate_oplog hook (which would raise
-    InitInProgressError on the in-flight _InitOp) and dispatch directly
-    to service.init(continue_=True). The recovery branch's only
-    pre-service call is vacuum_completed (journal hygiene); it must
-    NOT call read_in_flight (the service does that itself)."""
+    """`switcher init --continue` with an in-flight _InitOp must bypass
+    the generic _detect_or_compensate_oplog hook (which would otherwise
+    raise InitInProgressError) and dispatch to service.init(continue_=True).
+    Journal hygiene (vacuum_completed + a read_in_flight probe for the
+    rename-drain check) still runs."""
     patched_deps.oplog.in_flight = _init_record()
     runner = CliRunner()
     result = runner.invoke(app, ["init", "--continue"])
     assert result.exit_code == 0, _combined(result)
-    assert patched_deps.oplog.calls == ["vacuum_completed"]
+    # vacuum_completed (journal hygiene) + read_in_flight (rename-drain
+    # probe; harmless when the in-flight op is an _InitOp).
+    assert patched_deps.oplog.calls == ["vacuum_completed", "read_in_flight"]
     assert patched_deps.service.init_calls == [
         {"target_ids": None, "continue_": True, "abort": False}
     ]
-    # Sanity: rename auto-compensation MUST NOT run on the recovery
-    # path — the hook is bypassed entirely.
+    # Rename auto-compensation MUST NOT fire when the in-flight op is
+    # an init — only an _InitOp is in flight here.
     assert patched_deps.service.compensate_rename_args == []
 
 
@@ -554,11 +562,90 @@ def test_init_abort_dispatches_to_service_with_in_flight(
     runner = CliRunner()
     result = runner.invoke(app, ["init", "--abort"])
     assert result.exit_code == 0, _combined(result)
-    assert patched_deps.oplog.calls == ["vacuum_completed"]
+    assert patched_deps.oplog.calls == ["vacuum_completed", "read_in_flight"]
     assert patched_deps.service.init_calls == [
         {"target_ids": None, "continue_": False, "abort": True}
     ]
     assert patched_deps.service.compensate_rename_args == []
+
+
+# Rename auto-compensation must STILL fire on the recovery path -----------
+
+
+def test_init_continue_drains_in_flight_rename_before_dispatch(
+    patched_deps: _FakeDeps,
+) -> None:
+    """A stale in-flight _RenameOp (left from a crash on a prior rename)
+    must be transparently auto-compensated BEFORE init recovery dispatches.
+    Without this, `switcher init --continue/--abort` would hit the
+    service's "not an _InitOp" guard and raise OpLogCorruptError on a
+    state every OTHER CLI command silently fixes (spec §2.3 contract:
+    rename is auto-compensated transparently on every other command).
+
+    Both reviewers (CR + abby) flagged this as a blocking regression in
+    the initial recovery wiring; the fix re-runs rename's idempotent
+    disk-truth roll-forward via service._compensate_rename, mirroring
+    the read-only/mutating branch of _detect_or_compensate_oplog.
+    """
+    rename = _rename_record()
+    patched_deps.oplog.in_flight = rename
+    # Simulate the real OpLog's post-drain state: after rename is
+    # marked completed by service._compensate_rename, the next
+    # read_in_flight returns None, and service.init(continue_=True)
+    # raises NoInProgressInitError. The fake mimics that by clearing
+    # in_flight inside the compensate hook and arming init_side_effect.
+    real_compensate = patched_deps.service._compensate_rename
+
+    def drain_and_clear(record: _RenameOp) -> None:
+        real_compensate(record)
+        patched_deps.oplog.in_flight = None
+
+    patched_deps.service._compensate_rename = drain_and_clear  # type: ignore[method-assign]
+    patched_deps.service.init_side_effect = NoInProgressInitError(
+        "no interrupted init detected; nothing to continue/abort"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--continue"])
+    # The contract: rename drained FIRST, then init dispatched.
+    assert patched_deps.service.compensate_rename_args == [rename]
+    assert len(patched_deps.service.init_calls) == 1
+    # And the surfaced error is NoInProgressInitError (clean signal),
+    # NOT OpLogCorruptError (scary corruption) — that was abby's
+    # blocking concern with the original wiring.
+    out = _combined(result).lower()
+    assert "no interrupted init" in out
+    assert "corrupt" not in out
+    assert result.exit_code == 1
+
+
+def test_init_abort_drains_in_flight_rename_before_dispatch(
+    patched_deps: _FakeDeps,
+) -> None:
+    """Same contract for --abort. Rename auto-compensation is symmetric
+    across continue and abort because the rename drain is independent
+    of the init's recovery direction."""
+    rename = _rename_record()
+    patched_deps.oplog.in_flight = rename
+    real_compensate = patched_deps.service._compensate_rename
+
+    def drain_and_clear(record: _RenameOp) -> None:
+        real_compensate(record)
+        patched_deps.oplog.in_flight = None
+
+    patched_deps.service._compensate_rename = drain_and_clear  # type: ignore[method-assign]
+    patched_deps.service.init_side_effect = NoInProgressInitError(
+        "no interrupted init detected; nothing to continue/abort"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--abort"])
+    assert patched_deps.service.compensate_rename_args == [rename]
+    assert len(patched_deps.service.init_calls) == 1
+    out = _combined(result).lower()
+    assert "no interrupted init" in out
+    assert "corrupt" not in out
+    assert result.exit_code == 1
 
 
 # Return-shape handling -----------------------------------------------------

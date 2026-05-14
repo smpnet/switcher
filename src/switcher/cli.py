@@ -537,16 +537,25 @@ def init(
     deps = get_deps()
 
     if continue_ or abort:
-        # Recovery dispatch MUST run before the generic detection hook.
-        # The hook would raise InitInProgressError on the in-flight
-        # _InitOp (mutating path), and recovery would never reach the
-        # service. Journal hygiene (vacuum_completed) still runs so a
-        # stale completed snapshot can't masquerade as in-flight when
-        # the service reads the record. The service raises
-        # NoInProgressInitError / RescanInProgressError /
-        # OpLogCorruptError / AbortPreflightError — all SwitcherError
-        # subclasses that handle_errors routes through err_console.
+        # Recovery dispatch MUST run before the generic detection hook
+        # would raise InitInProgressError on the in-flight _InitOp. But
+        # an in-flight _RenameOp (left from a crash on a prior rename)
+        # is supposed to be transparently auto-compensated on EVERY
+        # CLI command — spec §2.3 + the read-only/mutating branch of
+        # _detect_or_compensate_oplog. Bypassing that contract here
+        # would elevate a recoverable state to a scary OpLogCorruptError
+        # (service.init's "not an _InitOp" guard fires on _RenameOp).
+        # Drain rename first, then dispatch init recovery against
+        # whatever is still in flight (or nothing).
+        #
+        # The service raises NoInProgressInitError /
+        # RescanInProgressError / OpLogCorruptError / AbortPreflightError
+        # — all SwitcherError subclasses that handle_errors routes
+        # through err_console.
         deps.oplog.vacuum_completed()
+        in_flight = deps.oplog.read_in_flight()
+        if isinstance(in_flight, _RenameOp):
+            deps.service._compensate_rename(in_flight)  # pyright: ignore[reportPrivateUsage]
         result = deps.service.init(continue_=continue_, abort=abort)
         _print_init_recovery_result(result, abort=abort)
         return
