@@ -2335,7 +2335,17 @@ class ProfileService:
         into: str | None = None,
         dry_run: bool = False,
     ) -> RescanReport:
-        """Capture newly-installed tools (spec §4)."""
+        """Capture newly-installed tools (spec §4).
+
+        v0.1.5 op-log integration: rescan does NOT yet write an
+        ``_RescanOp`` intent record — that wiring ships in PR5 / Phase 7
+        alongside ``--continue`` / ``--abort`` recovery flags. The CLI
+        detection hook still surfaces a hand-injected or
+        downgrade-stranded ``_RescanOp`` as ``RescanInProgressError``
+        (mutating) / exit 3 (read-only); the recovery surface points at
+        the forthcoming flags rather than executing compensation here.
+        Spec §2.2.
+        """
         self._require_initialized()
         active = self._store.get_active()
 
