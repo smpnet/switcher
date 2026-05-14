@@ -773,6 +773,16 @@ class ProfileService:
         ``InitInProgressError`` (mutating) / exit 3 (read-only); the
         user resolves via ``switcher init --continue`` / ``--abort``.
         """
+        # Defense-in-depth mutex (CLI enforces the same invariant ahead
+        # of get_deps; this guard catches direct callers — tests,
+        # alternative front-ends — that bypass the CLI layer). Silently
+        # falling through to the `continue_` branch would let a confused
+        # caller compensate-forward when they thought they were aborting.
+        # ValueError matches the "in-memory caller bug" shape, same as
+        # OpLogIO.append_record's completed-record rejection.
+        if continue_ and abort:
+            raise ValueError("init: continue_ and abort are mutually exclusive")
+
         oplog = OpLogIO(self._store.state_dir())
 
         if continue_ or abort:
@@ -897,7 +907,29 @@ class ProfileService:
         )
         oplog.append_record(intent)
 
-        self._store.create(current_name, {t.id: True for t in installed})
+        # Pre-mutation cancel scope (mirrors service.rename): the first
+        # `_store.create(current_name, ...)` is the entry point to all FS
+        # mutation. Its only pre-mutation exit is `ProfileExistsError`
+        # from `profile_dir.exists()` — raised before `d.mkdir`, so the
+        # disk is untouched. Init's own pre-flight (`_store.list()` empty)
+        # makes that path effectively unreachable today, but a race
+        # between pre-flight and this call (another process / hand-edited
+        # state) would land here, and turning a no-op failure into a
+        # persistent "compensate the init that never started" prompt
+        # blocks every subsequent retry. cancel_intent drops the record
+        # for that class of failure only — every OTHER exception (mid-
+        # `mkdir`, capture loop, `_store.create("vanilla")` AFTER the
+        # capture loop committed FS state, set_active_state, mark_completed
+        # itself) leaves durable partial state the journal exists to
+        # recover. Suppression scope matches rename's: best-effort on
+        # StorageError, propagate OpLogCorruptError (race-on-the-journal-
+        # itself signal that must surface loudly).
+        try:
+            self._store.create(current_name, {t.id: True for t in installed})
+        except ProfileExistsError:
+            with contextlib.suppress(StorageError):
+                oplog.cancel_intent(intent)
+            raise
         live_paths_cache: dict[str, list[str]] = {}
         for tool in installed:
             live_paths_cache[tool.id] = self._capture_tool(current_name, tool)

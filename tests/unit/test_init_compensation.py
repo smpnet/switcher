@@ -12,6 +12,7 @@ import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +20,7 @@ from switcher.errors import (
     AbortPreflightError,
     NoInProgressInitError,
     OpLogCorruptError,
+    ProfileExistsError,
 )
 from switcher.models import Tool
 from switcher.oplog import OpLogIO, _InitOp, _MappingIntent
@@ -201,6 +203,80 @@ def test_continue_with_no_in_flight_raises_no_in_progress(
     """`switcher init --continue` against an empty journal → NoInProgressInitError."""
     with pytest.raises(NoInProgressInitError):
         service.init(continue_=True)
+
+
+def test_continue_and_abort_mutually_exclusive_at_service_layer(
+    service: ProfileService,
+) -> None:
+    """Defense-in-depth: the service-level mutex protects direct
+    callers that bypass the CLI. Without it, ``continue_=True`` AND
+    ``abort=True`` would silently fall through to the continue branch
+    (because the dispatch is ``if continue_: ... else: ...``) — exactly
+    the silent-misroute abby flagged."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        service.init(continue_=True, abort=True)
+
+
+# -- writer-side journal hygiene ---------------------------------------------
+
+
+def test_init_cancels_intent_on_pre_mutation_create_failure(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """A ``ProfileExistsError`` from ``_store.create(current_name, ...)``
+    is a pre-mutation failure: the disk is untouched (store.create's
+    existence check raises BEFORE mkdir). The in-flight intent must
+    be canceled so a retry isn't blocked behind a "compensate the init
+    that never started" prompt.
+
+    Mirrors ``test_rename_cancels_intent_on_pre_mutation_exception`` —
+    same class of failure, same cancel_intent contract."""
+    with (
+        patch.object(
+            service._store,
+            "create",
+            side_effect=ProfileExistsError("simulated race"),
+        ),
+        pytest.raises(ProfileExistsError, match="simulated race"),
+    ):
+        service.init()
+    oplog = OpLogIO(tmp_state)
+    assert oplog.read_in_flight() is None
+    assert oplog.read_records() == []
+
+
+def test_init_preserves_intent_on_post_mutation_failure(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """A failure AFTER ``_store.create(current_name, ...)`` already
+    mutated FS state (here: a ``_capture_tool`` OSError) must NOT
+    cancel the intent — compensation needs the in-flight record to
+    drive the recovery surface. The cancel scope is narrow on purpose:
+    only the pre-mutation ProfileExistsError window triggers it."""
+    real_capture = service._capture_tool
+
+    def _failing_capture(profile: str, tool: object) -> list[str]:
+        # Run the real capture for the first call so we leave actual
+        # post-mutation state behind, then fail on the second call to
+        # exit init mid-loop. Without real mutation, the test would be
+        # exercising the pre-mutation path again.
+        if not getattr(_failing_capture, "_fired", False):
+            _failing_capture._fired = True  # type: ignore[attr-defined]
+            return real_capture(profile, tool)  # type: ignore[arg-type]
+        raise OSError("simulated post-create failure")
+
+    with (
+        patch.object(service, "_capture_tool", side_effect=_failing_capture),
+        pytest.raises(OSError, match="simulated post-create failure"),
+    ):
+        service.init()
+    oplog = OpLogIO(tmp_state)
+    in_flight = oplog.read_in_flight()
+    assert in_flight is not None, (
+        "intent must survive a post-mutation failure — compensation "
+        "needs it to drive --continue / --abort"
+    )
+    assert in_flight.op == "init"
 
 
 # -- abort-path --------------------------------------------------------------
