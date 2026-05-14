@@ -1098,27 +1098,39 @@ class ProfileService:
         satisfies it alone — without the explicit ``is_link`` refusal
         we'd bless an externally-mutated profile shape as healthy.
 
-        Not checked here: profile ``metadata.json`` readability. CR
-        pass-2 critical flagged that ``_store.create``'s
-        ``shutil.rmtree(d, ignore_errors=True)`` rollback could silently
-        fail (Windows file-lock race), leaving the profile dir without
-        metadata while every OTHER invariant holds. Pushed back: the
-        trigger is extremely narrow, compensation cannot regenerate
-        the current profile's metadata (only the dir-missing path
-        creates a fresh profile), and tightening this check breaks
+        Vanilla metadata check (CR pass-5 major): vanilla's
+        ``metadata.json`` readability IS verified — without it, a
+        rmtree-silent-failure window during ``_store.create("vanilla",
+        ...)`` could leave an empty vanilla dir that the short-circuit
+        would bless as healthy, blocking the empty-leftover repair
+        path in ``_compensate_init_continue``. Returning False here
+        falls through to compensation, which detects the empty-dir
+        case and regenerates vanilla via ``_store.delete + _store.create``.
+
+        NOT checked here: the dated-current profile's metadata.json.
+        That broader check (CR pass-2 critical, pass-3 major) was
+        pushed back — compensation cannot regenerate the current
+        profile's metadata (it holds user data captured from live
+        dirs; we can't synthesize it), tightening the check breaks
         the existing test-scaffolding pattern that mkdir's a profile
-        dir without going through ``store.create`` (15+ tests). The
-        user-visible outcome on the rmtree-silent-failure window:
-        short-circuit fires → mark_completed → next ``switcher use``
-        raises ``UnknownProfileError`` with a clear "profile X not
-        found" message. Manual recovery (delete the broken dir,
-        re-run init) works regardless. Track for a follow-on that
-        refactors test scaffolding alongside the invariant tightening.
+        dir without going through ``store.create`` (15+ tests), and
+        the user-visible outcome on that window is a clear
+        ``UnknownProfileError`` on the next ``switcher use``. Track
+        for a follow-on PR that refactors test scaffolding alongside
+        the invariant tightening.
         """
         for name in (record.profile_name, "vanilla"):
             p = self._store.profile_dir(name)
             if self._resolver.is_link(p) or not p.is_dir():
                 return False
+        # Vanilla metadata readability — vanilla is in our control
+        # (no user data), so the check is safe to apply here without
+        # breaking the test-scaffolding pattern that mkdir's the
+        # dated-current profile directly.
+        try:
+            self._store.get("vanilla")
+        except (UnknownProfileError, StorageError):
+            return False
         profile_dir = self._store.profile_dir(record.profile_name)
         for intent in record.mappings:
             if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:

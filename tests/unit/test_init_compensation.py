@@ -650,6 +650,50 @@ def test_abort_short_circuits_when_already_completed(
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_check_does_not_short_circuit_when_vanilla_metadata_unreadable(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """``_check_init_already_completed`` MUST treat a vanilla profile
+    with missing/corrupt metadata.json as "not fully completed" — the
+    short-circuit fires only when the dir-mkdir window of
+    ``_store.create("vanilla", ...)`` survived AND the rest of init
+    completed. Without the metadata check, the short-circuit would
+    bless an empty-leftover vanilla dir as a healthy profile and
+    mark the journal completed, blocking the empty-leftover repair
+    path in ``_compensate_init_continue``. CR pass-5 major
+    (narrower than the pass-2/pass-3 broader metadata concern; scoped
+    here to vanilla where compensation CAN heal — the current
+    profile remains pushed back because compensation cannot
+    regenerate user-data-bearing metadata)."""
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    store.create("vanilla", {"claude": True})
+    store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
+    # Sabotage: delete vanilla's metadata.json to simulate the
+    # rmtree-silent-failure window. Dir survives empty.
+    (store.profile_dir("vanilla") / "metadata.json").unlink()
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    # Continue must fall through to _compensate_init_continue, where
+    # the empty-leftover repair path regenerates vanilla via store.create.
+    service.init(continue_=True)
+
+    # Healed: vanilla metadata.json was rewritten through the canonical
+    # store API.
+    profile = store.get("vanilla")
+    assert profile.name == "vanilla"
+    # Journal record marked completed by compensation's tail.
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
 def test_continue_regenerates_vanilla_when_empty_leftover_dir(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
