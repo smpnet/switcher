@@ -1039,17 +1039,35 @@ class ProfileService:
                 continue
             self._seed_credentials(record.profile_name, "vanilla", tool)
 
-        # Step 7: active map + live-paths cache, one atomic write. Build
-        # live_paths_cache from the resolver (NOT from _capture_tool —
-        # the move has already happened, calling it again would fail).
-        live_paths_cache: dict[str, list[str]] = {}
-        for tid in record.target_ids:
-            tool = find_tool(self._registry, tid)
-            if tool is None:
-                continue
-            live_paths_cache[tid] = [
-                str(self._resolver.tool_dir(tool, i)) for i in range(len(tool.config_dirs))
-            ]
+        # Step 7: active map + live-paths cache, one atomic write. Both
+        # maps are derived from the journal (NOT the live registry):
+        #
+        #   - `live_paths_cache` is built per-tool from `record.mappings`,
+        #     sorted by `mapping_index` so the list matches `tool.config_dirs`
+        #     ordering. Using the journal here (rather than the resolver
+        #     output) keeps the cache symmetric with `active` even when a
+        #     tool was unregistered between intent-write and recovery:
+        #     the journal holds the canonical live_path it observed, and
+        #     that's what the on-disk symlink references.
+        #
+        #   - `active` covers every target_id, orphans included. Active-
+        #     map entries for unregistered tools mirror rename's
+        #     orphan-tolerance contract — the live symlink exists on
+        #     disk regardless of the registry state, and the active map
+        #     must stay consistent with that observation.
+        #
+        # abby-review pass-2 finding: the previous resolver-based cache
+        # built `live_paths_cache` only for `find_tool`-resolved tools,
+        # producing an asymmetric (active, cache) pair when a tool
+        # disappeared from the registry between intent and recovery.
+        live_paths_by_tool: dict[str, list[tuple[int, str]]] = {}
+        for mapping in record.mappings:
+            live_paths_by_tool.setdefault(mapping.tool_id, []).append(
+                (mapping.mapping_index, mapping.live_path)
+            )
+        live_paths_cache: dict[str, list[str]] = {
+            tid: [p for _, p in sorted(entries)] for tid, entries in live_paths_by_tool.items()
+        }
         active = dict.fromkeys(record.target_ids, record.profile_name)
         self._store.set_active_state(active, live_paths_cache)
 

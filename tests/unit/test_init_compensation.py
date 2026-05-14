@@ -451,6 +451,91 @@ def test_abort_validates_all_mappings_before_mutating_any(
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
+def test_abort_short_circuits_when_already_completed(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """The "committed but log-unmarked" short-circuit
+    (``_check_init_already_completed``) applies to BOTH ``--continue``
+    AND ``--abort``: a crash between the final ``set_active_state``
+    and ``mark_completed`` leaves the on-disk state already consistent,
+    so the recovery flag's exact value doesn't matter — both paths
+    should mark the record completed and skip per-mapping mutation.
+
+    Locks behavior in (abby-review pass-2 non-blocking suggestion):
+    a future change that splits the short-circuit between continue and
+    abort would silently reverse a committed init.
+    """
+    # Set up the post-set_active_state-pre-mark_completed shape: live
+    # is a symlink to a populated target, active map covers target_ids.
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(abort=True)
+
+    # Abort did NOT run: live still symlinked, target data intact,
+    # profile dir present, active map untouched.
+    assert claude_live.is_symlink()
+    assert (target / "settings.json").read_text() == '{"committed": true}'
+    assert profile_dir.exists()
+    assert store.get_active().get("claude") == profile_name
+    # Journal: record marked completed (next vacuum drops it).
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
+def test_continue_writes_symmetric_active_and_cache_for_orphan_tool(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """abby-review pass-2 blocker: if a tool is unregistered between
+    intent-write and recovery, ``_compensate_init_continue`` must
+    still write the live_paths_cache entry for it — the journal holds
+    the live_path snapshot the resolver can no longer reproduce, and
+    a missing cache entry alongside a present active entry creates
+    inconsistent state.
+
+    Use a fabricated tool id (``"phantom"``) that the registry has
+    never heard of so ``find_tool`` returns None, simulating the
+    "registered at intent time, not at recovery time" drift.
+    """
+    phantom_live = tmp_home / ".phantom"
+    phantom_live.mkdir()
+    (phantom_live / "settings.json").write_text('{"phantom": true}')
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    profile_dir.mkdir(parents=True)
+    phantom_mapping = _MappingIntent.model_validate(
+        {
+            "tool_id": "phantom",
+            "mapping_index": 0,
+            "live_path": str(phantom_live),
+            "profile_subdir": "phantom",
+            "original_kind": "real-dir",
+        }
+    )
+    record = _make_init_record(profile_name, ["phantom"], [phantom_mapping])
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(continue_=True)
+
+    # Active map has phantom; cache also has phantom with the journal's
+    # live_path. (The previous resolver-based cache would have skipped
+    # phantom — only active would carry it.)
+    active = store.get_active()
+    cache = store.get_active_live_paths()
+    assert active.get("phantom") == profile_name
+    assert cache.get("phantom") == [str(phantom_live)]
+
+
 def test_abort_idempotent_second_call_raises_no_in_progress(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
