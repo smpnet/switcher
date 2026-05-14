@@ -691,6 +691,12 @@ def test_check_does_not_short_circuit_when_vanilla_metadata_unreadable(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    # Create the dated-current profile properly so its metadata.json
+    # exists — without this, the new pass-7 check fires on the current
+    # profile and the test becomes a false-positive for the vanilla
+    # branch (abby pass-8 blocker). Sabotaging ONLY vanilla isolates
+    # the vanilla-specific path.
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -698,8 +704,9 @@ def test_check_does_not_short_circuit_when_vanilla_metadata_unreadable(
     _symlink_dir(target, claude_live)
     store.create("vanilla", {"claude": True})
     store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
-    # Sabotage: delete vanilla's metadata.json to simulate the
-    # rmtree-silent-failure window. Dir survives empty.
+    # Sabotage ONLY vanilla's metadata.json to simulate the
+    # rmtree-silent-failure window. Vanilla dir survives empty;
+    # current profile remains fully healthy.
     (store.profile_dir("vanilla") / "metadata.json").unlink()
     record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
     OpLogIO(tmp_state).append_record(record)
