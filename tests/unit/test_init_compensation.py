@@ -8,6 +8,7 @@ conftest.py — same pattern as test_rename_compensation.py."""
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from datetime import UTC, datetime
@@ -214,10 +215,9 @@ def test_continue_routes_user_to_rescan_when_in_flight_is_rescan(
     ``switcher rescan --continue`` command rather than silently
     refusing with a generic "wrong type" error.
 
-    abby-review pass-3 regression guard: this user-facing recovery-
-    steering branch must stay covered so a future refactor doesn't
-    quietly land users on a manual-recovery prompt for an op that
-    has an automated recovery command available."""
+    This user-facing recovery-steering branch must stay covered so a
+    future refactor doesn't quietly land users on a manual-recovery
+    prompt for an op that has an automated recovery command available."""
     record = _RescanOp.model_validate(
         {
             "op": "rescan",
@@ -248,9 +248,7 @@ def test_continue_refuses_with_oplog_corrupt_on_unexpected_in_flight_type(
     command's detection hook (which auto-compensates rename) didn't
     run — likely a stale binary or a hand-edited journal. The
     defensive refusal is documented in service.init's continue/abort
-    dispatch table.
-
-    abby-review pass-3 regression guard."""
+    dispatch table."""
     record = _RenameOp.model_validate(
         {
             "op": "rename",
@@ -526,9 +524,8 @@ def test_abort_short_circuits_when_already_completed(
     so the recovery flag's exact value doesn't matter — both paths
     should mark the record completed and skip per-mapping mutation.
 
-    Locks behavior in (abby-review pass-2 non-blocking suggestion):
-    a future change that splits the short-circuit between continue and
-    abort would silently reverse a committed init.
+    Regression guard: a future change that splits the short-circuit
+    between continue and abort would silently reverse a committed init.
     """
     # Set up the post-set_active_state-pre-mark_completed shape: live
     # is a symlink to a populated target, active map covers target_ids.
@@ -557,13 +554,43 @@ def test_abort_short_circuits_when_already_completed(
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_continue_serializes_empty_cache_entry_for_zero_mapping_tool(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """A target_id with zero mappings (a registry-only tool with no
+    ``config_dirs``) must serialize as ``cache[tid] = []`` on disk
+    — matching the shape a clean init writes (``_capture_tool``
+    returns ``[]`` for those tools). Without an explicit per-target
+    seed, continue would silently drop the cache key while leaving
+    active populated — asymmetric serialized state.
+
+    ``get_active_live_paths`` normalizes ``[]`` to "absent" at read
+    time, so the assertion has to read raw ``config.json`` rather
+    than going through the store API."""
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    profile_dir.mkdir(parents=True)
+    record = _make_init_record(profile_name, ["registry-only-tool"], mappings=[])
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(continue_=True)
+
+    config = json.loads((tmp_state / "config.json").read_text())
+    # active populated for the zero-mapping tool.
+    assert config["active"]["registry-only-tool"] == profile_name
+    # cache key present with [] value — the serialized symmetry.
+    assert "registry-only-tool" in config["active_live_paths"]
+    assert config["active_live_paths"]["registry-only-tool"] == []
+
+
 def test_continue_writes_symmetric_active_and_cache_for_orphan_tool(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
-    """abby-review pass-2 blocker: if a tool is unregistered between
-    intent-write and recovery, ``_compensate_init_continue`` must
-    still write the live_paths_cache entry for it — the journal holds
-    the live_path snapshot the resolver can no longer reproduce, and
+    """If a tool is unregistered between intent-write and recovery,
+    ``_compensate_init_continue`` must still write the
+    ``live_paths_cache`` entry for it — the journal holds the
+    ``live_path`` snapshot the resolver can no longer reproduce, and
     a missing cache entry alongside a present active entry creates
     inconsistent state.
 

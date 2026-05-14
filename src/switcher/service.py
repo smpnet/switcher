@@ -756,9 +756,7 @@ class ProfileService:
         above keeps the default-args call site typed as
         ``-> InitReport``; direct callers that pass either flag get
         ``-> InitReport | None`` and must handle the recovery branch
-        explicitly. abby-review pass-3 doc-suggestion: documented near
-        the summary so direct callers don't miss the shape change
-        buried in the v0.1.5 paragraph below.
+        explicitly.
 
         target_ids:
           None — capture every detected tool (v0.1.3 default-path behavior,
@@ -1060,34 +1058,38 @@ class ProfileService:
             self._seed_credentials(record.profile_name, "vanilla", tool)
 
         # Step 7: active map + live-paths cache, one atomic write. Both
-        # maps are derived from the journal (NOT the live registry):
+        # maps cover the SAME set — `record.target_ids` — so the
+        # serialized state matches the shape a clean init would write:
         #
-        #   - `live_paths_cache` is built per-tool from `record.mappings`,
-        #     sorted by `mapping_index` so the list matches `tool.config_dirs`
-        #     ordering. Using the journal here (rather than the resolver
-        #     output) keeps the cache symmetric with `active` even when a
-        #     tool was unregistered between intent-write and recovery:
-        #     the journal holds the canonical live_path it observed, and
-        #     that's what the on-disk symlink references.
+        #   - `active` carries every target_id (orphans whose tool
+        #     registration vanished between intent and recovery
+        #     included). The on-disk symlink the compensation step
+        #     already swapped exists regardless of registry state;
+        #     the active map must stay consistent with that observation.
+        #     Same orphan-tolerance contract rename uses.
         #
-        #   - `active` covers every target_id, orphans included. Active-
-        #     map entries for unregistered tools mirror rename's
-        #     orphan-tolerance contract — the live symlink exists on
-        #     disk regardless of the registry state, and the active map
-        #     must stay consistent with that observation.
+        #   - `live_paths_cache` is keyed by every target_id with `[]`
+        #     defaults so a registry-only tool (zero ``config_dirs``,
+        #     zero mappings) serializes as ``cache[tid] = []`` —
+        #     matching the normal init path where ``_capture_tool``
+        #     returns ``[]`` for those tools. Per-mapping live_paths
+        #     come from the journal (not the resolver) so orphans keep
+        #     the live_path snapshot the resolver can no longer
+        #     reproduce, sorted by ``mapping_index`` to match
+        #     ``tool.config_dirs`` ordering.
         #
-        # abby-review pass-2 finding: the previous resolver-based cache
-        # built `live_paths_cache` only for `find_tool`-resolved tools,
-        # producing an asymmetric (active, cache) pair when a tool
-        # disappeared from the registry between intent and recovery.
+        # Mismatched-coverage (active populated, cache key missing) was
+        # the asymmetric-state failure mode for both the orphan-tool
+        # and the zero-config_dirs cases — keep both maps anchored on
+        # ``target_ids``.
+        live_paths_cache: dict[str, list[str]] = {tid: [] for tid in record.target_ids}
         live_paths_by_tool: dict[str, list[tuple[int, str]]] = {}
         for mapping in record.mappings:
             live_paths_by_tool.setdefault(mapping.tool_id, []).append(
                 (mapping.mapping_index, mapping.live_path)
             )
-        live_paths_cache: dict[str, list[str]] = {
-            tid: [p for _, p in sorted(entries)] for tid, entries in live_paths_by_tool.items()
-        }
+        for tid, entries in live_paths_by_tool.items():
+            live_paths_cache[tid] = [p for _, p in sorted(entries)]
         active = dict.fromkeys(record.target_ids, record.profile_name)
         self._store.set_active_state(active, live_paths_cache)
 
