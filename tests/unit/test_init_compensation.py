@@ -695,6 +695,42 @@ def test_continue_does_not_short_circuit_when_cache_is_stale(
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_continue_does_not_short_circuit_when_zero_mapping_tool_has_stale_cache(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Symmetric to ``test_..._when_cache_is_stale`` but covers the
+    zero-mapping tool case: a target_id with no mappings expects
+    ``cache[tid] = []`` (normalized to "absent" at read). If a
+    crashed init left ``cache[tid] = ["/wrong/path"]`` behind, the
+    short-circuit must fall through so the cache-rebuild step
+    overwrites the stale entry.
+
+    Dict-equality check on ``(actual_cache == expected_nonempty)``
+    catches this — the actual cache has an extra key the expected
+    map doesn't carry."""
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    profile_dir = store.profile_dir(profile_name)
+    profile_dir.mkdir(parents=True)
+    store.create("vanilla", {"registry-only-tool": True})
+    # Stale cache: zero-mapping tool expects [] but actual cache has
+    # a non-empty path. Short-circuit MUST fall through.
+    store.set_active_state(
+        {"registry-only-tool": profile_name},
+        {"registry-only-tool": ["/wrong/stale/path"]},
+    )
+    record = _make_init_record(profile_name, ["registry-only-tool"], mappings=[])
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(continue_=True)
+
+    # Compensation rebuilt the cache: zero-mapping tool now has []
+    # (which appears as absent via get_active_live_paths).
+    config = json.loads((tmp_state / "config.json").read_text())
+    assert config["active_live_paths"].get("registry-only-tool") == []
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
 def test_continue_does_not_short_circuit_when_vanilla_is_missing(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

@@ -1056,14 +1056,21 @@ class ProfileService:
         }
         actual_cache = self._store.get_active_live_paths()
         # `actual_cache` only contains keys with non-empty values
-        # (get_active_live_paths normalizes [] to absent); compare
-        # against the non-empty slice of the journal expectation.
-        # Tools that appear in target_ids with zero mappings get
-        # cache[tid] = [] at write time and appear absent from
-        # actual_cache — that's the expected post-normalization view,
-        # so a target_id with no mappings is implicitly satisfied
-        # regardless of actual_cache containing it.
-        return all(actual_cache.get(tid) == expected for tid, expected in expected_nonempty.items())
+        # (get_active_live_paths normalizes [] to absent). A clean
+        # init's serialized cache covers target_ids exactly, with
+        # `[]` for zero-mapping tools; after normalization the
+        # post-read view matches `expected_nonempty` exactly — same
+        # keys, same values. Dict equality (not a per-key subset
+        # check) catches BOTH directions of drift:
+        #   - missing key / stale value for a tool that should have
+        #     a non-empty cache entry,
+        #   - extra entry for a zero-mapping target_id that should
+        #     have been an empty `[]` (normalized to absent).
+        # The second case is the gap abby-review pass-9 flagged: a
+        # crashed init leaving a stale non-empty cache for a tool the
+        # journal expects to be empty would have short-circuited
+        # under a per-key subset check.
+        return actual_cache == expected_nonempty
 
     def _compensate_init_continue(self, record: _InitOp) -> None:
         """Replay any non-COMPLETE mapping per the §2.1.1 continue
