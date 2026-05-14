@@ -1128,14 +1128,19 @@ class ProfileService:
             p = self._store.profile_dir(name)
             if self._resolver.is_link(p) or not p.is_dir():
                 return False
-        # Vanilla metadata readability — vanilla is in our control
-        # (no user data), so the check is safe to apply here without
-        # breaking the test-scaffolding pattern that mkdir's the
-        # dated-current profile directly.
-        try:
-            self._store.get("vanilla")
-        except (UnknownProfileError, StorageError):
-            return False
+        # Metadata readability for BOTH profiles. Falling through to
+        # compensation isn't enough by itself (compensation can't
+        # regenerate the current profile's metadata), but the
+        # short-circuit-only check still helps: it prevents
+        # mark_completed from clearing the journal on a state that's
+        # secretly broken, so a subsequent compensation pass can
+        # refuse loudly with the journal still in flight. abby pass-7
+        # blocker + CR pass-5/6 carry-forward.
+        for name in (record.profile_name, "vanilla"):
+            try:
+                self._store.get(name)
+            except (UnknownProfileError, StorageError):
+                return False
         profile_dir = self._store.profile_dir(record.profile_name)
         for intent in record.mappings:
             if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
@@ -1384,6 +1389,18 @@ class ProfileService:
         profile_dir = self._store.profile_dir(record.profile_name)
         vanilla_dir = self._store.profile_dir("vanilla")
 
+        # Preflight config.json BEFORE any FS mutation (CR pass-7
+        # major). The active-map / cache cleanup at the tail reads
+        # these maps to strip target_ids and rewrite. If config.json
+        # is malformed, that read raises StorageError — but at the
+        # tail position, abort would already have restored live dirs
+        # and deleted profile dirs, leaving the disk half-recovered
+        # and the journal still in flight. Reading early surfaces the
+        # corruption BEFORE any destructive work runs, so the user
+        # can fix config.json and re-run cleanly.
+        active_snapshot = self._store.get_active()
+        cache_snapshot = self._store.get_active_live_paths_raw()
+
         # VALIDATION pass. No FS mutation; states cached by index.
         # Profile-dir shape check runs FIRST so a corrupt vanilla /
         # dated-current path can't slip through to the per-mapping
@@ -1520,20 +1537,16 @@ class ProfileService:
         # tids that never landed in active/cache (crash before
         # `set_active_state`) skip cleanly.
         #
-        # Cache read goes through `get_active_live_paths_raw` (NOT
-        # `get_active_live_paths`) on purpose: the latter normalizes
-        # serialized `[]` entries to "absent", so the round-trip
-        # through `set_active_state` would silently drop any
-        # unrelated zero-mapping tool whose cache value is `[]` —
-        # exactly the external state abort is supposed to preserve.
-        # The raw accessor keeps those entries observable so the
-        # rewrite can leave them in place.
-        active = self._store.get_active()
-        cache = self._store.get_active_live_paths_raw()
+        # Use the validation-pass snapshots (read BEFORE any FS
+        # mutation — CR pass-7 major). The raw cache reader preserves
+        # serialized `[]` entries that the normalizing reader would
+        # drop, so unrelated zero-mapping tools survive the rewrite —
+        # mirrors the spec's "abort surfaces externally-mutated state
+        # for inspection" stance.
         for tid in record.target_ids:
-            active.pop(tid, None)
-            cache.pop(tid, None)
-        self._store.set_active_state(active, cache)
+            active_snapshot.pop(tid, None)
+            cache_snapshot.pop(tid, None)
+        self._store.set_active_state(active_snapshot, cache_snapshot)
 
     def use(self, profile_name: str, only: list[str] | None = None) -> None:
         self._require_initialized()

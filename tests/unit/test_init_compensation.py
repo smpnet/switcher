@@ -23,6 +23,7 @@ from switcher.errors import (
     OpLogCorruptError,
     ProfileExistsError,
     RescanInProgressError,
+    StorageError,
 )
 from switcher.models import Tool
 from switcher.oplog import OpLogIO, _InitOp, _MappingIntent, _RenameOp, _RescanOp
@@ -591,6 +592,12 @@ def test_continue_short_circuit_returns_already_completed_report(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    # Go through store.create so metadata.json is written — matches what
+    # a clean init produces and satisfies _check_init_already_completed's
+    # metadata-readability gate. Previously mkdir'd profile_dir directly,
+    # which (post-CR-pass-7) the short-circuit now correctly rejects as
+    # "current profile metadata not readable".
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -628,6 +635,9 @@ def test_abort_short_circuits_when_already_completed(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    # Same store.create-for-metadata reason as
+    # test_continue_short_circuit_returns_already_completed_report.
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -704,6 +714,62 @@ def test_check_does_not_short_circuit_when_vanilla_metadata_unreadable(
     assert profile.name == "vanilla"
     # Journal record marked completed by compensation's tail.
     assert OpLogIO(tmp_state).read_in_flight() is None
+
+
+def test_abort_preflights_config_before_any_filesystem_mutation(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """``_compensate_init_abort`` must read config.json in its validation
+    pass — BEFORE it deletes profile dirs or restores live state. If
+    config.json is malformed, the StorageError must surface BEFORE any
+    destructive work, leaving the disk recoverable for a manual retry
+    after the user fixes the config.
+
+    Without preflight, abort restores live dirs and deletes the profile
+    dirs (mutation pass), then reads config.json (cleanup pass) — if
+    that read raises StorageError, abort is half-applied: live state
+    restored, profile dirs gone, journal still in flight, but active
+    map still references the deleted profile. CR pass-7 major.
+
+    Scenario: a partial-complete state where the short-circuit returns
+    False (mapping isn't COMPLETE) so abort actually runs, AND
+    config.json is corrupted at FS-truth-read time.
+    """
+    # Pre-state: live dir present (real), no init mutation applied yet.
+    claude_live = tmp_home / ".claude"
+    (claude_live / "user-data.json").write_text('{"user": true}')
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # Build the init pre-flight state with proper metadata so the short-
+    # circuit's metadata check passes; the mapping classifier will then
+    # see UNTOUCHED (live still real-dir, target empty) → short-circuit
+    # fails on the mapping-not-COMPLETE check, abort proceeds.
+    store.create(profile_name, {"claude": True})
+    store.create("vanilla", {"claude": True})
+    store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    # Corrupt config.json AFTER setup. The short-circuit's get_active()
+    # read happens FIRST (against the malformed config) and short-
+    # circuits the check — but the abort path reads config again as
+    # part of its cleanup. The fix moves that read into the validation
+    # pass so it raises BEFORE any mutation.
+    config_path = tmp_state / "config.json"
+    config_path.write_text("{not valid json")
+
+    # Abort must raise (StorageError from malformed config) BEFORE any
+    # FS mutation. The short-circuit reads get_active too, so the
+    # error path may surface there OR in abort's validation — either
+    # is acceptable as long as the disk state is untouched.
+    with pytest.raises(StorageError):
+        service.init(abort=True)
+
+    # Pre-mutation state preserved end-to-end.
+    assert store.profile_dir(profile_name).is_dir()
+    assert store.profile_dir("vanilla").is_dir()
+    # Journal still in flight — no mark_completed reached.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
 def test_continue_regenerates_vanilla_when_empty_leftover_dir(
