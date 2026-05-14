@@ -226,16 +226,28 @@ def _detect_or_compensate_oplog(deps: Deps, *, allow_mutation: bool) -> None:
           other mutating callback lets the error bubble to
           ``handle_errors`` (stderr + exit 1).
 
+    Read-only / mutating asymmetry, made explicit (abby review):
+
+    - **Vacuum** is journal hygiene — gated on ``allow_mutation`` because
+      `switcher list` should not rewrite oplog.json just to scrub
+      completed records. The next mutating command tidies up.
+    - **Rename compensation** is forward progress on COMMITTED user
+      intent — runs from read-only callers too. The user already asked
+      for the rename when the intent record landed; an interrupted
+      rename surfacing through `switcher status` is automatically
+      finished rather than reported, because the spec treats the
+      auto-roll-forward as the canonical recovery path (§2.3, §2.2).
+      This writes to disk on the rare path of an interrupted rename;
+      a read-only state dir in that state can't be repaired without
+      ANY switcher command writing, so deferring compensation to a
+      mutating command would only shift the same StorageError later.
+    - **Init/rescan in-flight** never auto-compensates — those need
+      guided ``--continue`` / ``--abort`` decisions, so the hook
+      surfaces them as exit 3 (read-only) or
+      InitInProgressError / RescanInProgressError (mutating).
+
     Spec §2.2.
     """
-    # Vacuum only on mutating paths. Read-only commands (list / status /
-    # which / tools_main) should never write to disk; vacuum_completed
-    # rewrites oplog.json when there's anything to drop, which would
-    # promote `switcher list` from pure-read to a StorageError on a
-    # read-only state dir (e.g., sudo-owned, mounted read-only). The
-    # next mutating command will still tidy up — vacuum is idempotent
-    # and the journal grows by at most one record per completed op.
-    # CodeRabbit review.
     if allow_mutation:
         deps.oplog.vacuum_completed()
     in_flight = deps.oplog.read_in_flight()
