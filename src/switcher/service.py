@@ -21,6 +21,7 @@ from switcher.errors import (
     AlreadyLinkedError,
     NothingToInitializeError,
     NoToolsManagedError,
+    OpLogCorruptError,
     PathNotADirectoryError,
     ProfileExistsError,
     ProfileIsActiveError,
@@ -28,6 +29,7 @@ from switcher.errors import (
     RescanCaptureError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
+    StorageError,
     ToolHasNoActiveProfileError,
     ToolNotInProfileError,
     ToolNotManagedError,
@@ -37,6 +39,12 @@ from switcher.errors import (
 )
 from switcher.links import move_or_seed_dir, remove_link, restore_real_dir, swap_link
 from switcher.models import Profile, Tool
+
+# Op-log record classes are namespace-private to oplog.py (the underscore marks
+# them as internal-to-switcher, not a user-facing surface). Service is the
+# legitimate cross-module consumer that builds and dispatches them; the
+# per-line suppression keeps the convention without leaking module-wide.
+from switcher.oplog import OpLogIO, _RenameOp  # pyright: ignore[reportPrivateUsage]
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import find_tool
 from switcher.store import ProfileStore
@@ -1013,11 +1021,13 @@ class ProfileService:
            is ``use(<new>)``, which runs swap_link for every tool in the
            profile; it's idempotent on already-relinked tools.
 
-        The narrow failure window between steps 1 and 2 (rename succeeds,
-        set_active fails) leaves the active map pointing at ``old`` while
-        the profile lives at ``new``. That requires a manual state.json
-        edit until tracked-ops land in v0.2.0 — same constraint as
-        init() multi-step failures.
+        v0.1.5: an op-log intent record is appended BEFORE store.rename
+        runs and marked completed after the final
+        ``set_active_live_paths``. A crash in the narrow failure window
+        between steps 1 and 2 leaves the in-flight record for the next
+        CLI command's detection hook to auto-compensate via
+        :meth:`_compensate_rename` (idempotent disk-truth roll-forward;
+        no user input). See spec §2.3.
         """
         self._require_initialized()
         if not self._store.profile_dir(old).exists():
@@ -1029,8 +1039,7 @@ class ProfileService:
         # would let store.rename succeed, then swap_link refuse mid-loop with
         # IsADirectoryError, leaving the rename half-applied (profile dir
         # moved, some live links updated, others stale). Same "validate, then
-        # mutate" discipline as use() / save() / init(). True transactional
-        # rollback on transient swap_link failures is v0.2.0 (tracked-ops).
+        # mutate" discipline as use() / save() / init().
         active = self._store.get_active()
         affected_ids = [tid for tid, p in active.items() if p == old]
         for tid in affected_ids:
@@ -1048,7 +1057,53 @@ class ProfileService:
                     raise PathNotADirectoryError(
                         f"{live} exists but is not a directory; cannot relink"
                     )
-        self._store.rename(old, new)
+        # v0.1.5: record intent BEFORE any FS mutation. affected_ids carries
+        # SafeName-validated profile/tool ids (no path canonicalization
+        # needed at this entry point — rename does not persist live_paths).
+        oplog = OpLogIO(self._store.state_dir())
+        intent = _RenameOp.model_validate(
+            {
+                "op": "rename",
+                "started_at": now(),
+                "from": old,
+                "to": new,
+                "affected_ids": list(affected_ids),
+            }
+        )
+        oplog.append_record(intent)
+        # Cancellation scope is narrow on purpose. store.rename has explicit
+        # pre-mutation guards at the top of its body (UnknownProfileError
+        # if `old` vanished; ProfileExistsError if `to` appeared between
+        # OUR preflight and store.rename's own check) — both raised before
+        # any FS write. For those races, the disk is untouched, so dropping
+        # the in-flight intent prevents the next CLI command from
+        # "compensating" work that never started. Every OTHER exception
+        # (mid-store.rename OSError after the metadata write but before
+        # the dir replace, set_active failure after store.rename committed
+        # the move, swap_link failure mid-loop, mark_completed itself
+        # failing) may have left durable partial state — those are exactly
+        # the cases the journal exists to recover, so the intent must
+        # survive. abby-review batch-1 pass-3 blocking finding: a broad
+        # except Exception here would silently swallow the recovery record
+        # for those compensable failures.
+        #
+        # cancel_intent is best-effort for the I/O class of failures only:
+        # if the same FS error that broke the rename also breaks the
+        # journal's tmp+rename write (StorageError), prefer the original
+        # rename exception so the user sees the root cause, not the
+        # follow-on. OpLogCorruptError surfaces a different concern —
+        # the journal was externally modified between our append_record
+        # and the cancel attempt — and must propagate (the race exception
+        # becomes the implicit __context__ so the traceback has both).
+        # Suppressing OpLogCorruptError here would hide journal corruption
+        # behind a transient race and undermine the "surface corruption
+        # loudly" contract cancel_intent itself enforces.
+        try:
+            self._store.rename(old, new)
+        except (UnknownProfileError, ProfileExistsError):
+            with contextlib.suppress(StorageError):
+                oplog.cancel_intent(intent)
+            raise
         # Persist the active-map update IMMEDIATELY after the dir rename:
         # once both succeed, the rename is logically committed and any
         # subsequent swap_link failure is recoverable via `use(<new>)`.
@@ -1061,12 +1116,12 @@ class ProfileService:
         for tid in affected_ids:
             active[tid] = new
         # Step 2: commit the active-map update. set_active is the wrapper
-        # that round-trips the existing on-disk active_live_paths cache, so
-        # an already-populated cache survives. The migration flush comes
-        # AFTER swap_link below — at this point the symlinks still point at
-        # `<old>` (Path.resolve() returns the stored target verbatim, even
-        # when it no longer exists), so the strict validator can't yet
-        # produce a usable cache entry.
+        # that round-trips the existing on-disk active_live_paths cache,
+        # so an already-populated cache survives. The migration flush
+        # comes AFTER swap_link below — at this point the symlinks still
+        # point at `<old>` (Path.resolve() returns the stored target
+        # verbatim, even when it no longer exists), so the strict
+        # validator can't yet produce a usable cache entry.
         self._store.set_active(active)
         for tid in affected_ids:
             tool = find_tool(self._registry, tid)
@@ -1076,13 +1131,254 @@ class ProfileService:
                 target = self._store.profile_dir(new) / dm.profile_subdir
                 live = self._resolver.tool_dir(tool, i)
                 swap_link(target, live)
-        # Post-relink migration flush: now that every affected symlink points
-        # into <new>, _derive_cache_for_active can validate them against the
-        # post-rename active map. This is a second atomic write — safe
-        # because the canonical state (store dir + active map) is already
-        # consistent; the cache is a derived index, not load-bearing for
-        # recovery (recovery path is `use(<new>)` regardless).
+        # Post-relink migration flush: now that every affected symlink
+        # points into <new>, _derive_cache_for_active can validate them
+        # against the post-rename active map. This is a second atomic
+        # write — safe because the canonical state (store dir + active
+        # map) is already consistent; the cache is a derived index, not
+        # load-bearing for recovery (recovery path is `use(<new>)`
+        # regardless).
         self._store.set_active_live_paths(self._derive_cache_for_active(active))
+
+        # v0.1.5: mark the intent record completed.
+        oplog.mark_completed(intent)
+
+    def _compensate_rename(self, record: _RenameOp) -> None:
+        """Idempotent disk-truth roll-forward of a partial rename (spec §2.3).
+
+        Derives progress from disk on every call:
+          - from_dir_exists, to_dir_exists determine whether step 1 (store.rename) ran.
+          - Active map contents determine whether step 2 (set_active) ran.
+          - swap_link is idempotent on already-correct links, so step 3 is replayed
+            unconditionally for every affected_id in the registry.
+
+        Refuses if BOTH `from` and `to` dirs exist (data in two places, ambiguous)
+        or NEITHER exists (manual intervention since intent).
+
+        Important: the intent record is written BEFORE store.rename runs. The
+        `from_dir_exists AND NOT to_dir_exists` state means: intent was written,
+        but store.rename never ran (crash between append_record and store.rename,
+        OR inside store.rename before the directory replace). Compensation rolls
+        FORWARD by running store.rename ourselves — the user asked for this
+        rename and the intent record commits us to completing it.
+
+        On successful return, the in-flight intent is marked completed so the
+        next vacuum drops it. Failure paths re-raise without marking; the
+        record stays in-flight for the next compensation pass to pick up.
+        Mirrors the init/rescan compensation lifecycle (Tasks 6.3 / 7.2):
+        the service method that knows the record is fully recovered owns
+        the journal transition.
+        """
+        from_path = self._store.profile_dir(record.from_)
+        to_path = self._store.profile_dir(record.to)
+        # Path.exists() follows the link/file/dir distinction loosely;
+        # a regular file at profiles/<from>/ or profiles/<to>/ would
+        # otherwise look like a legitimate rename step state and slip
+        # past the dual-existence guards, only to fail later inside
+        # store.rename or relinking (CodeRabbit recurring review).
+        # is_dir() narrows existence to "actual profile directory";
+        # anything else (file, broken link, special) is corruption.
+        #
+        # is_dir() ALSO follows symlinks / Windows junctions through to
+        # their target — so a hand-edited profile dir that's actually a
+        # symlink pointing at an unrelated dir would slip past as
+        # "valid". Reject any link shape (cross-platform via
+        # `_resolver.is_link`) before the .is_dir() narrow (CodeRabbit
+        # PR review). The profile store invariant is "profile_dir is a
+        # real directory"; anything else came from outside switcher.
+        for label, path in (("from", from_path), ("to", to_path)):
+            if self._resolver.is_link(path):
+                raise OpLogCorruptError(
+                    f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                    f"{path} ({label}) is a symlink or junction, not a real "
+                    f"profile directory; manual recovery required"
+                )
+            if path.exists() and not path.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                    f"{path} exists but is not a directory; manual recovery required"
+                )
+        from_dir_exists = from_path.is_dir()
+        to_dir_exists = to_path.is_dir()
+
+        if from_dir_exists and to_dir_exists:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: both "
+                f"profile dirs exist on disk; manual recovery required"
+            )
+        if not from_dir_exists and not to_dir_exists:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"neither profile dir exists on disk; manual recovery required"
+            )
+
+        # Pre-flight (mirrors service.rename): every affected tool's live path
+        # must be a link (broken or valid) or non-existent. A real directory
+        # or regular file there would let store.rename / set_active run, then
+        # swap_link would refuse mid-loop, leaving the active map at `to`
+        # while a stale live link still references `from` — exactly the
+        # partial-apply shape this compensation is supposed to resolve. The
+        # window is real: a user who notices a missing live dir post-crash
+        # and runs `mkdir ~/.claude` before re-invoking switcher will land
+        # here. Validate before any mutation; same discipline as rename().
+        for tid in record.affected_ids:
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                continue
+            for i in range(len(tool.config_dirs)):
+                live = self._resolver.tool_dir(tool, i)
+                if not self._resolver.is_link(live) and live.exists():
+                    if live.is_dir():
+                        raise PathNotADirectoryError(
+                            f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                            f"{live} is a real directory, not a switcher link; "
+                            f"remove it (or restore the original symlink) before "
+                            f"compensation can complete"
+                        )
+                    raise PathNotADirectoryError(
+                        f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                        f"{live} exists but is not a directory; cannot relink"
+                    )
+
+        # Drift guards (run BEFORE the store.rename replay so a corrupt
+        # journal doesn't trigger further canonical-state mutation):
+        # the active map's affected slice must be in a coherent rename
+        # phase, and no UNEXPECTED active entries may reference either
+        # endpoint of the rename. The real `service.rename` sequence is
+        #
+        #   (1) store.rename(old, new)                  # profile dir move
+        #   (2) for tid in affected_ids: active[tid]=new  # in-memory rewrite
+        #   (3) store.set_active(active)                # atomic persist
+        #   (4) swap_link loop                          # live link relink
+        #
+        # The legitimate post-crash phases are therefore:
+        #   A. pre-(1): from dir exists, all affected at `from_`
+        #   B. post-(1) pre-(3): to dir exists, all affected at `from_`
+        #   C. post-(3): to dir exists, all affected at `to_`
+        # Anything else (mixed affected, affected at `to_` while from
+        # dir still exists, third-profile drift, unexpected extra refs
+        # to `from_/to_` outside affected_ids) cannot come from the
+        # real rename sequence. Auto-healing it would silently drop the
+        # user's original intent or bless externally-mutated state as
+        # recovered. Refuse loudly and leave the intent in flight.
+        # Hermes PR review convergence with CodeRabbit's earlier
+        # plateau on the same surface.
+        active = dict(self._store.get_active())
+        affected_set = set(record.affected_ids)
+
+        # 1. Affected slice must live entirely within {from_, to}.
+        drifted = {
+            tid: active.get(tid)
+            for tid in record.affected_ids
+            if active.get(tid) not in {record.from_, record.to}
+        }
+        if drifted:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"affected active-map entries drifted outside the expected "
+                f"{{{record.from_!r}, {record.to!r}}} set: {drifted!r}. "
+                f"Manual recovery required."
+            )
+
+        # 2. Phase coherence: every affected_id must be at the SAME
+        #    endpoint — `set_active` is atomic, so a split affected
+        #    set cannot be produced by the real rename sequence.
+        affected_phase = {active[tid] for tid in record.affected_ids}
+        if len(affected_phase) > 1:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"affected active-map entries are split across both endpoints "
+                f"{affected_phase!r} — `set_active` is atomic so this state "
+                f"cannot come from the real rename sequence. Manual recovery "
+                f"required."
+            )
+
+        # 3. from_dir_exists implies pre-(1): no affected entry should
+        #    already point at `to`. Affected-at-`to_` means step (2)
+        #    ran, which in turn means step (1) ran first — so `from`
+        #    dir must be gone. Seeing both is externally-mutated state.
+        if from_dir_exists and record.to in affected_phase:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"source dir {from_path} still exists, yet affected active-map "
+                f"entries already reference {record.to!r}. step (2) of the "
+                f"rename runs after step (1); this phase is unreachable from "
+                f"the real sequence. Manual recovery required."
+            )
+
+        # 4. No tool outside `affected_ids` may reference either rename
+        #    endpoint. Such an entry was not part of the journal's
+        #    "what to recover" snapshot: rolling the rename forward
+        #    would leave it pointing at `from_` (a profile name that's
+        #    about to disappear) or pre-bless a `to`-reference that
+        #    came from somewhere else. Either way, the journal would
+        #    get marked completed while canonical state remains
+        #    inconsistent (Hermes PR review robustness gap; CodeRabbit
+        #    recurring).
+        extra_refs = {
+            tid: profile
+            for tid, profile in active.items()
+            if tid not in affected_set and profile in {record.from_, record.to}
+        }
+        if extra_refs:
+            raise OpLogCorruptError(
+                f"interrupted rename {record.from_!r} -> {record.to!r}: "
+                f"active-map entries outside record.affected_ids still "
+                f"reference one of the rename endpoints: {extra_refs!r}. "
+                f"Manual recovery required."
+            )
+
+        if from_dir_exists:
+            # Intent written, store.rename never completed (or completed
+            # only its first step — the metadata rewrite — before the
+            # dir replace failed). Roll FORWARD by re-running store.rename:
+            # the user committed to this rename when the intent record
+            # landed, and a no-op interpretation would silently drop it.
+            #
+            # Replay is safe because FileProfileStore.rename is documented
+            # idempotent for retry (store.py:162-167): the metadata
+            # rewrite is the same content on a second pass, and a
+            # half-completed prior call where metadata.name already says
+            # `to` is reconciled by store.get's name/dir mismatch repair
+            # (store.py:131-138) so the read returns a clean Profile.
+            # If the underlying failure that broke the first attempt has
+            # cleared (transient FS error, race resolved), the second
+            # pass commits cleanly; if it persists, the user sees the
+            # same error and can investigate.
+            self._store.rename(record.from_, record.to)
+
+        # Step 2: re-point any affected entry that still references `from`.
+        affected_still_at_old = [
+            tid for tid in record.affected_ids if active.get(tid) == record.from_
+        ]
+        if affected_still_at_old:
+            for tid in affected_still_at_old:
+                active[tid] = record.to
+            self._store.set_active(active)
+
+        # Step 3: swap_link for every affected tool whose active entry is `to`
+        # and is in the registry (orphans skip link-fixup — same as the
+        # original rename method).
+        for tid in record.affected_ids:
+            if active.get(tid) != record.to:
+                continue
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                continue
+            for i, dm in enumerate(tool.config_dirs):
+                target = self._store.profile_dir(record.to) / dm.profile_subdir
+                live = self._resolver.tool_dir(tool, i)
+                swap_link(target, live)
+
+        # Refresh the live-paths cache (the original rename does this too).
+        self._store.set_active_live_paths(self._derive_cache_for_active(active))
+
+        # v0.1.5: mark the in-flight intent completed so the next vacuum
+        # drops it. Locating the journal here (not as a constructor field)
+        # mirrors the rename / init / rescan write paths and keeps the
+        # _compensate_rename surface a pure (state-dir + record) function
+        # of the service it was constructed against.
+        OpLogIO(self._store.state_dir()).mark_completed(record)
 
     def delete(self, name: str) -> None:
         """Delete a profile, refusing if it's active for any tool.

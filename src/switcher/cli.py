@@ -16,13 +16,28 @@ from rich.console import Console
 from rich.table import Table
 
 from switcher.errors import (
+    InitInProgressError,
     NothingToInitializeError,
+    RescanInProgressError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
     SwitcherError,
     UnknownToolError,
 )
 from switcher.models import Tool
+
+# Op-log record classes (`_InitOp`, `_RenameOp`, `_RescanOp`) are namespace-
+# private to oplog.py; the CLI detection hook (spec §2.2) is a legitimate
+# cross-module consumer that dispatches on them. Per-line basedpyright
+# suppressions keep the privacy intent explicit at the import site rather
+# than leaking module-wide — mirrors the pattern in service.py.
+from switcher.oplog import (
+    OpLogIO,
+    OpLogRecord,
+    _InitOp,  # pyright: ignore[reportPrivateUsage]
+    _RenameOp,  # pyright: ignore[reportPrivateUsage]
+    _RescanOp,  # pyright: ignore[reportPrivateUsage]
+)
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
 from switcher.service import InitReport, ProfileService, UninstallMappingState
@@ -70,6 +85,7 @@ class Deps:
     service: ProfileService
     store: ProfileStore
     registry: Sequence[Tool]
+    oplog: OpLogIO
 
 
 def get_deps() -> Deps:
@@ -79,7 +95,8 @@ def get_deps() -> Deps:
     registry = build_registry(state / "registry.d")
     store = FileProfileStore(state)
     service = ProfileService(store, resolver, registry)
-    return Deps(service=service, store=store, registry=registry)
+    oplog = OpLogIO(state)
+    return Deps(service=service, store=store, registry=registry, oplog=oplog)
 
 
 def handle_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -107,6 +124,155 @@ def handle_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+# -- op-log detection hook (spec §2.2) --------------------------------------
+
+
+def _format_in_progress_hint(record: OpLogRecord) -> str:
+    """Render the user-facing recovery hint for an in-flight init/rescan.
+
+    Same text for read-only and mutating callers so the wording stays
+    consistent across multiple invocations of the same broken state.
+    Rename has no hint — it is auto-compensated transparently.
+
+    The hint deliberately does NOT name `--continue` / `--abort` because
+    those flags don't ship until init/rescan compensation lands (Phase 6
+    / Phase 7 = PR4 / PR5). A PR3-only build can still encounter an
+    in-flight ``_InitOp`` / ``_RescanOp`` via hand-edited journals,
+    mixed-version installs, or version downgrades; pointing the user at
+    a flag that the binary doesn't expose would fail with "no such
+    option" and burn their first recovery attempt (abby review). The
+    text says "manual recovery required" and references the future
+    compensation surface so the user knows what to look for.
+    """
+    if isinstance(record, _InitOp):
+        targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
+        return (
+            f"Interrupted `switcher init` detected "
+            f"(started {record.started_at.isoformat()}).\n"
+            f"  Profile: {record.profile_name}\n"
+            f"  Targets: {targets}\n"
+            f"Manual recovery required on this switcher version. Guided "
+            f"continue/abort handlers for init ship in a follow-on release."
+        )
+    if isinstance(record, _RescanOp):
+        targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
+        # into_mode rescan routes every target to a single existing
+        # profile; surface that target by name. Fresh-mode rescan creates
+        # one profile per tool — label it explicitly so the user knows
+        # which mode the interrupted op was in.
+        if record.into_mode:
+            # Spec invariant: into-mode rescan captures every target tool
+            # into the SAME existing profile, so set(target_profiles.values())
+            # should be a singleton. Reaching the multi-value branch implies
+            # a hand-edited / corrupt journal — emit a marker rather than a
+            # spurious profile name (abby review). _RescanOp validators
+            # don't enforce this singleton today; the hint stays robust
+            # against that gap.
+            into_targets = sorted(set(record.target_profiles.values()))
+            if len(into_targets) == 1:
+                mode_desc = f"into existing profile {into_targets[0]!r}"
+            else:
+                mode_desc = (
+                    f"into existing profile (corrupt: multiple distinct values {into_targets!r})"
+                )
+        else:
+            mode_desc = "fresh-profile"
+        profiles_desc = ", ".join(
+            f"{tid}->{prof}" for tid, prof in sorted(record.target_profiles.items())
+        )
+        return (
+            f"Interrupted `switcher rescan` detected "
+            f"(started {record.started_at.isoformat()}).\n"
+            f"  Mode: {mode_desc} (target profiles: {profiles_desc})\n"
+            f"  Targets: {targets}\n"
+            f"Manual recovery required on this switcher version. Guided "
+            f"continue/abort handlers for rescan ship in a follow-on release."
+        )
+    raise AssertionError(f"unexpected in-flight record type: {type(record).__name__}")
+
+
+def _detect_or_compensate_oplog(deps: Deps, *, allow_mutation: bool) -> None:
+    """Op-log detection hook.
+
+    Called at the top of every state-touching command callback (every
+    callback in this module's `@app.command` / `@tools_app.command` /
+    `@tools_app.callback` set EXCEPT ``version``, which has no FS
+    dependency and intentionally skips the hook per spec §5.2 dispatch
+    table). Mutating callbacks must invoke this BEFORE any interactive
+    prompt — otherwise an in-flight init/rescan would let the user
+    answer a confirm dialog before being told about the broken state.
+
+    Always vacuums completed records first so a stale "completed" snapshot
+    cannot masquerade as in-flight. Then:
+
+    - In-flight `_RenameOp`: auto-compensates via
+      ``service._compensate_rename`` REGARDLESS of ``allow_mutation``.
+      The service method is idempotent disk-truth roll-forward of state
+      the user already committed (spec §2.3); a read-only command
+      surfacing that state cleanly is better than refusing. The service
+      method owns its own ``mark_completed`` call (service.py:1265) —
+      the hook MUST NOT replicate it (a second mark_completed would
+      raise on the already-completed record).
+    - In-flight `_InitOp` / `_RescanOp`:
+        - ``allow_mutation=False`` (status / list / which / tools_main):
+          prints the recovery hint and raises ``typer.Exit(code=3)``.
+          ``handle_errors`` does not catch ``typer.Exit``, so the exit
+          code propagates correctly.
+        - ``allow_mutation=True`` (init / rescan / use / save / create /
+          rename / delete / uninstall / unmanage / prune / tools_scaffold):
+          raises ``InitInProgressError`` / ``RescanInProgressError``.
+          The init / rescan callbacks special-case these around their
+          ``--continue`` / ``--abort`` dispatch in later PRs; every
+          other mutating callback lets the error bubble to
+          ``handle_errors`` (stderr + exit 1).
+
+    Read-only / mutating asymmetry, made explicit (abby review):
+
+    - **Vacuum** is journal hygiene — gated on ``allow_mutation`` because
+      `switcher list` should not rewrite oplog.json just to scrub
+      completed records. The next mutating command tidies up.
+    - **Rename compensation** is forward progress on COMMITTED user
+      intent — runs from read-only callers too. The user already asked
+      for the rename when the intent record landed; an interrupted
+      rename surfacing through `switcher status` is automatically
+      finished rather than reported, because the spec treats the
+      auto-roll-forward as the canonical recovery path (§2.3, §2.2).
+      This writes to disk on the rare path of an interrupted rename;
+      a read-only state dir in that state can't be repaired without
+      ANY switcher command writing, so deferring compensation to a
+      mutating command would only shift the same StorageError later.
+    - **Init/rescan in-flight** never auto-compensates — those need
+      guided ``--continue`` / ``--abort`` decisions, so the hook
+      surfaces them as exit 3 (read-only) or
+      InitInProgressError / RescanInProgressError (mutating).
+
+    Spec §2.2.
+    """
+    if allow_mutation:
+        deps.oplog.vacuum_completed()
+    in_flight = deps.oplog.read_in_flight()
+    if in_flight is None:
+        return
+    if isinstance(in_flight, _RenameOp):
+        deps.service._compensate_rename(in_flight)  # pyright: ignore[reportPrivateUsage]
+        return
+    if not allow_mutation:
+        # Hint goes to stderr — exit 3 is an error state, and a read-only
+        # caller's stdout is data for downstream pipelines (e.g.,
+        # `switcher status | grep claude`). Routing the recovery text to
+        # stdout would pollute that stream and break scripts (abby
+        # review). Mutating callers raise SwitcherError subclasses that
+        # handle_errors writes to err_console for the same reason.
+        err_console.print(_format_in_progress_hint(in_flight))
+        raise typer.Exit(code=3)
+    if isinstance(in_flight, _InitOp):
+        raise InitInProgressError(_format_in_progress_hint(in_flight))
+    # OpLogRecord is the discriminated union of _InitOp | _RenameOp | _RescanOp;
+    # only _RescanOp remains here. No fallback assertion — basedpyright would
+    # flag the redundant isinstance and an unreachable branch is dead code.
+    raise RescanInProgressError(_format_in_progress_hint(in_flight))
+
+
 # -- simple read-only commands ----------------------------------------------
 
 
@@ -128,6 +294,7 @@ def version() -> None:
 def list_cmd() -> None:
     """List all profiles. `*` marks any tool's active profile."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=False)
     profiles = deps.store.list()
     active = set(deps.store.get_active().values())
     if not profiles:
@@ -145,6 +312,7 @@ def status(
 ) -> None:
     """Show currently-active profiles per tool, plus live-path cache state."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=False)
     active = deps.store.get_active()
     if not active:
         # Distinguish two empty-active-map states (Hermes review):
@@ -291,12 +459,17 @@ def init(
     ),
 ) -> None:
     """Initialize switcher; optionally restrict to a subset of detected tools."""
+    # Hook FIRST — an in-flight init/rescan must surface ahead of any
+    # flag-mutex BadParameter (abby blocking review). A user with broken
+    # state who accidentally passes `--interactive --only` should see
+    # the recovery hint, not a misleading "mutually exclusive" error
+    # for flags they could have corrected after fixing the state.
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     if interactive and (only is not None or skip is not None):
         raise typer.BadParameter("--interactive is mutually exclusive with --only/--skip")
     if only is not None and skip is not None:
         raise typer.BadParameter("--only and --skip are mutually exclusive")
-
-    deps = get_deps()
     # Hermes blocker: surface StateAlreadyInitializedError BEFORE any
     # flag-specific detection / prompting runs. Without this preflight,
     # `init --skip claude` on an already-initialized repo reaches the
@@ -397,13 +570,18 @@ def use(
     active map. After `unmanage X`, subsequent `use` calls leave X alone —
     the durability fix from v0.1.4. Pass `--only X` to restrict further.
     """
+    # Hook FIRST — an in-flight init/rescan must surface ahead of the
+    # --only emptiness check (abby blocking review). Same precedence
+    # rationale as init.
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     if only is None:
         only_list = None
     else:
         only_list = [t.strip() for t in only.split(",") if t.strip()]
         if not only_list:
             raise typer.BadParameter("--only must contain at least one tool id")
-    get_deps().service.use(name, only_list)
+    deps.service.use(name, only_list)
     if only_list is None:
         console.print(f"Using profile {name!r} for all currently-managed tools")
     else:
@@ -414,7 +592,9 @@ def use(
 @handle_errors
 def create(name: str) -> None:
     """Create a new profile, seeding credentials from the current active profile."""
-    get_deps().service.create(name)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
+    deps.service.create(name)
     console.print(f"Created profile {name!r}")
 
 
@@ -422,7 +602,9 @@ def create(name: str) -> None:
 @handle_errors
 def save(name: str) -> None:
     """Snapshot current live config into a new profile."""
-    get_deps().service.save(name)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
+    deps.service.save(name)
     console.print(f"Saved live config as {name!r}")
 
 
@@ -430,7 +612,9 @@ def save(name: str) -> None:
 @handle_errors
 def rename(old: str, new: str) -> None:
     """Rename a profile. Active tools auto-relink to the new name."""
-    get_deps().service.rename(old, new)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
+    deps.service.rename(old, new)
     console.print(f"Renamed {old!r} -> {new!r}")
 
 
@@ -441,9 +625,15 @@ def delete(
     force: bool = typer.Option(False, "--force", help="Skip the interactive confirmation."),
 ) -> None:
     """Delete a profile. Refuses if the profile is active for any tool."""
+    # Hook BEFORE typer.confirm: an in-flight init/rescan must surface the
+    # recovery hint before the user is prompted to delete anything (Hermes
+    # review). Otherwise a user who answers "y" to "Delete profile X?" only
+    # then sees they have a broken state to recover first.
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     if not force and not typer.confirm(f"Delete profile {name!r}?"):
         raise typer.Exit(code=0)
-    get_deps().service.delete(name)
+    deps.service.delete(name)
     console.print(f"Deleted profile {name!r}")
 
 
@@ -451,7 +641,9 @@ def delete(
 @handle_errors
 def which(tool: str) -> None:
     """Show which profile a specific tool is currently using."""
-    name = get_deps().service.which(tool)
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=False)
+    name = deps.service.which(tool)
     console.print(name)
 
 
@@ -469,6 +661,7 @@ def uninstall(
 ) -> None:
     """Inverse of init: replace every active symlink with a real directory."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     report = deps.service.uninstall(
         purge=purge,
         yes=yes,
@@ -520,6 +713,7 @@ def unmanage(
 ) -> None:
     """Restore a single tool's live path and remove it from the active map."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     report = deps.service.unmanage(tool, dry_run=dry_run, force=force)
     if dry_run:
         console.print(f"Would unmanage {report.tool_id!r}:")
@@ -577,10 +771,13 @@ def rescan(
     tool. Use --all to suppress the warning, or --only to be selective.
     --dry-run never prompts regardless of TTY.
     """
+    # Hook FIRST — an in-flight init/rescan must surface ahead of the
+    # flag-mutex BadParameter (abby blocking review). Same precedence
+    # rationale as init.
+    deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     if all_ and only is not None:
         raise typer.BadParameter("--all and --only are mutually exclusive")
-
-    deps = get_deps()
 
     # Preflight: surface StateNotInitializedError BEFORE the new prompt /
     # warning logic touches the user (Hermes review). Otherwise bare
@@ -651,6 +848,7 @@ def prune(
 ) -> None:
     """Delete orphan profiles."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
 
     # First call is always a dry-run to enumerate orphans + sizes.
     preview = deps.service.prune(dry_run=True)
@@ -701,6 +899,7 @@ def tools_scaffold(
 ) -> None:
     """Write a stub TOML for a new user tool."""
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     target = (
         Path(out).expanduser() if out else deps.store.state_dir() / "registry.d" / f"{tool_id}.toml"
     )
@@ -788,8 +987,13 @@ def _build_tools_table_rows(deps: Deps) -> list[_ToolsTableRow]:
 def tools_main(ctx: typer.Context) -> None:
     """List supported tools and per-OS config paths."""
     if ctx.invoked_subcommand is not None:
+        # Subcommand path: that callback (e.g. tools_scaffold) owns its own
+        # op-log hook, so skip here to avoid two read_in_flight calls per
+        # invocation. The early return preserves the existing fall-through
+        # to the subcommand.
         return
     deps = get_deps()
+    _detect_or_compensate_oplog(deps, allow_mutation=False)
     rows = _build_tools_table_rows(deps)
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID")

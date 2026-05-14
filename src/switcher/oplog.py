@@ -826,6 +826,139 @@ class OpLogIO:
             )
         self._write_records(new_records)
 
+    def cancel_intent(self, record: OpLogRecord) -> None:
+        """Remove an in-flight intent record without marking it completed.
+
+        Crash-recovery semantics differ from sync-exception semantics. The
+        spec's auto-rollforward model (§2.3 for rename, §2.2 / §2.4 for
+        init/rescan via the explicit-flag paths) treats an in-flight
+        record as a commitment from a process that did not finish — exactly
+        the SIGKILL window the journal exists to recover. A *synchronous*
+        exception is a different shape: control returned to the caller, the
+        user got the error, and the in-flight record now describes work
+        that was abandoned, not interrupted. Without this method, the next
+        CLI command's compensation pass would treat a normal failed rename
+        as a recovery state and re-apply (or refuse) on every subsequent
+        invocation. Callers wrap the mutation block in try/except and
+        invoke ``cancel_intent`` from the except branch as best-effort
+        cleanup before re-raising.
+
+        Locates the disk record by ``op`` + ``started_at`` (sufficient
+        discriminator for a single-user CLI), then verifies the entire
+        persisted record matches the caller's reference — same shape as
+        :meth:`mark_completed`, for the same reason. The journal is
+        immutable from intent-write through cancel/complete, so any
+        observed mismatch means external rewrite between read and
+        cancel; refusing rather than blessing the mutated record
+        preserves the audit guarantee.
+
+        Refuses if the matching record is already completed: a completed
+        record is not abandoned work, and dropping it would erase audit
+        history vacuum has not yet had a chance to scrub. Caller bug,
+        not on-disk corruption — same shape as
+        :meth:`mark_completed`'s re-completion guard, hence ``ValueError``.
+
+        Enforces the single-in-flight invariant directly here (in
+        addition to ``read_in_flight``): cancelling the first matching
+        record in a hand-edited 2-in-flight journal would hide
+        corruption rather than surface it.
+
+        Raises:
+            ValueError: caller passed a record whose ``completed_at`` is
+                set, or no in-flight record matches and a completed one
+                with the same (op, started_at) does — caller misuse, not
+                journal corruption.
+            OpLogCorruptError: more than one record is in-flight on
+                disk (single-in-flight invariant violated), no record
+                matches ``op`` + ``started_at`` at all, or the located
+                in-flight record differs from the caller's reference on
+                any field.
+        """
+        if record.completed_at is not None:
+            raise ValueError(
+                f"cancel_intent expects an intent (completed_at=None); got a "
+                f"record already completed at {record.completed_at.isoformat()}. "
+                f"Vacuum drops completed records; cancel_intent is for the "
+                f"in-flight transition only."
+            )
+        records = self.read_records()
+        in_flight_count = sum(1 for r in records if r.completed_at is None)
+        if in_flight_count > 1:
+            raise OpLogCorruptError(
+                f"oplog at {self._path}: {in_flight_count} records are in-flight; "
+                f"single-in-flight invariant violated. Manual recovery required."
+            )
+        # A previous completed record can legitimately share (op, started_at)
+        # with a later in-flight record: the writer derives started_at from
+        # datetime.now() and clock resolution can be coarse (Windows
+        # historically ~16ms), so back-to-back ops or freezegun-driven tests
+        # can collide on the timestamp pair (CodeRabbit review). Distinguish
+        # the two by completion state instead of treating any duplicate
+        # identity as corruption. The earlier in_flight_count guard already
+        # rules out >1 in-flight, so the in-flight-side filter yields 0 or 1.
+        in_flight_id_matches = [
+            r
+            for r in records
+            if r.completed_at is None and r.op == record.op and r.started_at == record.started_at
+        ]
+        if not in_flight_id_matches:
+            # No in-flight match. Either a completed record with the same
+            # (op, started_at) exists (caller's reference is stale — the
+            # intent already transitioned) or nothing matches at all
+            # (corruption).
+            completed_id_matches = [
+                r
+                for r in records
+                if r.completed_at is not None
+                and r.op == record.op
+                and r.started_at == record.started_at
+            ]
+            if completed_id_matches:
+                sole_completed = completed_id_matches[0]
+                # Verify the completed disk record matches the caller's
+                # reference on every field except completed_at — same
+                # discipline as the in-flight match below. If the
+                # payload differs, the journal was externally rewritten
+                # between the caller's read and now (e.g. hand-edited
+                # to alter from_/to/affected_ids), and surfacing that
+                # as "already completed" ValueError would let
+                # ProfileService leak corruption upstream as caller
+                # misuse (CodeRabbit review).
+                disk_payload = sole_completed.model_dump(exclude={"completed_at"})
+                caller_payload = record.model_dump(exclude={"completed_at"})
+                if disk_payload != caller_payload:
+                    raise OpLogCorruptError(
+                        f"oplog at {self._path}: completed record on disk "
+                        f"differs from caller's reference (same op + "
+                        f"started_at, differing payload). External rewrite "
+                        f"between read and cancel_intent; manual recovery "
+                        f"required."
+                    )
+                # mypy/basedpyright: completed_id_matches is filtered on
+                # `completed_at is not None`, so the cast is safe.
+                completed_at = sole_completed.completed_at
+                assert completed_at is not None
+                raise ValueError(
+                    f"cancel_intent: record with op={record.op!r} "
+                    f"started_at={record.started_at!r} is already completed "
+                    f"on disk at {completed_at.isoformat()}; cannot cancel"
+                )
+            raise OpLogCorruptError(
+                f"oplog at {self._path}: no matching record for "
+                f"op={record.op!r} started_at={record.started_at!r}"
+            )
+        sole = in_flight_id_matches[0]
+        if sole != record:
+            raise OpLogCorruptError(
+                f"oplog at {self._path}: in-flight record on disk "
+                f"differs from caller's reference (same op + "
+                f"started_at, differing fields). External rewrite "
+                f"between read and cancel_intent; manual recovery "
+                f"required."
+            )
+        kept = [r for r in records if r is not sole]
+        self._write_records(kept)
+
     def vacuum_completed(self) -> None:
         """Drop every record whose ``completed_at`` is not None.
 

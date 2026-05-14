@@ -453,6 +453,179 @@ def test_mark_completed_sets_timestamp(tmp_path: Path):
     assert on_disk[0]["completed_at"] is not None
 
 
+def test_cancel_intent_drops_in_flight_record(tmp_path: Path):
+    """Sync-exception cleanup: cancel_intent removes the in-flight record
+    so the next CLI command's compensation pass does not auto-roll-forward
+    work the user has already been told failed. After cancellation, the
+    journal is empty (or back to whatever predated the intent)."""
+    io = OpLogIO(tmp_path)
+    record = _make_rename_op()
+    io.append_record(record)
+    assert io.read_in_flight() is not None
+    io.cancel_intent(record)
+    assert io.read_in_flight() is None
+    assert io.read_records() == []
+
+
+def test_cancel_intent_preserves_unrelated_completed_records(tmp_path: Path):
+    """A previously-completed record from an earlier op must survive
+    cancellation of a later in-flight intent — cancel_intent is precise,
+    not a wholesale wipe."""
+    io = OpLogIO(tmp_path)
+    earlier = _make_rename_op("x", "y")
+    io.append_record(earlier)
+    io.mark_completed(earlier)
+    later = _make_rename_op("a", "b")
+    later = later.model_copy(update={"started_at": _now() + timedelta(minutes=5)})
+    io.append_record(later)
+    io.cancel_intent(later)
+    remaining = io.read_records()
+    assert len(remaining) == 1
+    assert remaining[0].completed_at is not None
+    assert isinstance(remaining[0], _RenameOp)
+    assert remaining[0].from_ == "x"
+
+
+def test_cancel_intent_rejects_completed_record_argument(tmp_path: Path):
+    """Cancellation is for the in-flight transition only. Passing a
+    record whose completed_at is set is API misuse — same shape as
+    mark_completed's re-completion guard, which raises ValueError
+    rather than OpLogCorruptError because the journal is fine, the
+    caller is wrong."""
+    from switcher.oplog import mark_completed
+
+    io = OpLogIO(tmp_path)
+    record = _make_rename_op()
+    io.append_record(record)
+    completed = mark_completed(record, _now() + timedelta(minutes=1))
+    with pytest.raises(ValueError, match="cancel_intent expects an intent"):
+        io.cancel_intent(completed)
+
+
+def test_cancel_intent_rejects_when_disk_record_already_completed(tmp_path: Path):
+    """Caller passes an in-flight reference (completed_at=None) but the
+    on-disk record with the same (op, started_at) is already completed.
+    The caller is holding a stale snapshot taken before some other code
+    path already transitioned the record. Distinct from the
+    completed-argument case (`completed_at` set on the caller's reference)
+    and from the no-match / corruption cases — surface as ValueError so
+    the caller learns its reference is stale, rather than OpLogCorruptError
+    which would falsely accuse the journal."""
+    io = OpLogIO(tmp_path)
+    record = _make_rename_op()
+    io.append_record(record)
+    # Some other code path completed the record between the caller's
+    # initial read and now (modeled directly here for unit isolation).
+    io.mark_completed(record)
+    with pytest.raises(ValueError, match="already completed"):
+        io.cancel_intent(record)
+    # Disk state untouched: completed record still present.
+    on_disk: list[dict[str, Any]] = json.loads((tmp_path / "oplog.json").read_text())
+    assert len(on_disk) == 1
+    assert on_disk[0]["completed_at"] is not None
+
+
+def test_cancel_intent_raises_corrupt_on_externally_mutated_record(tmp_path: Path):
+    """If the on-disk record changed between the caller's read and the
+    cancellation, refuse rather than blessing the mutation — same
+    contract as mark_completed."""
+    io = OpLogIO(tmp_path)
+    original = _make_rename_op("a", "b")
+    io.append_record(original)
+    mutated_payload = json.dumps(
+        [
+            {
+                "op": "rename",
+                "from": "a",
+                "to": "evil",  # changed from "b"
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "affected_ids": [],
+            }
+        ]
+    )
+    (tmp_path / "oplog.json").write_text(mutated_payload, encoding="utf-8")
+    with pytest.raises(OpLogCorruptError):
+        io.cancel_intent(original)
+
+
+def test_cancel_intent_raises_corrupt_when_no_match(tmp_path: Path):
+    """Caller holds a record that isn't on disk — surface as corruption,
+    not silent no-op (a silent no-op would mask journal drift)."""
+    io = OpLogIO(tmp_path)
+    record = _make_rename_op()
+    with pytest.raises(OpLogCorruptError, match="no matching record"):
+        io.cancel_intent(record)
+
+
+def test_cancel_intent_succeeds_when_completed_record_shares_started_at(
+    tmp_path: Path,
+):
+    """A previously-completed record and a new in-flight record can
+    legitimately share (op, started_at): the writer derives started_at
+    from datetime.now() and clock resolution can be coarse (CodeRabbit
+    review). The completion-state filter distinguishes the two — the
+    in-flight one is the unique cancellation target; the completed one
+    stays put as audit history that the next vacuum will scrub on its
+    own schedule."""
+    payload = json.dumps(
+        [
+            {
+                "op": "rename",
+                "from": "a",
+                "to": "b",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "completed_at": "2026-05-12T10:30:00.500+00:00",
+                "affected_ids": [],
+            },
+            {
+                "op": "rename",
+                "from": "c",
+                "to": "d",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "affected_ids": [],
+            },
+        ]
+    )
+    (tmp_path / "oplog.json").write_text(payload, encoding="utf-8")
+    io = OpLogIO(tmp_path)
+    caller_ref = _make_rename_op("c", "d")
+    io.cancel_intent(caller_ref)  # MUST NOT raise
+    # Only the completed record remains; the in-flight has been dropped.
+    on_disk: list[dict[str, Any]] = json.loads((tmp_path / "oplog.json").read_text())
+    assert len(on_disk) == 1
+    assert on_disk[0]["from"] == "a"
+    assert on_disk[0]["completed_at"] is not None
+
+
+def test_cancel_intent_raises_corrupt_on_multiple_in_flight(tmp_path: Path):
+    """Same single-in-flight defense as mark_completed: cancellation
+    of the first match in a corrupt 2-in-flight journal would partial-heal
+    and hide the corruption."""
+    payload = json.dumps(
+        [
+            {
+                "op": "rename",
+                "from": "a",
+                "to": "b",
+                "started_at": "2026-05-12T10:30:00+00:00",
+                "affected_ids": [],
+            },
+            {
+                "op": "rename",
+                "from": "c",
+                "to": "d",
+                "started_at": "2026-05-12T10:31:00+00:00",
+                "affected_ids": [],
+            },
+        ]
+    )
+    (tmp_path / "oplog.json").write_text(payload, encoding="utf-8")
+    io = OpLogIO(tmp_path)
+    first = _make_rename_op("a", "b")
+    with pytest.raises(OpLogCorruptError, match="single-in-flight"):
+        io.cancel_intent(first)
+
+
 def test_vacuum_drops_completed_records(tmp_path: Path):
     io = OpLogIO(tmp_path)
     completed = _make_rename_op("a", "b")
