@@ -991,6 +991,31 @@ class ProfileService:
             skipped_via_interactive=list(skipped_via_interactive),
         )
 
+    @staticmethod
+    def _expected_nonempty_live_paths(record: _InitOp) -> dict[str, list[str]]:
+        """Group ``record.mappings`` by tool_id and produce the
+        sorted-by-mapping_index live_path list per tool — the journal's
+        expected non-empty cache slice. Shared between two callers
+        whose invariants must stay aligned:
+
+          - ``_check_init_already_completed`` compares this against
+            ``get_active_live_paths`` (which normalizes [] to absent,
+            so the dict-equality check matches exactly).
+          - ``_compensate_init_continue`` overlays this on top of a
+            ``{tid: [] for tid in target_ids}`` seed to build the full
+            cache for ``set_active_state``.
+
+        Extracted (abby-review pass-10 readability note) so the
+        recovery invariants stay readable and the two call sites
+        can't drift out of sync.
+        """
+        by_tool: dict[str, list[tuple[int, str]]] = {}
+        for mapping in record.mappings:
+            by_tool.setdefault(mapping.tool_id, []).append(
+                (mapping.mapping_index, mapping.live_path)
+            )
+        return {tid: [p for _, p in sorted(entries)] for tid, entries in by_tool.items()}
+
     def _check_init_already_completed(self, record: _InitOp) -> bool:
         """Return True ONLY if every observable post-init invariant
         holds on disk: both profile dirs are real directories, every
@@ -1039,38 +1064,15 @@ class ProfileService:
         active = self._store.get_active()
         if not all(active.get(tid) == record.profile_name for tid in record.target_ids):
             return False
-        # Cache invariant: every target_id's live_paths must match
-        # the journal's snapshot. The journal's per-tool expectation
-        # is the sorted-by-mapping_index list of live_paths from
-        # record.mappings; tools with zero mappings expect [] (which
-        # `get_active_live_paths` normalizes to "absent"). Reading
-        # the cache and comparing against this expectation catches
-        # both missing-key and stale-value drift.
-        live_paths_by_tool: dict[str, list[tuple[int, str]]] = {}
-        for mapping in record.mappings:
-            live_paths_by_tool.setdefault(mapping.tool_id, []).append(
-                (mapping.mapping_index, mapping.live_path)
-            )
-        expected_nonempty: dict[str, list[str]] = {
-            tid: [p for _, p in sorted(entries)] for tid, entries in live_paths_by_tool.items()
-        }
-        actual_cache = self._store.get_active_live_paths()
-        # `actual_cache` only contains keys with non-empty values
-        # (get_active_live_paths normalizes [] to absent). A clean
-        # init's serialized cache covers target_ids exactly, with
-        # `[]` for zero-mapping tools; after normalization the
-        # post-read view matches `expected_nonempty` exactly — same
-        # keys, same values. Dict equality (not a per-key subset
-        # check) catches BOTH directions of drift:
-        #   - missing key / stale value for a tool that should have
-        #     a non-empty cache entry,
-        #   - extra entry for a zero-mapping target_id that should
-        #     have been an empty `[]` (normalized to absent).
-        # The second case is the gap abby-review pass-9 flagged: a
-        # crashed init leaving a stale non-empty cache for a tool the
-        # journal expects to be empty would have short-circuited
-        # under a per-key subset check.
-        return actual_cache == expected_nonempty
+        # Cache invariant: actual_cache must equal the journal's
+        # expected non-empty slice exactly. Dict equality catches both
+        # missing-key and stale-value drift (a zero-mapping tool with
+        # a stale non-empty cache value would otherwise short-circuit
+        # under a per-key subset check). `get_active_live_paths`
+        # normalizes [] to absent at read time, so the post-read view
+        # of a clean init's cache equals exactly the non-empty slice.
+        expected_nonempty = self._expected_nonempty_live_paths(record)
+        return self._store.get_active_live_paths() == expected_nonempty
 
     def _compensate_init_continue(self, record: _InitOp) -> None:
         """Replay any non-COMPLETE mapping per the §2.1.1 continue
@@ -1214,13 +1216,7 @@ class ProfileService:
         # and the zero-config_dirs cases — keep both maps anchored on
         # ``target_ids``.
         live_paths_cache: dict[str, list[str]] = {tid: [] for tid in record.target_ids}
-        live_paths_by_tool: dict[str, list[tuple[int, str]]] = {}
-        for mapping in record.mappings:
-            live_paths_by_tool.setdefault(mapping.tool_id, []).append(
-                (mapping.mapping_index, mapping.live_path)
-            )
-        for tid, entries in live_paths_by_tool.items():
-            live_paths_cache[tid] = [p for _, p in sorted(entries)]
+        live_paths_cache.update(self._expected_nonempty_live_paths(record))
         active = dict.fromkeys(record.target_ids, record.profile_name)
         self._store.set_active_state(active, live_paths_cache)
 
