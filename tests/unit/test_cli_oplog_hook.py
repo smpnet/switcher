@@ -146,9 +146,12 @@ class _FakeDeps:
 
 
 def test_no_in_flight_read_only_returns_silently() -> None:
+    """Read-only paths never write to disk — vacuum is intentionally
+    skipped (CodeRabbit review). The hook only reads in_flight; the
+    next mutating command tidies up completed records."""
     deps = _FakeDeps.with_in_flight(None)
     _detect_or_compensate_oplog(deps, allow_mutation=False)
-    assert deps.oplog.calls == ["vacuum_completed", "read_in_flight"]
+    assert deps.oplog.calls == ["read_in_flight"]
     assert deps.service.compensate_rename_args == []
     assert deps.oplog.mark_completed_args == []
 
@@ -160,12 +163,21 @@ def test_no_in_flight_mutating_returns_silently() -> None:
     assert deps.service.compensate_rename_args == []
 
 
-def test_vacuum_runs_before_read_in_flight() -> None:
-    """Vacuum must happen before any decision is made on read_in_flight,
-    so a previous run's completed record can't masquerade as in-flight
-    via a stale snapshot."""
+def test_read_only_path_does_not_vacuum() -> None:
+    """Vacuum is mutating-only — `switcher list` / `status` / `which` /
+    `tools` must not write to disk even when there are completed records
+    to drop. The next mutating command picks up the cleanup."""
     deps = _FakeDeps.with_in_flight(None)
     _detect_or_compensate_oplog(deps, allow_mutation=False)
+    assert "vacuum_completed" not in deps.oplog.calls
+
+
+def test_mutating_path_vacuums_before_read_in_flight() -> None:
+    """On mutating paths, vacuum must happen before any decision is made
+    on read_in_flight, so a previous run's completed record can't
+    masquerade as in-flight via a stale snapshot."""
+    deps = _FakeDeps.with_in_flight(None)
+    _detect_or_compensate_oplog(deps, allow_mutation=True)
     assert deps.oplog.calls.index("vacuum_completed") < deps.oplog.calls.index("read_in_flight")
 
 

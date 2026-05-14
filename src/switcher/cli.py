@@ -228,7 +228,16 @@ def _detect_or_compensate_oplog(deps: Deps, *, allow_mutation: bool) -> None:
 
     Spec §2.2.
     """
-    deps.oplog.vacuum_completed()
+    # Vacuum only on mutating paths. Read-only commands (list / status /
+    # which / tools_main) should never write to disk; vacuum_completed
+    # rewrites oplog.json when there's anything to drop, which would
+    # promote `switcher list` from pure-read to a StorageError on a
+    # read-only state dir (e.g., sudo-owned, mounted read-only). The
+    # next mutating command will still tidy up — vacuum is idempotent
+    # and the journal grows by at most one record per completed op.
+    # CodeRabbit review.
+    if allow_mutation:
+        deps.oplog.vacuum_completed()
     in_flight = deps.oplog.read_in_flight()
     if in_flight is None:
         return

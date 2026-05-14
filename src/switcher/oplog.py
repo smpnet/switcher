@@ -915,6 +915,25 @@ class OpLogIO:
             ]
             if completed_id_matches:
                 sole_completed = completed_id_matches[0]
+                # Verify the completed disk record matches the caller's
+                # reference on every field except completed_at — same
+                # discipline as the in-flight match below. If the
+                # payload differs, the journal was externally rewritten
+                # between the caller's read and now (e.g. hand-edited
+                # to alter from_/to/affected_ids), and surfacing that
+                # as "already completed" ValueError would let
+                # ProfileService leak corruption upstream as caller
+                # misuse (CodeRabbit review).
+                disk_payload = sole_completed.model_dump(exclude={"completed_at"})
+                caller_payload = record.model_dump(exclude={"completed_at"})
+                if disk_payload != caller_payload:
+                    raise OpLogCorruptError(
+                        f"oplog at {self._path}: completed record on disk "
+                        f"differs from caller's reference (same op + "
+                        f"started_at, differing payload). External rewrite "
+                        f"between read and cancel_intent; manual recovery "
+                        f"required."
+                    )
                 # mypy/basedpyright: completed_id_matches is filtered on
                 # `completed_at is not None`, so the cast is safe.
                 completed_at = sole_completed.completed_at
