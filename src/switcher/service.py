@@ -1763,12 +1763,21 @@ class ProfileService:
             )
         (singleton,) = unique_profiles
         previous = record.previous_tools or {}
-        if singleton not in previous:
+        # Exact-key-equality (abby pass-4 blocker). _RescanOp's Pydantic
+        # validator already enforces ``set(previous_tools.keys()) ==
+        # set(target_profiles.values())``; combined with the singleton
+        # check above that means ``set(previous.keys()) == {singleton}``
+        # is automatic for parsed records. The exact-equality check
+        # here is defense-in-depth against model_construct bypass —
+        # surfaces an extra-keys corruption clearly rather than letting
+        # the snapshot's extra entries get silently ignored downstream.
+        if set(previous.keys()) != {singleton}:
             raise OpLogCorruptError(
                 f"interrupted rescan record (--into mode, target "
-                f"{singleton!r}) is missing its previous_tools snapshot; "
-                f"abort cannot restore pre-rescan metadata without it. "
-                f"Manual recovery required."
+                f"{singleton!r}) has previous_tools keys "
+                f"{sorted(previous.keys())!r} but expected exactly "
+                f"{{{singleton!r}}}; abort cannot trust pre-rescan "
+                f"metadata. Manual recovery required."
             )
 
     def _check_rescan_already_completed(self, record: _RescanOp) -> bool:
@@ -1837,12 +1846,11 @@ class ProfileService:
             if expected_paths:
                 if cache.get(tid) != expected_paths:
                     return False
-            else:
-                # Zero-mapping tool: clean rescan writes [] which
-                # get_active_live_paths normalizes to absent. Any present
-                # entry would be drift.
-                if tid in cache:
-                    return False
+            # Zero-mapping tool: clean rescan writes [] which
+            # get_active_live_paths normalizes to absent. Any present
+            # entry would be drift.
+            elif tid in cache:
+                return False
         return True
 
     def _compensate_rescan_continue(self, record: _RescanOp) -> None:
@@ -1910,10 +1918,7 @@ class ProfileService:
                     # and let the second pass run update_profile_tools to
                     # finalize.
                     pre_write = dict((record.previous_tools or {}).get(name, {}))
-                    if (
-                        existing_profile.tools != expected_tools
-                        and existing_profile.tools != pre_write
-                    ):
+                    if existing_profile.tools not in (expected_tools, pre_write):
                         raise OpLogCorruptError(
                             f"interrupted rescan continue: profile {name!r} at "
                             f"{p} has tools={existing_profile.tools!r} but the "
@@ -2096,10 +2101,7 @@ class ProfileService:
                     # journal-owned; both will be restored to previous_tools
                     # in the mutation pass.
                     pre_write = dict((record.previous_tools or {}).get(name, {}))
-                    if (
-                        existing_profile.tools != expected_tools
-                        and existing_profile.tools != pre_write
-                    ):
+                    if existing_profile.tools not in (expected_tools, pre_write):
                         raise OpLogCorruptError(
                             f"interrupted rescan abort: profile {name!r} at "
                             f"{p} has tools={existing_profile.tools!r} but "

@@ -507,14 +507,11 @@ def test_rescan_writes_intent_and_marks_completed(service: ProfileService, tmp_s
     # newly-installed tool.
     service.init()
     oplog = OpLogIO(tmp_state)
-    # Drop the init record so we observe the rescan one in isolation.
-    in_flight = oplog.read_in_flight()
-    if in_flight is not None:
-        # init's mark_completed should have already cleared it, but be
-        # defensive in case the test is run on a system where init writes
-        # an in-flight record we forgot to mark.
-        oplog.vacuum_completed()
-    # Drop any completed init record so the rescan-record assertion is clean.
+    # Drop any completed init record so the rescan-record assertion
+    # below is clean. ``vacuum_completed`` only acts on records where
+    # ``completed_at is not None`` — the in-flight branch a prior
+    # version of this test guarded for was dead code (vacuum's a no-op
+    # on in-flight). CR pass-4 trivial.
     oplog.vacuum_completed()
 
     # Pre-active state has all built-in tools managed (init captures
@@ -950,15 +947,13 @@ def test_validator_refuses_into_record_with_missing_previous_tools_snapshot(
     service: ProfileService,
 ) -> None:
     """Defensive: ``_validate_rescan_record_invariants`` rejects an
-    --into record whose previous_tools doesn't carry an entry for the
-    singleton target. Unreachable via the journal's normal lifecycle
-    today — _RescanOp's model validators already enforce
+    --into record whose previous_tools doesn't include the singleton
+    target's key. Unreachable via the journal's normal lifecycle today
+    — _RescanOp's model validators already enforce
     ``set(previous_tools.keys()) == set(target_profiles.values())``,
     AND ``into_mode=True`` requires ``previous_tools`` to be a non-
-    None dict. The in-method check is defense-in-depth against a
-    future schema relaxation. Constructed via ``model_construct`` to
-    bypass the Pydantic validators, mirroring the
-    ``test_abort_rejects_link_original_kind_defensively`` pattern."""
+    None dict. The in-method check is defense-in-depth against
+    model_construct bypass."""
     record = _RescanOp.model_construct(
         op="rescan",
         started_at=_now(),
@@ -969,7 +964,36 @@ def test_validator_refuses_into_record_with_missing_previous_tools_snapshot(
         mappings=[],
     )
 
-    with pytest.raises(OpLogCorruptError, match="previous_tools snapshot"):
+    with pytest.raises(OpLogCorruptError, match="previous_tools keys"):
+        service._validate_rescan_record_invariants(record)
+
+
+def test_validator_refuses_into_record_with_extra_previous_tools_keys(
+    service: ProfileService,
+) -> None:
+    """abby pass-4 blocker (defense-in-depth): the validator rejects
+    extra keys in previous_tools beyond the singleton target. A hand-
+    crafted journal with target_profiles={'claude':'shared'} but
+    previous_tools={'shared':{...}, 'other':{...}} would otherwise
+    let recovery silently ignore the 'other' snapshot. Pydantic
+    already enforces ``set(prev.keys()) == set(target_profiles.values())``,
+    so combined with the singleton check this is unreachable via the
+    journal — kept as defense-in-depth against model_construct
+    bypass."""
+    record = _RescanOp.model_construct(
+        op="rescan",
+        started_at=_now(),
+        target_ids=["claude"],
+        target_profiles={"claude": "shared"},
+        into_mode=True,
+        previous_tools={
+            "shared": {"existing-tool": True},
+            "other": {"orphan": True},  # extra key — corruption
+        },
+        mappings=[],
+    )
+
+    with pytest.raises(OpLogCorruptError, match="previous_tools keys"):
         service._validate_rescan_record_invariants(record)
 
 
