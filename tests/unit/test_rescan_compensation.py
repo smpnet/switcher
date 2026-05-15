@@ -889,6 +889,39 @@ def test_continue_refuses_when_into_record_has_multiple_target_profiles(
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
+def test_validator_refuses_fresh_record_with_duplicate_target_profile_values(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """abby pass-5 blocker: in fresh-profile mode a clean rescan
+    allocates a unique ``<today>-rescan-N`` per tool — duplicate
+    target_profiles values come ONLY from a hand-edited journal.
+    Without the guard, continue would merge multiple tools into one
+    profile via ``_expected_tools_for_rescan_target``'s aggregation,
+    and abort would delete that merged profile in one shot, destroying
+    data from a tool that was never captured into it. _RescanOp's
+    Pydantic validators DON'T enforce values-uniqueness, so this case
+    IS reachable via the journal lifecycle — refuse upfront before
+    short-circuit OR compensation dispatch."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    store.set_active_state({}, {})
+
+    record = _make_rescan_record(
+        target_ids=["claude", "copilot"],
+        # Both tools point at the SAME profile — invalid in fresh mode.
+        target_profiles={"claude": "p", "copilot": "p"},
+        into_mode=False,
+        previous_tools=None,
+        mappings=[],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="duplicate target_profiles"):
+        service.rescan(continue_=True)
+    # Refusal is side-effect-free: journal preserved.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
 def test_validator_refuses_record_with_target_ids_profiles_mismatch(
     service: ProfileService,
 ) -> None:

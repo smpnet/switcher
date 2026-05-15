@@ -1752,6 +1752,30 @@ class ProfileService:
                 )
 
         if not record.into_mode:
+            # Fresh-profile mode (abby pass-5 blocker): a clean rescan
+            # allocates a UNIQUE ``<today>-rescan-N`` per tool (spec
+            # §2.4 + service.py's intent-write loop increments N per
+            # tool). Duplicate values in ``target_profiles`` are only
+            # producible by a hand-edited journal, and would otherwise
+            # let continue merge multiple tools into one profile via
+            # _expected_tools_for_rescan_target's aggregation, then
+            # abort would delete that merged profile in one shot —
+            # destroying data from a tool that was never captured into
+            # it. _RescanOp's Pydantic validators don't enforce values-
+            # uniqueness, so this case IS reachable via the journal
+            # lifecycle (unlike the pass-3/pass-4 defensive checks).
+            values = list(record.target_profiles.values())
+            if len(set(values)) != len(values):
+                seen: dict[str, int] = {}
+                for v in values:
+                    seen[v] = seen.get(v, 0) + 1
+                duplicates = sorted(name for name, count in seen.items() if count > 1)
+                raise OpLogCorruptError(
+                    f"interrupted rescan record (fresh-profile mode) has "
+                    f"duplicate target_profiles values {duplicates!r}; spec "
+                    f"§2.4 requires a unique profile per tool. Manual "
+                    f"recovery required."
+                )
             return
         unique_profiles = set(record.target_profiles.values())
         if len(unique_profiles) != 1:
