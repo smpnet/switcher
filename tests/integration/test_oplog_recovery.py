@@ -44,6 +44,7 @@ from pathlib import Path
 
 import pytest
 
+import switcher
 from switcher.oplog import OpLogIO, _InitOp, _RenameOp, _RescanOp
 from switcher.paths import IS_WINDOWS
 from switcher.registry import build_registry, find_tool
@@ -51,6 +52,21 @@ from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
 pytestmark = pytest.mark.integration
+
+
+# Sanity guard (abby pass-7 batch 2): the subprocess helper invokes
+# ``python -m switcher`` and relies on the pixi editable install
+# (``switcher = { path = ".", editable = true }`` in pixi.toml) to
+# resolve the package to THIS worktree's source. The e2e suite uses
+# the same convention. A stale or wrong-worktree install would let
+# these tests false-pass against unrelated code. Surface that loudly
+# at collection time rather than silently testing the wrong package.
+_WORKTREE_SRC = Path(__file__).resolve().parents[2] / "src"
+assert Path(switcher.__file__).resolve().is_relative_to(_WORKTREE_SRC), (
+    f"switcher resolves to {switcher.__file__!r}, not under {_WORKTREE_SRC!r}; "
+    f"the editable install is stale or points at a different checkout. "
+    f"Run `pixi install` to rebuild the environment."
+)
 
 
 def _now() -> datetime:
