@@ -1124,13 +1124,25 @@ class ProfileService:
         would clear and the user would hit ``UnknownProfileError``
         on the next ``switcher use`` with no recovery path left.
         """
+        expected_tools = dict.fromkeys(record.target_ids, True)
         for name in (record.profile_name, "vanilla"):
             p = self._store.profile_dir(name)
             if self._resolver.is_link(p) or not p.is_dir():
                 return False
             try:
-                self._store.get(name)
+                profile = self._store.get(name)
             except (UnknownProfileError, StorageError):
+                return False
+            # Tools-equality gate (Hermes pass-PR-3 blocker): the
+            # compensation paths refuse on foreign profiles, but
+            # bypassing them via the short-circuit would let the
+            # journal clear while persisted ``.tools`` stays foreign.
+            # Mirror the check both compensation paths apply: a
+            # mismatch means this directory is NOT the journal-owned
+            # profile, so short-circuit can't fire — falling through
+            # to compensation lets the user see the same loud refusal
+            # they'd get on any other recovery path.
+            if profile.tools != expected_tools:
                 return False
         profile_dir = self._store.profile_dir(record.profile_name)
         for intent in record.mappings:
@@ -1364,7 +1376,7 @@ class ProfileService:
             self._store.create("vanilla", dict.fromkeys(record.target_ids, True))
         else:
             try:
-                self._store.get("vanilla")
+                existing_vanilla = self._store.get("vanilla")
             except (UnknownProfileError, StorageError) as e:
                 # Empty leftover: safe to delete + recreate.
                 if not any(vanilla_dir.iterdir()):
@@ -1379,6 +1391,24 @@ class ProfileService:
                         f"and either delete it or restore metadata.json "
                         f"before re-running `switcher init --continue`."
                     ) from e
+            else:
+                # Foreign-vanilla refusal (CR pass-PR-3 major): mirror
+                # the dated-current branch's tools-equality check.
+                # Without it, _seed_credentials would write into a
+                # vanilla whose .tools doesn't list this init's
+                # target_ids — clobbering foreign credentials and
+                # leaving metadata that disagrees with the seeded
+                # content. Abort's symmetric refusal is in
+                # _compensate_init_abort's validation loop.
+                expected_vanilla_tools = dict.fromkeys(record.target_ids, True)
+                if existing_vanilla.tools != expected_vanilla_tools:
+                    raise OpLogCorruptError(
+                        f"interrupted init continue: 'vanilla' profile at "
+                        f"{vanilla_dir} has tools={existing_vanilla.tools!r} "
+                        f"but the journal expects {expected_vanilla_tools!r}; "
+                        f"refusing to adopt a foreign profile. Manual "
+                        f"recovery required."
+                    )
         for tid in record.target_ids:
             tool = find_tool(self._registry, tid)
             if tool is None:

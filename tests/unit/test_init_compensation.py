@@ -759,6 +759,122 @@ def test_abort_short_circuits_when_already_completed(
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_check_does_not_short_circuit_when_current_profile_has_foreign_tools(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR-3 blocker: ``_check_init_already_completed`` must
+    verify that ``profile.tools == dict.fromkeys(record.target_ids,
+    True)`` for ``record.profile_name``, not just that metadata is
+    readable. Otherwise a foreign-but-readable profile occupying the
+    recovery pathname satisfies the short-circuit (mappings COMPLETE,
+    active matches, cache matches, both dirs readable) and the
+    journal gets cleared while ``store.get(profile_name).tools``
+    still says the profile manages an unrelated tool set.
+
+    Without the fix: short-circuit fires, ``mark_completed`` runs,
+    journal cleared, persisted state internally inconsistent.
+    With the fix: short-circuit returns False, compensation's
+    pass-PR-2 tools-equality refusal fires loudly, journal preserved.
+    """
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # Foreign current profile: tools={"external": True}, NOT matching
+    # record.target_ids=["claude"].
+    store.create(profile_name, {"external": True})
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    store.create("vanilla", {"claude": True})
+    store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError):
+        service.init(continue_=True)
+
+    # Journal stays in flight — short-circuit did NOT fire.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+    # Foreign metadata preserved.
+    assert store.get(profile_name).tools == {"external": True}
+
+
+def test_check_does_not_short_circuit_when_vanilla_has_foreign_tools(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR-3 blocker, vanilla variant: same gap exists for
+    ``vanilla``. A foreign-but-readable vanilla profile satisfying
+    other short-circuit invariants would have its journal cleared
+    while the persisted ``vanilla.tools`` stays foreign — and a
+    subsequent ``switcher use vanilla --only X`` would surface
+    ``ToolNotInProfileError`` on tools the user expected to be
+    managed.
+    """
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # Current profile matches; vanilla is foreign.
+    store.create(profile_name, {"claude": True})
+    profile_dir = store.profile_dir(profile_name)
+    target = profile_dir / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    store.create("vanilla", {"unrelated_tool": True})
+    store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError):
+        service.init(continue_=True)
+
+    # Journal preserved + foreign vanilla untouched.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+    assert store.get("vanilla").tools == {"unrelated_tool": True}
+
+
+def test_continue_refuses_when_existing_vanilla_has_foreign_tools(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """CR pass-PR-3 major: continue's compensation pass-PR-2 added
+    a tools-equality check for ``record.profile_name`` but missed
+    the symmetric check for ``vanilla``. Without it, continue's
+    vanilla branch (which only verified metadata readability) would
+    fall through to ``_seed_credentials``, overwriting any foreign
+    credentials into a profile whose ``.tools`` doesn't list this
+    init's target_ids.
+
+    Trigger setup deliberately fails the short-circuit (mappings
+    UNTOUCHED, no active map) so compensation runs and the vanilla
+    branch is reached.
+    """
+    claude_live = tmp_home / ".claude"
+    (claude_live / "settings.json").write_text('{"original": true}')
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
+    # Foreign vanilla: tools doesn't match record.target_ids.
+    store.create("vanilla", {"unrelated_tool": True})
+    foreign_creds = store.profile_dir("vanilla") / "unrelated_tool" / "creds.json"
+    foreign_creds.parent.mkdir(parents=True)
+    foreign_creds.write_text('{"preserve": true}')
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="vanilla"):
+        service.init(continue_=True)
+
+    # Foreign vanilla preserved end-to-end (NOT credential-seeded).
+    assert store.get("vanilla").tools == {"unrelated_tool": True}
+    assert foreign_creds.read_text() == '{"preserve": true}'
+    # Journal stays.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
 def test_check_does_not_short_circuit_when_vanilla_metadata_unreadable(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
