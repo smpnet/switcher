@@ -2,508 +2,182 @@
 
 Switch between AI-agent configuration profiles in one command.
 
-`switcher` re-points each managed tool's live config directory at a profile
-directory under a state store, so you can move between, say, a "full setup"
-with plugins and hooks and a "vanilla" clean slate. Credential files are
-copied into each new profile at create-time (seeded from whichever profile
-is active), so day-to-day switching doesn't re-prompt for auth — every
-profile starts life carrying the same credential snapshot. (Credentials
-are seeded once and then become profile-local; see "How it works" for the
-implications.)
+You have one `~/.claude` directory. But you want different setups for different
+work — a stripped-down config for client A, a heavyweight one with plugins and
+hooks for personal projects, a vanilla one when you're debugging. `switcher`
+lets you snapshot, swap between, and recover from those configurations without
+re-authenticating each time you switch.
 
-Each per-directory swap is atomic (a `replace`-style symlink rename on POSIX
-gives kernel-level atomicity; on Windows the implementation hedges by removing
-the existing junction and recreating it, which is *not* a single atomic
-operation but completes in well under the typical observation window — see
-`scripts/verify_junction.py` for the probabilistic atomicity probe).
-Multi-dir / multi-tool sequencing is best-effort;
-pre-flight validation runs before any mutation, but `init` and `rename` have
-narrow documented failure windows where a partial state may need manual
-reconciliation. Day-to-day `use` and `save` are the well-trodden paths.
-
-**Day-one tools:** Claude Code and GitHub Copilot CLI ship as built-in
-registry entries (in `src/switcher/builtins/`). Additional tools are
-user-extensible via TOML files dropped into `<state_dir>/registry.d/`
-(see "Adding a tool").
+**Day-one tools:** Claude Code and GitHub Copilot CLI ship as built-in registry
+entries. Tools are user-extensible via TOML in `<state_dir>/registry.d/` — see
+[`docs/MANUAL.md`](docs/MANUAL.md#adding-a-tool).
 
 **Supported OSes:** macOS, Linux, Windows.
 
+---
+
+## Requirements
+
+- **Python 3.13 or newer.**
+  - macOS: `brew install python@3.13`
+  - Linux: your distro's `python3.13` package, or `pyenv install 3.13`
+  - Windows: the [official installer](https://www.python.org/downloads/)
+- **pipx.**
+  - macOS: `brew install pipx`
+  - Linux: distro package, or `python3 -m pip install --user pipx`
+  - Windows: `py -m pip install --user pipx`
+  - Then run `pipx ensurepath` once to add pipx's bin dir to your PATH.
+- **git.** Anything recent.
+- **GitHub auth.** This repo is private. You need either an SSH key registered
+  with GitHub OR the [`gh` CLI](https://cli.github.com/) authenticated and
+  configured as git's credential helper.
+
 ## Install
 
-**Prerequisites:** Python 3.13 or newer, `pipx`, and `git`. The HTTPS
-install option also needs [`gh`](https://cli.github.com/) for the
-credential helper.
-
-The repo is private during the v0.1.0 scaffolding phase, so `pipx` needs an
-authenticated path to GitHub. Two safe options — pick whichever matches how
-you already authenticate. **Don't embed a personal access token directly in
-the URL** (it ends up in shell history and process listings).
-
-### macOS / Linux
+Pick the path that matches how you already auth with GitHub:
 
 ```bash
-# Option A: SSH (recommended if you already use SSH for GitHub)
-pipx install git+ssh://git@github.com/smpnet/switcher.git@v0.1.0
+# SSH (if you have a GitHub-registered key in your agent)
+pipx install git+ssh://git@github.com/smpnet/switcher.git@v0.1.5
 
-# Option B: HTTPS via the gh credential helper (no token in argv)
-gh auth login                            # one-time
-gh auth setup-git                        # registers gh as git's credential helper
-pipx install git+https://github.com/smpnet/switcher.git@v0.1.0
-
-# For a different version: replace @v0.1.0 with the desired tag
-# (or omit the @<ref> entirely to install the latest main).
+# OR via the gh credential helper
+gh auth login          # one-time
+gh auth setup-git      # one-time: registers gh as git's credential helper
+pipx install git+https://github.com/smpnet/switcher.git@v0.1.5
 ```
 
-### Windows
-
-The same two options work on Windows, but you need a working git auth setup
-first. Pick the one matching your existing setup:
-
-- **SSH:** install [Git for Windows](https://git-scm.com/download/win) (ships
-  OpenSSH), generate a key, add it to your GitHub account, and ensure
-  `ssh-agent` is running. Then use the SSH `pipx install` line above from
-  PowerShell or Git Bash.
-- **HTTPS via gh:** install [GitHub CLI](https://cli.github.com/), run
-  `gh auth login` then `gh auth setup-git`, then use the HTTPS `pipx install`
-  line above.
-
-`pipx` itself works the same across macOS, Linux, and Windows (it ships
-per-OS bin dirs). The Windows code paths (junctions, `%LOCALAPPDATA%`,
-`%USERPROFILE%` env-var expansion) are covered by the test suite, which
-runs on a Windows runner in CI (see `.github/workflows/ci.yml`).
-
-### Upgrading
-
-`pipx` remembers the URL the package came from. To pull a newer commit on
-the same ref, run `pipx upgrade switcher` — but note that pinned tags
-(`@v0.1.0`) won't move past the tag. To switch to a different tag, reinstall
-with the new ref (`pipx install --force git+ssh://...@v0.2.0`).
-
-While the repo is private, both upgrade and reinstall still need the same
-GitHub auth that worked at install time (SSH key in your agent, or
-`gh auth status` showing a valid login). If `pipx upgrade switcher` fails
-with a `git clone`-style auth error, that's a GitHub auth problem, not a
-`switcher` bug — refresh the SSH agent or re-run `gh auth login`.
-
-## Start using switcher
-
-> **⚠ Run `switcher init` only after the tools you want to manage are
-> already installed.** `init` captures whichever tools exist at the moment
-> you run it; tools installed later are picked up by `switcher rescan`
-> (see "Add another tool later"). `init` is one-shot — re-running it
-> fails with `StateAlreadyInitialized`.
+Verify:
 
 ```bash
-# Capture every detected tool into a dated-current profile:
+switcher version       # → switcher v0.1.5
+```
+
+---
+
+## Your first session
+
+> **⚠ Run `switcher init` only AFTER the tools you want to manage are already
+> installed.** `init` captures whatever's on disk at the moment you run it.
+> Tools you install later get picked up via `switcher rescan` separately.
+
+```bash
 switcher init
-
-# Restrict to a subset:
-switcher init --only copilot              # manage Copilot only
-switcher init --skip claude               # manage everything detected except Claude
-switcher init --interactive               # per-tool yes/no prompt (TTY required)
 ```
 
-> **Recovery (forthcoming in v0.1.5; not in earlier releases):**
-> if `init` is interrupted by a process kill or transient FS error,
-> `switcher status` will report it and point you at
-> `switcher init --continue` (resume the partial capture) or
-> `switcher init --abort` (restore the pre-init state). Pre-v0.1.5,
-> an interrupted `init` requires manual intervention — see
-> "Maintenance and recovery".
+What just happened on disk:
 
-## Switch profiles
+1. `~/.claude` (and `~/.copilot`, if installed) moved into
+   `<state_dir>/profiles/<today>-current/`.
+2. Symlinks at the original paths now point into that profile.
+3. A second `vanilla` profile was created carrying just your credential files
+   (auth tokens, API keys) — your starting-from-scratch baseline.
+4. The "active" map records both tools as currently using `<today>-current`.
+
+Confirm it:
 
 ```bash
-switcher use vanilla                  # all currently-managed tools
-switcher use vanilla --only claude    # one tool only
+switcher status
+# claude  → 2026-05-15-current
+# copilot → 2026-05-15-current
+
+switcher list
+# * 2026-05-15-current
+#   vanilla
 ```
 
-`use` switches **only currently-managed tools**. Tools removed via
-`unmanage` stay removed across `use` calls — the durability invariant
-added in v0.1.4. To bring a tool back under management, run
-`switcher rescan --only <tool>`.
+You can keep working with Claude as usual — the symlink is invisible to the
+tool. `~/.claude/settings.json` is still the file Claude reads; it just
+happens to live under the switcher state directory now.
 
-## Save and manage profiles
+---
 
-`save` and `create` are different operations:
+## Branching: experiments
 
-- `switcher save <name>` snapshots the **current live config** of every
-  managed tool into a new profile.
-- `switcher create <name>` scaffolds a new **empty** profile, seeded
-  with the active profile's credential files. Use this when you want a
-  fresh profile to populate from scratch.
+Suppose you want to try a different Claude setup — a new `CLAUDE.md`, a different
+`settings.json`, an experimental plugin — without losing your current state.
 
 ```bash
-switcher save before-experiment       # capture the moment, then experiment
-switcher create experiment            # empty profile, credentials seeded
-switcher use experiment
-
-switcher rename experiment client-A   # auto-relinks active profiles
-switcher delete old-profile           # refused if active; switch off first
-switcher delete old-profile --force   # suppresses y/N prompt; active still blocks
+switcher save baseline           # snapshot RIGHT NOW into a profile named "baseline"
+switcher create experiment       # new profile, credentials copied from current
+switcher use experiment          # flip: ~/.claude now points into "experiment"
 ```
 
-## Add another tool later
+You're now running on the `experiment` profile. Any changes you make to
+`~/.claude` (new files, edits to settings, plugin installs) write into the
+experiment profile's data. The `baseline` profile stays frozen.
 
-`init` is a one-shot. To bring a newly-installed tool under management:
+Compare runs by flipping:
 
 ```bash
-switcher rescan --only gemini         # canonical "add a tool" verb
-switcher rescan                       # TTY-interactive: yes/no per detected tool
-switcher rescan --all                 # non-interactive, capture everything
+switcher use baseline            # back to baseline; experiment data is preserved
+switcher use experiment          # forward again
 ```
 
-> **Recovery (forthcoming in v0.1.5; not in earlier releases):**
-> if `rescan` is interrupted, `switcher status` will report it and
-> you resolve with `switcher rescan --continue` or
-> `switcher rescan --abort`. Pre-v0.1.5, see "Maintenance and
-> recovery".
-
-## Stop managing one tool
+**Per-tool experiments.** If both Claude and Copilot are managed but you only
+want to branch Claude:
 
 ```bash
-switcher unmanage copilot             # restores ~/.copilot to a real directory,
-                                       # removes Copilot from the active map
+switcher use experiment --only claude   # only Claude flips; Copilot stays put
 ```
 
-Subsequent `use` calls won't re-activate Copilot. To bring it back,
-run `switcher rescan --only copilot`.
+The `experiment` profile carries both tools' metadata, but `use --only claude`
+only swaps Claude's symlinks.
 
-## Stop using switcher entirely
+---
+
+## Walking back
+
+Three escape hatches, least to most aggressive.
+
+### 1. Switch to a known-good profile
 
 ```bash
-switcher uninstall                    # every live symlink → real directory;
-                                       # state directory preserved
-switcher uninstall --purge            # same, plus `rm -rf <state_dir>`
+switcher use baseline
 ```
 
-This restores `switcher`-managed config paths to real directories and
-(optionally) removes the state dir. It does **not** uninstall the
-`switcher` Python package — for that, run `pipx uninstall switcher`.
+The day-to-day undo. The `experiment` profile still exists; you can come back
+to it later. Use this when you just want to step away from an experiment.
 
-## Inspect and diagnose
+### 2. Stop managing a single tool
 
 ```bash
-switcher status                       # active profile per tool
-switcher status -v                    # plus cached live-path state
-switcher which claude                 # which profile a tool is on
-switcher tools                        # registered tools, INSTALLED + MANAGED columns
-switcher list                         # all profiles, active marked with *
-switcher version                      # package version
+switcher unmanage copilot
 ```
 
-The `tools` `INSTALLED` column is `✓` when the tool's live config dir
-exists; `MANAGED` is `✓` when the tool is in the active map.
+Restores `~/.copilot` to a real directory (the data from whichever profile was
+currently active becomes the live config) and removes Copilot from switcher's
+active map. Subsequent `switcher use` calls won't touch it. Claude stays
+managed. To bring Copilot back later: `switcher rescan --only copilot`.
 
-## Maintenance and recovery
+### 3. Uninstall switcher entirely
 
 ```bash
-switcher prune                        # delete profiles not active for any tool
-switcher prune --dry-run
-switcher prune --force                # skip the confirmation prompt
+switcher uninstall              # every managed live path → real directory; state dir preserved
+switcher uninstall --purge      # same, plus `rm -rf <state_dir>`
 ```
 
-> **⚠ Manual recovery (last resort).** When the normal commands can't
-> repair the state — a half-finished `init` that even `--abort` can't
-> resolve, dangling links after a manual `rm -rf`, registry drift past
-> what `unmanage` handles — fall through to the destructive procedure.
->
-> ### If everything else fails: destructive recovery
->
-> The v0.1.0 wipe procedure is retained for cases where `uninstall`
-> can't run — e.g. live config paths manually broken, state-dir
-> contents corrupted past recognition, or a half-finished `init` that
-> `uninstall`'s classifier rejects. This is an exceptional manual
-> procedure with multiple failure modes, not a routine operation.
-> **You will lose every saved profile, your live tool config, AND any
-> user-added tool registry entries if you do not back up the entire
-> `<state_dir>` first.** The `<dated>-current` profile is where your
-> real Claude/Copilot config lives after `init` (the live `~/.claude`
-> etc. are just symlinks into it); `<state_dir>/registry.d/` holds
-> user-added tool definitions; `<state_dir>/profiles/` holds every
-> saved profile. Read the whole procedure before running any of the
-> steps.
->
-> 1. **Record the active profile per tool, then back up the entire state
->    directory.** The active profile is what each tool's live config
->    actually points at right now — and it may differ across tools
->    (e.g. Claude on `vanilla`, Copilot on `experiment`). Restoring from
->    the wrong profile silently discards newer changes:
->    ```bash
->    switcher status      # capture this output — it tells you which
->                         # profile to restore from for each tool
->    ```
->    Then back up the whole state tree (not just `profiles/`) so user-added
->    registry entries and the active map come along:
->    ```bash
->    # macOS example — adjust the source path per the per-OS table below
->    cp -R "$HOME/Library/Application Support/switcher" ~/switcher-state-backup
->    ```
->    > **🔒 The backup contains credentials.** Per the seed-not-share
->    > model, every profile in `<state_dir>/profiles/` carries its own
->    > copy of every tool's credential files (OAuth tokens, API keys,
->    > etc.). Treat `~/switcher-state-backup` as secret material:
->    > restrict permissions, do not commit it, and delete it once
->    > recovery is complete. On POSIX: `chmod -R go-rwx
->    > ~/switcher-state-backup` after copying.
-> 2. **Restore each tool's active-profile config to its live path before
->    wiping.** After `init`/`use`, each managed tool's live config dir is
->    a symlink/junction pointing into `<state_dir>`. If you delete
->    `<state_dir>` while those links exist, they dangle — and `switcher
->    init` will then refuse to run with `AlreadyLinkedError`. For each
->    tool, look at the profile name from step 1's `switcher status` output
->    and restore from `profiles/<that-profile>/<config_subdir>/`. The
->    link-removal step is OS-specific:
->
->    > **One `<active-profile>` per tool, not one for the whole step.**
->    > If `switcher status` showed `claude → vanilla` and `copilot →
->    > experiment`, restore Claude from `profiles/vanilla/claude/` and
->    > Copilot from `profiles/experiment/copilot/`. Substituting the same
->    > value for both is the most likely way to lose work.
->    ```bash
->    # macOS / Linux — symlinks: use `rm` (NOT rmdir).
->    # Substitute <active-profile> per `switcher status` output for this tool.
->    rm ~/.claude
->    cp -R ~/switcher-state-backup/profiles/<active-profile>/claude ~/.claude
->    ```
->    ```powershell
->    # Windows — junctions: use `rmdir` from cmd, or Remove-Item from PowerShell.
->    # `rm`/`del` will fail or behave unexpectedly on a junction.
->    cmd /c rmdir "$env:USERPROFILE\.claude"
->    Copy-Item -Recurse "$env:USERPROFILE\switcher-state-backup\profiles\<active-profile>\claude" "$env:USERPROFILE\.claude"
->    ```
->    Repeat for every tool listed in `switcher status` — each may need a
->    different `<active-profile>` source.
-> 3. **Verify, then wipe `<state_dir>` and re-run `switcher init`.**
->    Before wiping, confirm each tool's live config path is now a real
->    directory (not a symlink/junction) — `ls -lh ~/.claude` on POSIX
->    or `Get-Item ~/.claude | Select Mode` in PowerShell will show this.
->    If any path is still a link, repeat step 2 for that tool. With real
->    config dirs at every live path, init captures every installed tool
->    fresh. After init, run `switcher status` to confirm the expected
->    active profiles per tool before moving on to step 4.
-> 4. **Restore user-added registry entries and additional profiles.**
->    Copy any TOMLs from your backup's `registry.d/` into the new
->    `<state_dir>/registry.d/` so user-added tools are recognized again,
->    then copy non-current profile directories from your backup's
->    `profiles/` into the new `<state_dir>/profiles/`. Restored profiles
->    reappear in `switcher list` but are inert until you
->    `switcher use <name>` them — the fresh `init` resets the active map
->    to the new dated-current; prior active state is not preserved.
->
->    **Note on credentials in restored profiles.** Per the seed-not-share
->    credential model described in "How it works," a restored profile
->    carries the credentials it was created with — which may be stale
->    if tokens have rotated since the backup. If `switcher use <restored>`
->    followed by the tool's first action triggers a re-auth prompt,
->    that's expected; completing the auth updates the live config dir,
->    which IS the restored profile while it's active, so the new
->    credentials persist in that profile.
+`uninstall` restores every managed config path to a real directory. Without
+`--purge`, your profiles remain on disk under the state directory — you could
+reinstall switcher later and rebuild. With `--purge`, the state directory is
+also removed; nothing persists.
 
-### Migrating from the legacy two-dir Copilot builtin
+Note: this is separate from removing the Python package itself. To remove the
+`switcher` binary: `pipx uninstall switcher`.
 
-v0.1.4 rewrites the bundled `copilot` builtin to target the standalone
-`copilot` binary's single config dir (`~/.copilot`). Profiles created
-before v0.1.4 — when the builtin captured both `~/.copilot` AND
-`~/.config/github-copilot` (POSIX) / `%LOCALAPPDATA%\github-copilot`
-(Windows) — keep working: their cached live paths still resolve and the
-`copilot-auth/` subdir under each profile is harmless dead data
-(switcher no longer visits it).
+---
 
-If you want to fully migrate to the single-dir shape and drop the
-legacy `copilot-auth/` subdir from new profiles:
+## Reference
 
-```bash
-switcher unmanage copilot                  # restores both legacy live paths
-switcher rescan --only copilot             # captures just ~/.copilot
-```
-
-The unmanage step's pre-flight uses cached live paths, so registry
-drift doesn't break it. After `rescan`, new profiles created from
-the standalone Copilot CLI's data carry only `copilot-config/`.
-
-If you use the deprecated `gh copilot` extension instead, see
-[Adding a tool](#adding-a-tool) below — register it as a user-local
-tool with the explicit two-dir shape rather than re-using the `copilot`
-id.
-
-## How it works
-
-`switcher init` performs a one-time setup:
-
-1. Detects which managed tools are installed by looking for an existing
-   configuration directory each tool registers.
-2. Moves each tool's live config dirs into `<state_dir>/profiles/<dated>-current/`.
-3. Creates symlinks (or junctions on Windows) from the original paths back into the profile.
-4. Creates a `vanilla` profile containing only credential files — no plugins, hooks, or extensions.
-5. Records `<dated>-current` as active for every detected tool.
-
-After that, `switcher use <name>` re-links each managed dir to the new
-profile — one atomic per-directory swap each.
-
-**`init` is one-shot.** It snapshots whichever managed tools are installed
-at the moment you run it, and then refuses to run again
-(`StateAlreadyInitialized`). Two cases worth knowing:
-
-- *No managed tools installed yet:* `init` still succeeds — but with empty
-  profiles and no active tools, so `status` will show "no active profiles."
-- *Only some managed tools installed:* only those are captured; the rest
-  are simply not in the active map.
-
-In both cases, a tool installed *after* `init` is not retroactively picked
-up by `init` itself. Use `switcher rescan` to capture newly-installed
-tools into a fresh profile (see "Add another tool later" above).
-
-Profile contents (what `save`/`create`/`use` move around): each profile is
-a directory of full per-tool config trees. Credential files (declared in
-each tool's `[[credentials]]` block) are *seeded across profiles*, not
-shared at runtime — `create` copies them in from whichever profile is
-currently active, and `init` carries them into `vanilla`. After seeding,
-each profile owns its own credential files; if you re-auth while a profile
-is active, that profile's copy is updated, but other profiles' copies
-remain untouched. The seeding model is what gives the "switch without
-re-auth" guarantee day-to-day. Everything else (plugins, hooks, settings,
-history) is profile-specific from the start.
-
-The state directory is chosen by `platformdirs.user_data_dir("switcher")`:
-
-| OS | Path |
-|---|---|
-| Linux | `~/.local/share/switcher` |
-| macOS | `~/Library/Application Support/switcher` |
-| Windows | `%LOCALAPPDATA%\switcher` |
-
-Override with `SWITCHER_STATE_DIR=<path>`.
-
-## Adding a tool
-
-Beyond listing what's registered, `switcher tools` also has a `scaffold`
-subcommand for generating new registry entries. To add a tool, drop a TOML
-in `<state_dir>/registry.d/` matching the schema — generate a stub with
-`switcher tools scaffold <id>`:
-
-> **Same `init`-is-one-shot caveat applies.** Registering a new tool TOML
-> after `init` makes it visible to `switcher tools` and `switcher list`,
-> but it is NOT automatically captured into existing profiles or the
-> active map. Run `switcher rescan` to capture the newly-registered
-> tool's live config dir into a fresh `<today>-rescan-N` profile (or
-> `switcher rescan --into <profile>` to consolidate into an existing
-> profile).
-
-```bash
-switcher tools scaffold gemini
-# Edit the stub at <state_dir>/registry.d/gemini.toml
-switcher tools         # confirms the registry entry loads (schema validation only;
-                       # does not check whether the target paths exist on disk)
-```
-
-The TOML schema (full form):
-
-```toml
-id = "gemini"
-name = "Gemini CLI"
-
-[[config_dirs]]
-posix_path = "~/.gemini"
-windows_path = "%USERPROFILE%\\.gemini"
-profile_subdir = "gemini"
-env_override = "GEMINI_HOME"   # optional
-
-[[credentials]]
-config_dir = "gemini"            # references a config_dirs[].profile_subdir
-path = "oauth_creds.json"
-```
-
-`credentials[].config_dir` is *not* the tool `id` and not a filesystem path —
-it must equal the `profile_subdir` of one of the `config_dirs` entries. That
-identifies which managed dir the credential file lives in; `path` is then
-relative to that dir.
-
-For tools whose credential files all live in their first registered config
-directory, a `credential_files` shorthand works in place of the
-`[[credentials]]` block (it auto-expands at registry-load time, anchored to
-`config_dirs[0].profile_subdir`). This is the common case — the shorthand
-is intended for single-dir tools, but it also works for multi-dir tools
-whose credentials happen to all live in the first dir. If credentials live
-in a non-first config dir, use the explicit `[[credentials]]` form so you
-can name the right `config_dir`:
-
-```toml
-id = "gemini"
-name = "Gemini CLI"
-credential_files = ["oauth_creds.json"]   # auto-expands
-
-[[config_dirs]]
-posix_path = "~/.gemini"
-windows_path = "%USERPROFILE%\\.gemini"
-profile_subdir = "gemini"
-```
-
-A worked multi-dir example (illustrative — not a real tool). Suppose
-some hypothetical CLI keeps shell config in `~/.foocli/` but stashes
-its OAuth token in `~/.config/foocli/auth.json`. The shorthand
-wouldn't fit (the credential isn't in the first registered dir), so
-write the `[[credentials]]` block explicitly and set `config_dir` to
-the matching `profile_subdir`:
-
-```toml
-id = "foocli"
-name = "Foo CLI"
-
-[[config_dirs]]
-posix_path = "~/.foocli"
-windows_path = "%USERPROFILE%\\.foocli"
-profile_subdir = "foocli"
-
-[[config_dirs]]
-posix_path = "~/.config/foocli"
-windows_path = "%APPDATA%\\foocli"
-profile_subdir = "foocli-xdg"
-
-[[credentials]]
-config_dir = "foocli-xdg"        # matches the second config_dirs entry
-path = "auth.json"
-```
-
-### Worked example: deprecated `gh copilot` extension
-
-The bundled `copilot` builtin targets the standalone `copilot` binary
-(single config dir at `~/.copilot`). The deprecated `gh copilot`
-extension uses two dirs and is **not** bundled — register it as a
-user-local tool at `<state_dir>/registry.d/gh-copilot.toml` with a
-distinct id so it doesn't collide with the standalone builtin:
-
-```toml
-id = "gh-copilot"
-name = "GitHub Copilot (gh extension, deprecated)"
-
-[[config_dirs]]
-posix_path = "~/.config/github-copilot"
-windows_path = "%LOCALAPPDATA%\\github-copilot"
-profile_subdir = "gh-copilot-auth"
-
-[[config_dirs]]
-posix_path = "~/.copilot"
-windows_path = "%USERPROFILE%\\.copilot"
-profile_subdir = "gh-copilot-config"
-
-[[credentials]]
-config_dir = "gh-copilot-auth"
-path = "apps.json"
-```
-
-> **Conflict with the standalone CLI.** Both products use `~/.copilot`.
-> If you have both installed, complete the migration to the standalone
-> CLI first (uninstall the deprecated extension, install standalone),
-> then run `switcher rescan --only copilot`. Running both side-by-side
-> against the same `~/.copilot` will produce confused state.
+This README covers the happy path. For the full command catalog, flag matrices,
+recovery procedures when things go wrong, the state-directory layout, and how
+to register a new tool, see [`docs/MANUAL.md`](docs/MANUAL.md).
 
 ## Contributing
 
 Bug reports, feature requests, and PRs are welcome. See
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev environment setup,
-the test layout, the spec→plan→implementation workflow, commit
-conventions, and a walkthrough for adding a built-in tool.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev environment setup, the test
+layout, the spec→plan→implementation workflow, commit conventions, and a
+walkthrough for adding a built-in tool.
 
 ## License
 
