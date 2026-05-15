@@ -46,7 +46,7 @@ import pytest
 
 from switcher.oplog import OpLogIO, _InitOp, _RenameOp, _RescanOp
 from switcher.paths import IS_WINDOWS
-from switcher.registry import build_registry
+from switcher.registry import build_registry, find_tool
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
@@ -390,7 +390,6 @@ def test_interrupted_rename_auto_compensates_on_next_status(
     name + re-runs swap_link to point live at the new dir), and marks
     the journal complete — all without user input."""
     store = FileProfileStore(tmp_state)
-    claude_live = tmp_home / ".claude"
 
     # Full init through service so we have a real captured state to rename.
     service = _service(tmp_state, tmp_home)
@@ -439,9 +438,25 @@ def test_interrupted_rename_auto_compensates_on_next_status(
             f"compensation left {tid!r} pointing at {active_after.get(tid)!r} "
             f"but expected {new_name!r}"
         )
-    # Live symlink still resolves correctly (auto-compensation re-
-    # pointed it from old_name to new_name).
-    assert _is_link(claude_live)
+    # Every affected tool's live link is also rewritten to point into
+    # the new profile (abby pass-2 batch 2: a bug that fixes the
+    # active map for all tools but only repairs ONE on-disk symlink
+    # would otherwise slip through). resolve() follows the symlink to
+    # its final destination, which must live under the new profile's
+    # profile_dir.
+    new_profile_dir = store.profile_dir(new_name).resolve()
+    resolver = service._resolver
+    registry = build_registry(tmp_state / "registry.d")
+    for tid in affected:
+        tool = find_tool(registry, tid)
+        assert tool is not None, f"tool {tid!r} missing from registry"
+        for i in range(len(tool.config_dirs)):
+            live = resolver.tool_dir(tool, i)
+            assert _is_link(live), f"live={live} for {tid!r} not a managed link"
+            assert new_profile_dir in live.resolve().parents, (
+                f"live={live} for {tid!r} resolves to {live.resolve()} "
+                f"which is not under {new_profile_dir}"
+            )
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
