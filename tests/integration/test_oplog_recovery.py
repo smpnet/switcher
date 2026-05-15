@@ -14,8 +14,14 @@ auto-compensation hook (rename) from a fresh process. Confirms:
     mark_completed),
   - the rename auto-compensation runs on the FIRST CLI command after
     the crash, even read-only ones (`switcher status`),
-  - the journal is cleared (vacuum_completed drops the marked record)
-    by the time the recovery process exits.
+  - the journal record is mark_completed'd by the time the recovery
+    process exits (so ``read_in_flight`` returns None). The vacuum
+    step that physically drops the completed record from
+    ``oplog.json`` runs on the NEXT mutating command — read-only
+    commands intentionally skip vacuum (spec §2.2 journal-hygiene
+    contract). The test
+    ``test_completed_record_vacuumed_on_next_mutating_command``
+    exercises this two-phase shape explicitly.
 
 These tests deliberately avoid SIGKILL-of-a-mid-mutation-subprocess.
 The plan flagged that approach, but timing the kill between
@@ -422,9 +428,19 @@ def test_interrupted_rename_auto_compensates_on_next_status(
     r = _run(["status"], tmp_home, tmp_state)
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
 
-    # Active map now points at the new name; live still resolves
-    # correctly (auto-compensation re-pointed the symlink).
-    assert store.get_active()["claude"] == new_name
+    # Every affected tool's active entry now points at new_name (the
+    # whole purpose of affected_ids is to keep the rename atomic
+    # across all of them — abby pass-1 batch 2 blocker). Verifying
+    # only one tool would let a regression that updates one and
+    # leaves the others stale slip through.
+    active_after = store.get_active()
+    for tid in affected:
+        assert active_after.get(tid) == new_name, (
+            f"compensation left {tid!r} pointing at {active_after.get(tid)!r} "
+            f"but expected {new_name!r}"
+        )
+    # Live symlink still resolves correctly (auto-compensation re-
+    # pointed it from old_name to new_name).
     assert _is_link(claude_live)
     assert OpLogIO(tmp_state).read_in_flight() is None
 
