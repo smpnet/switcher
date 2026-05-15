@@ -700,6 +700,12 @@ def test_continue_short_circuit_returns_already_completed_report(
     assert isinstance(result, InitAlreadyCompletedReport)
     assert result.kind == "continue"
     assert result.profile_name == profile_name
+    # Short-circuit also marks the record completed (the journal-cleanup
+    # step that distinguishes "committed but log-unmarked" from "fully
+    # interrupted"). Without this assertion, a regression that skipped
+    # mark_completed on the short-circuit branch would still pass the
+    # InitAlreadyCompletedReport assertions above. CR pass-PR-3 nit.
+    assert OpLogIO(tmp_state).read_in_flight() is None
 
 
 def test_abort_short_circuits_when_already_completed(
@@ -1718,8 +1724,12 @@ def test_continue_refuses_when_vanilla_profile_dir_is_symlink(
     claude_live = tmp_home / ".claude"
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
-    profile_dir = store.profile_dir(profile_name)
-    profile_dir.mkdir(parents=True)
+    # Use store.create so the current-profile metadata is valid; the
+    # only corruption under test here is the vanilla symlink. Without
+    # this the current-profile metadata-readability check (pass-7)
+    # could fire BEFORE the vanilla shape check, making the test pass
+    # for the wrong reason. CR pass-PR-3 nit.
+    store.create(profile_name, {"claude": True})
     # Plant a symlink at profiles/vanilla pointing somewhere unrelated.
     elsewhere = tmp_state / "elsewhere"
     elsewhere.mkdir(parents=True)
