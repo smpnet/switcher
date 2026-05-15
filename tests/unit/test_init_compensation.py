@@ -264,10 +264,8 @@ def test_continue_with_no_in_flight_raises_no_in_progress(
 
 def _rescan_in_flight_record() -> _RescanOp:
     """Shared in-flight record for the rescan-routing tests below.
-    PR4 ships init's --continue/--abort; rescan's matching flags land
-    in PR5 (Phase 7), so the error message names the COMMAND but not
-    specific flags. CR pass-6 major carry-forward; CR pass-PR-1 nit
-    (test-split) means continue and abort get their own test bodies."""
+    v0.1.5 PR5 ships rescan's --continue/--abort, so the error message
+    NAMES the matching flags directly (symmetric to the init hint)."""
     return _RescanOp.model_validate(
         {
             "op": "rescan",
@@ -285,16 +283,16 @@ def test_continue_routes_user_to_rescan_when_in_flight_is_rescan(
     service: ProfileService, tmp_state: Path
 ) -> None:
     """`switcher init --continue` with an in-flight ``_RescanOp`` raises
-    RescanInProgressError pointing at the rescan recovery surface (by
-    command name, not by flag — PR4 doesn't ship rescan's flags)."""
+    RescanInProgressError pointing at the rescan recovery surface — now
+    NAMES the rescan flags directly (PR5 ships them)."""
     OpLogIO(tmp_state).append_record(_rescan_in_flight_record())
 
     with pytest.raises(RescanInProgressError) as excinfo:
         service.init(continue_=True)
     msg = str(excinfo.value)
     assert "rescan" in msg.lower()
-    assert "--continue" not in msg
-    assert "--abort" not in msg
+    assert "switcher rescan --continue" in msg
+    assert "switcher rescan --abort" in msg
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
@@ -310,8 +308,8 @@ def test_abort_routes_user_to_rescan_when_in_flight_is_rescan(
         service.init(abort=True)
     msg = str(excinfo.value)
     assert "rescan" in msg.lower()
-    assert "--continue" not in msg
-    assert "--abort" not in msg
+    assert "switcher rescan --continue" in msg
+    assert "switcher rescan --abort" in msg
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
 

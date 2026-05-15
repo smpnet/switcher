@@ -45,6 +45,8 @@ from switcher.service import (
     InitAlreadyCompletedReport,
     InitReport,
     ProfileService,
+    RescanAlreadyCompletedReport,
+    RescanReport,
     UninstallMappingState,
 )
 from switcher.store import FileProfileStore, ProfileStore
@@ -140,13 +142,8 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
     consistent across multiple invocations of the same broken state.
     Rename has no hint — it is auto-compensated transparently.
 
-    The init branch names ``--continue`` / ``--abort`` directly (v0.1.5
-    PR4). The rescan branch still defers to "manual recovery / follow-on
-    release" wording: rescan's matching flags don't ship until PR5
-    (Phase 7). Pointing a PR4 user at ``switcher rescan --continue`` /
-    ``--abort`` would fail with "no such option" and burn the first
-    recovery attempt (abby blocking review carry-forward). When PR5
-    ships, the rescan branch gets parallel flag-naming wording.
+    Both init and rescan branches name ``--continue`` / ``--abort``
+    directly (v0.1.5 PR4 shipped init's flags; PR5 ships rescan's).
     """
     if isinstance(record, _InitOp):
         targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
@@ -189,8 +186,9 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
             f"(started {record.started_at.isoformat()}).\n"
             f"  Mode: {mode_desc} (target profiles: {profiles_desc})\n"
             f"  Targets: {targets}\n"
-            f"Manual recovery required on this switcher version. Guided "
-            f"continue/abort handlers for rescan ship in a follow-on release."
+            f"Run `switcher rescan --continue` to finish the interrupted "
+            f"rescan, or `switcher rescan --abort` to reverse pre-rescan "
+            f"state."
         )
     raise AssertionError(f"unexpected in-flight record type: {type(record).__name__}")
 
@@ -490,6 +488,54 @@ def _print_init_recovery_result(
             console.print("Resumed interrupted init; mappings replayed.")
         return
     _print_init_report(result)
+
+
+def _print_rescan_recovery_result(
+    result: RescanAlreadyCompletedReport | None,
+    *,
+    abort: bool,
+) -> None:
+    """Render the outcome of ``service.rescan(continue_=True | abort=True)``.
+
+    Two return shapes the recovery branch can produce (spec §2.4):
+
+    - ``RescanAlreadyCompletedReport``: the journal record was committed
+      before the crash; ``mark_completed`` ran without invoking
+      compensation. ``kind`` distinguishes continue vs abort — both
+      surface the journal-cleanup outcome; the abort variant also
+      tells the user that the rescan is already on disk (abort can't
+      reverse a committed rescan).
+    - ``None``: compensation actually ran.
+
+    ``RescanReport`` (the normal-path shape) is intentionally excluded
+    from the signature (abby pass-6): the recovery branch can't
+    produce it, and refusing it at the type level protects future
+    callers from accidentally passing the normal-path shape through.
+    The CLI caller narrows the service's wider return union to this
+    helper's input shape via an explicit isinstance gate.
+    """
+    if isinstance(result, RescanAlreadyCompletedReport):
+        profiles_desc = ", ".join(
+            f"{tid}->{prof}" for tid, prof in sorted(result.target_profiles.items())
+        )
+        if result.kind == "continue":
+            console.print(
+                f"Rescan ({profiles_desc}) was already complete; "
+                f"journal record cleaned up. Nothing further to do."
+            )
+        else:
+            console.print(
+                f"Rescan ({profiles_desc}) was already committed before "
+                f"the crash; abort cannot reverse it. The captured tools "
+                f"are already managed."
+            )
+        return
+    # ``result is None`` is the only remaining shape after the
+    # isinstance check above — type system narrows the union here.
+    if abort:
+        console.print("Aborted interrupted rescan; pre-rescan state restored.")
+    else:
+        console.print("Resumed interrupted rescan; captures finalized.")
 
 
 @app.command()
@@ -892,6 +938,16 @@ def rescan(
         "Mutually exclusive with --only.",
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print plan; make no changes."),
+    continue_: bool = typer.Option(
+        False,
+        "--continue",
+        help="Resume an interrupted rescan using the op-log intent record.",
+    ),
+    abort: bool = typer.Option(
+        False,
+        "--abort",
+        help="Abort an interrupted rescan; reverse pre-rescan state.",
+    ),
 ) -> None:
     """Pick up tools installed after init.
 
@@ -899,11 +955,61 @@ def rescan(
     Off-TTY: print a stderr warning and capture every detected unmanaged
     tool. Use --all to suppress the warning, or --only to be selective.
     --dry-run never prompts regardless of TTY.
+
+    ``--continue`` / ``--abort`` drive op-log compensation (spec §2.4).
+    Mutually exclusive with each other AND with --only / --into / --all
+    / --dry-run (recovery scope comes from the in-flight journal record,
+    not the call site).
     """
+    # Recovery-flag mutex runs BEFORE get_deps. Same rationale as init's
+    # mutex: explicit recovery intent, so a malformed combination is a
+    # pure usage error. Bailing out before reading state also keeps the
+    # error surface clean.
+    if continue_ and abort:
+        raise typer.BadParameter("--continue and --abort are mutually exclusive")
+    if (continue_ or abort) and (only is not None or into is not None or all_ or dry_run):
+        raise typer.BadParameter(
+            "--continue/--abort are mutually exclusive with --only/--into/--all/--dry-run"
+        )
+
+    deps = get_deps()
+
+    if continue_ or abort:
+        # Same dispatch-before-hook + rename-drain pattern as init's
+        # recovery branch (spec §2.3 + §2.4). The hook would otherwise
+        # raise RescanInProgressError on the in-flight _RescanOp before
+        # the recovery flags reached service.rescan.
+        deps.oplog.vacuum_completed()
+        in_flight = deps.oplog.read_in_flight()
+        if isinstance(in_flight, _RenameOp):
+            deps.service._compensate_rename(in_flight)  # pyright: ignore[reportPrivateUsage]
+            # Defensive refresh: service._compensate_rename owns
+            # mark_completed; if the journal still holds a _RenameOp
+            # after the drain, the contract regressed and we'd otherwise
+            # mask it as a generic OpLogCorruptError. Surface the
+            # rename-specific breakage at the CLI layer.
+            in_flight = deps.oplog.read_in_flight()
+            if isinstance(in_flight, _RenameOp):
+                raise OpLogCorruptError(
+                    "rename auto-compensation did not drain the in-flight "
+                    "journal record; service._compensate_rename contract "
+                    "regressed. Manual recovery required."
+                )
+        result = deps.service.rescan(continue_=continue_, abort=abort)
+        # service.rescan's overload returns the wider union; the
+        # recovery branch only ever produces RescanAlreadyCompletedReport
+        # or None. Narrow via assert before passing to the helper —
+        # surfaces a future contract regression (RescanReport leaking
+        # through) loudly rather than masking it as a type-check error.
+        assert not isinstance(result, RescanReport), (
+            "service.rescan(continue_|abort=True) must not return RescanReport"
+        )
+        _print_rescan_recovery_result(result, abort=abort)
+        return
+
     # Hook FIRST — an in-flight init/rescan must surface ahead of the
     # flag-mutex BadParameter (abby blocking review). Same precedence
     # rationale as init.
-    deps = get_deps()
     _detect_or_compensate_oplog(deps, allow_mutation=True)
     if all_ and only is not None:
         raise typer.BadParameter("--all and --only are mutually exclusive")

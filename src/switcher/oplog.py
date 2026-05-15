@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import uuid
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -317,11 +318,19 @@ class _RescanOp(_BaseOp):
     # target_profiles: {tool_id: profile_name} — both SafeName.
     # previous_tools: {profile_name: {tool_id: was_managed_before}} —
     #   outer key Profile.name shape, inner key Tool.id shape.
+    # rescan_id: opaque per-rescan token. Stamped into the
+    #   ``journal_id`` field of any fresh-mode profile this rescan
+    #   creates; checked at recovery time to refuse fresh-mode
+    #   targets whose ``.tools`` match by coincidence but were
+    #   actually created by an external process during the
+    #   reservation-vs-capture race window (Hermes pass-PR-2
+    #   blocker). Auto-generated, 32-hex-char uuid4.
     target_ids: list[SafeName]
     target_profiles: dict[SafeName, SafeName]
     into_mode: StrictBool
     previous_tools: dict[SafeName, dict[SafeName, StrictBool]] | None = None
     mappings: list[_MappingIntent]
+    rescan_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
     @model_validator(mode="after")
     def _check_target_ids_unique(self) -> Self:

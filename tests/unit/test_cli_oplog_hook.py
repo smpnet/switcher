@@ -29,7 +29,7 @@ from switcher.errors import (
     RescanInProgressError,
 )
 from switcher.oplog import OpLogRecord, _InitOp, _RenameOp, _RescanOp
-from switcher.service import InitAlreadyCompletedReport
+from switcher.service import InitAlreadyCompletedReport, RescanAlreadyCompletedReport
 
 
 def _now() -> datetime:
@@ -132,12 +132,19 @@ class _FakeService:
     invocations and a configurable return value so the init-recovery CLI
     tests can exercise the InitAlreadyCompletedReport vs None branches
     without MagicMock (project convention, per coding guidelines).
+
+    v0.1.5 PR5: extended with the same shape for ``service.rescan(
+    continue_=..., abort=...)`` so the rescan-recovery CLI tests can
+    cover the same matrix.
     """
 
     compensate_rename_args: list[_RenameOp] = field(default_factory=list)
     init_calls: list[dict[str, Any]] = field(default_factory=list)
     init_return_value: Any = None
     init_side_effect: BaseException | None = None
+    rescan_calls: list[dict[str, Any]] = field(default_factory=list)
+    rescan_return_value: Any = None
+    rescan_side_effect: BaseException | None = None
 
     def _compensate_rename(self, record: _RenameOp) -> None:
         self.compensate_rename_args.append(record)
@@ -155,6 +162,12 @@ class _FakeService:
         if self.init_side_effect is not None:
             raise self.init_side_effect
         return self.init_return_value
+
+    def rescan(self, **kwargs: object) -> Any:
+        self.rescan_calls.append(dict(kwargs))
+        if self.rescan_side_effect is not None:
+            raise self.rescan_side_effect
+        return self.rescan_return_value
 
 
 @dataclass
@@ -293,39 +306,20 @@ def test_format_in_progress_hint_init_names_recovery_flags() -> None:
 
 
 def test_format_in_progress_hint_rescan_fresh_mentions_fresh_profile() -> None:
+    """v0.1.5 PR5: hint still labels the mode + lists target tools.
+    Recovery-flag wording is asserted by the dedicated
+    test_format_in_progress_hint_rescan_fresh_names_recovery_flags test."""
     text = _format_in_progress_hint(_rescan_record_fresh())
     assert "rescan" in text
     assert "claude" in text
     assert "fresh-profile" in text
-    assert "Manual recovery required" in text
-    assert "follow-on release" in text
 
 
 def test_format_in_progress_hint_rescan_into_mentions_into_target() -> None:
     text = _format_in_progress_hint(_rescan_record_into())
     assert "rescan" in text
-    # No "--into shared" bare-flag wording — that flag is fine on its
-    # own as a rescan invocation, but the hint stays version-agnostic:
-    # name the target profile, don't tell the user to run any specific
-    # CLI shape that varies by switcher version.
     assert "shared" in text
     assert "claude" in text
-    assert "Manual recovery required" in text
-
-
-def test_format_in_progress_hint_rescan_does_not_reference_nonexistent_flags() -> None:
-    """v0.1.5 PR4 ships init's --continue/--abort but rescan's flags
-    don't land until PR5 (Phase 7). A PR4 binary that emits the rescan
-    hint must NOT direct the user to `switcher rescan --continue/--abort`
-    — those flags would fail with "no such option" and burn the user's
-    first recovery attempt (abby blocking review carry-forward). When
-    PR5 ships, this test gets removed and the rescan hint test is
-    updated to mirror the init one above."""
-    rescan_fresh_text = _format_in_progress_hint(_rescan_record_fresh())
-    rescan_into_text = _format_in_progress_hint(_rescan_record_into())
-    for text in (rescan_fresh_text, rescan_into_text):
-        assert "--continue" not in text
-        assert "--abort" not in text
 
 
 def test_format_in_progress_hint_rescan_into_multi_value_marks_corrupt() -> None:
@@ -780,3 +774,230 @@ def test_init_abort_compensation_ran_prints_success(
     result = runner.invoke(app, ["init", "--abort"])
     assert result.exit_code == 0, _combined(result)
     assert _combined(result).strip() != ""
+
+
+# -- v0.1.5 PR5: rescan --continue / --abort flag dispatch ----------------
+#
+# Mirrors the init recovery surface, with rescan-specific differences:
+# - Rescan has FOUR flags that conflict with --continue/--abort:
+#   --only, --into, --all, --dry-run.
+# - The recovery hint now NAMES the rescan flags (PR5 ships them).
+
+
+def test_rescan_continue_and_abort_mutex(patched_deps: _FakeDeps) -> None:
+    """`rescan --continue --abort` raises typer.BadParameter (exit 2)."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--continue", "--abort"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in _combined(result).lower()
+    assert patched_deps.service.rescan_calls == []
+
+
+@pytest.mark.parametrize(
+    "filter_args",
+    [
+        ["--only", "claude"],
+        ["--into", "shared"],
+        ["--all"],
+        ["--dry-run"],
+    ],
+)
+def test_rescan_continue_with_filter_flag_rejected(
+    patched_deps: _FakeDeps, filter_args: list[str]
+) -> None:
+    """Recovery scope is taken from the in-flight journal record, NOT the
+    call site. --continue is mutually exclusive with each of the rescan
+    filter flags (--only / --into / --all / --dry-run)."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--continue", *filter_args])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in _combined(result).lower()
+    assert patched_deps.service.rescan_calls == []
+
+
+@pytest.mark.parametrize(
+    "filter_args",
+    [
+        ["--only", "claude"],
+        ["--into", "shared"],
+        ["--all"],
+        ["--dry-run"],
+    ],
+)
+def test_rescan_abort_with_filter_flag_rejected(
+    patched_deps: _FakeDeps, filter_args: list[str]
+) -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--abort", *filter_args])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in _combined(result).lower()
+    assert patched_deps.service.rescan_calls == []
+
+
+def test_rescan_continue_dispatches_to_service_with_in_flight(
+    patched_deps: _FakeDeps,
+) -> None:
+    """`rescan --continue` with an in-flight _RescanOp bypasses the
+    generic _detect_or_compensate_oplog hook and dispatches to
+    service.rescan(continue_=True)."""
+    patched_deps.oplog.in_flight = _rescan_record_fresh()
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--continue"])
+    assert result.exit_code == 0, _combined(result)
+    # vacuum (journal hygiene) + read_in_flight (rename-drain probe).
+    assert patched_deps.oplog.calls == ["vacuum_completed", "read_in_flight"]
+    assert patched_deps.service.rescan_calls == [{"continue_": True, "abort": False}]
+    assert patched_deps.service.compensate_rename_args == []
+
+
+def test_rescan_abort_dispatches_to_service_with_in_flight(
+    patched_deps: _FakeDeps,
+) -> None:
+    patched_deps.oplog.in_flight = _rescan_record_fresh()
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--abort"])
+    assert result.exit_code == 0, _combined(result)
+    assert patched_deps.oplog.calls == ["vacuum_completed", "read_in_flight"]
+    assert patched_deps.service.rescan_calls == [{"continue_": False, "abort": True}]
+
+
+def test_rescan_continue_drains_in_flight_rename_before_dispatch(
+    patched_deps: _FakeDeps,
+) -> None:
+    """A stale in-flight _RenameOp must be transparently auto-
+    compensated BEFORE rescan recovery dispatches. Same contract init's
+    --continue / --abort uses."""
+    rename = _rename_record()
+    patched_deps.oplog.in_flight = rename
+    real_compensate = patched_deps.service._compensate_rename
+
+    def drain_and_clear(record: _RenameOp) -> None:
+        real_compensate(record)
+        patched_deps.oplog.in_flight = None
+
+    patched_deps.service._compensate_rename = drain_and_clear  # type: ignore[method-assign]
+    from switcher.errors import NoInProgressRescanError
+
+    patched_deps.service.rescan_side_effect = NoInProgressRescanError(
+        "no interrupted rescan detected; nothing to continue/abort"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--continue"])
+    assert patched_deps.service.compensate_rename_args == [rename]
+    assert len(patched_deps.service.rescan_calls) == 1
+    out = _combined(result).lower()
+    assert "no interrupted rescan" in out
+    assert "corrupt" not in out
+    assert result.exit_code == 1
+
+
+def test_rescan_continue_refuses_when_rename_drain_did_not_clear_journal(
+    patched_deps: _FakeDeps,
+) -> None:
+    """Defensive refresh: if the journal still holds a _RenameOp after
+    ``_compensate_rename`` returns, surface the contract breakage at
+    the CLI layer instead of falling through to service.rescan (which
+    would mask it as a generic OpLogCorruptError)."""
+    rename = _rename_record()
+    patched_deps.oplog.in_flight = rename
+    # _compensate_rename is a no-op in the default fake — simulates the
+    # contract regression.
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--continue"])
+    assert patched_deps.service.compensate_rename_args == [rename]
+    assert patched_deps.service.rescan_calls == []
+    out = _combined(result).lower()
+    assert "rename" in out
+    assert "contract" in out or "did not drain" in out
+    assert result.exit_code == 1
+
+
+def test_rescan_continue_already_completed_prints_journal_hint(
+    patched_deps: _FakeDeps,
+) -> None:
+    """RescanAlreadyCompletedReport(kind='continue') tells the user the
+    rescan was already on disk; journal cleaned up; no further action."""
+    patched_deps.oplog.in_flight = _rescan_record_fresh()
+    patched_deps.service.rescan_return_value = RescanAlreadyCompletedReport(
+        target_profiles={"claude": "2026-05-12-rescan-1"}, kind="continue"
+    )
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--continue"])
+    assert result.exit_code == 0, _combined(result)
+    out = _combined(result)
+    assert "2026-05-12-rescan-1" in out
+    assert "already" in out.lower()
+
+
+def test_rescan_abort_already_completed_signals_committed(
+    patched_deps: _FakeDeps,
+) -> None:
+    """RescanAlreadyCompletedReport(kind='abort') tells the user the
+    rescan was already committed before the crash; abort can't reverse
+    a committed rescan (the user would need to unmanage / re-init).
+    The CLI MUST tell them this — silent no-op would let them think
+    abort actually reversed the rescan."""
+    patched_deps.oplog.in_flight = _rescan_record_fresh()
+    patched_deps.service.rescan_return_value = RescanAlreadyCompletedReport(
+        target_profiles={"claude": "2026-05-12-rescan-1"}, kind="abort"
+    )
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--abort"])
+    assert result.exit_code == 0, _combined(result)
+    out = _combined(result)
+    assert "2026-05-12-rescan-1" in out
+    assert "already" in out.lower()
+    # CR pass-PR minor: verify abort-specific wording, not just
+    # generic "already". Without this, continue and abort could
+    # regress to identical messaging.
+    out_lower = out.lower()
+    assert "committed" in out_lower or "cannot" in out_lower
+
+
+def test_rescan_continue_compensation_ran_prints_success(
+    patched_deps: _FakeDeps,
+) -> None:
+    """service.rescan(continue_=True) returning None means compensation
+    actually ran. CLI prints a non-empty success indicator and exits 0."""
+    patched_deps.oplog.in_flight = _rescan_record_fresh()
+    patched_deps.service.rescan_return_value = None
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--continue"])
+    assert result.exit_code == 0, _combined(result)
+    assert _combined(result).strip() != ""
+
+
+def test_rescan_abort_compensation_ran_prints_success(
+    patched_deps: _FakeDeps,
+) -> None:
+    patched_deps.oplog.in_flight = _rescan_record_fresh()
+    patched_deps.service.rescan_return_value = None
+    runner = CliRunner()
+    result = runner.invoke(app, ["rescan", "--abort"])
+    assert result.exit_code == 0, _combined(result)
+    assert _combined(result).strip() != ""
+
+
+# -- v0.1.5 PR5: rescan hint NOW names the recovery flags ----------------
+
+
+def test_format_in_progress_hint_rescan_fresh_names_recovery_flags() -> None:
+    """v0.1.5 PR5 supersedes the PR4 ``test_format_in_progress_hint_
+    rescan_does_not_reference_nonexistent_flags`` carry-forward: the
+    rescan --continue / --abort flags ship in this PR, so the hint
+    must now NAME them (symmetric to init's hint)."""
+    text = _format_in_progress_hint(_rescan_record_fresh())
+    assert "rescan" in text
+    assert "claude" in text
+    assert "fresh-profile" in text
+    assert "switcher rescan --continue" in text
+    assert "switcher rescan --abort" in text
+
+
+def test_format_in_progress_hint_rescan_into_names_recovery_flags() -> None:
+    text = _format_in_progress_hint(_rescan_record_into())
+    assert "rescan" in text
+    assert "shared" in text
+    assert "switcher rescan --continue" in text
+    assert "switcher rescan --abort" in text
