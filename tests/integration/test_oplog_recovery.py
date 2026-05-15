@@ -449,21 +449,39 @@ def test_status_surfaces_interrupted_rescan_with_exit_3(tmp_home: Path, tmp_stat
 # -- rename auto-compensation ----------------------------------------------
 
 
-@pytest.mark.parametrize("readonly_cmd", [["status"], ["list"], ["which", "claude"]])
-def test_interrupted_rename_auto_compensates_on_next_readonly_command(
-    tmp_home: Path, tmp_state: Path, readonly_cmd: list[str]
+@pytest.mark.parametrize(
+    "next_cmd",
+    [
+        ["status"],
+        ["list"],
+        ["which", "claude"],
+        # Mutating command (abby pass-6 batch 2): rename auto-compensation
+        # MUST also fire on mutating callbacks, not just read-only ones —
+        # a regression that wires compensation only into the read-only
+        # branch of _detect_or_compensate_oplog would otherwise pass the
+        # read-only parametrize cases above. ``rescan --dry-run`` is the
+        # cleanest mutating-shape choice: hook runs allow_mutation=True
+        # (vacuum + compensation), but the --dry-run flag prevents any
+        # actual capture, so the post-compensation assertions about the
+        # rename's final state still hold.
+        ["rescan", "--dry-run"],
+    ],
+)
+def test_interrupted_rename_auto_compensates_on_next_command(
+    tmp_home: Path, tmp_state: Path, next_cmd: list[str]
 ) -> None:
     """Rename's auto-compensation contract: a stale ``_RenameOp`` in
     the journal is transparently rolled forward by the detection hook
-    on the next CLI command — including any read-only one. Spec §2.3
-    + the §2.2 hook contract.
+    on the next CLI command — read-only OR mutating. Spec §2.3 + the
+    §2.2 hook contract.
 
-    Parametrized over [status, list, which] (abby pass-5 batch 2):
-    init / rescan already had parametrized read-only coverage; rename
-    only ran via ``status``. A regression that wires the rename
-    auto-compensation only into ``status`` would otherwise pass the
-    suite while RELEASE.md continues to claim "the next switcher
-    command" rolls the rename forward.
+    Parametrized over [status, list, which, rescan --dry-run] (abby
+    pass-5 + pass-6 batch 2): init / rescan already had parametrized
+    coverage; rename originally only ran via ``status``. A regression
+    that wires rename auto-compensation into only one entry point
+    (read-only-only, or status-only) would otherwise pass the suite
+    while RELEASE.md continues to claim "the next switcher command"
+    rolls the rename forward.
 
     Stages the post-store.rename-pre-set_active state: profile dir
     has been renamed on disk, but the active map still references the
@@ -504,10 +522,10 @@ def test_interrupted_rename_auto_compensates_on_next_readonly_command(
     )
     OpLogIO(tmp_state).append_record(rename_record)
 
-    # Run a read-only command — any of them triggers the hook, which
-    # transparently rolls the rename forward.
-    r = _run(readonly_cmd, tmp_home, tmp_state)
-    assert r.returncode == 0, f"cmd={readonly_cmd!r} stdout={r.stdout!r} stderr={r.stderr!r}"
+    # Any command (read-only OR mutating) triggers the hook, which
+    # transparently rolls the rename forward before the body runs.
+    r = _run(next_cmd, tmp_home, tmp_state)
+    assert r.returncode == 0, f"cmd={next_cmd!r} stdout={r.stdout!r} stderr={r.stderr!r}"
 
     # Every affected tool's active entry now points at new_name (the
     # whole purpose of affected_ids is to keep the rename atomic
