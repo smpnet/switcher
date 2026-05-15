@@ -29,7 +29,7 @@ from switcher.errors import (
     RescanInProgressError,
 )
 from switcher.oplog import OpLogRecord, _InitOp, _RenameOp, _RescanOp
-from switcher.service import InitAlreadyCompletedReport
+from switcher.service import InitAlreadyCompletedReport, RescanAlreadyCompletedReport
 
 
 def _now() -> datetime:
@@ -918,8 +918,6 @@ def test_rescan_continue_already_completed_prints_journal_hint(
 ) -> None:
     """RescanAlreadyCompletedReport(kind='continue') tells the user the
     rescan was already on disk; journal cleaned up; no further action."""
-    from switcher.service import RescanAlreadyCompletedReport
-
     patched_deps.oplog.in_flight = _rescan_record_fresh()
     patched_deps.service.rescan_return_value = RescanAlreadyCompletedReport(
         target_profiles={"claude": "2026-05-12-rescan-1"}, kind="continue"
@@ -940,8 +938,6 @@ def test_rescan_abort_already_completed_signals_committed(
     a committed rescan (the user would need to unmanage / re-init).
     The CLI MUST tell them this — silent no-op would let them think
     abort actually reversed the rescan."""
-    from switcher.service import RescanAlreadyCompletedReport
-
     patched_deps.oplog.in_flight = _rescan_record_fresh()
     patched_deps.service.rescan_return_value = RescanAlreadyCompletedReport(
         target_profiles={"claude": "2026-05-12-rescan-1"}, kind="abort"

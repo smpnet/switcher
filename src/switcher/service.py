@@ -1700,33 +1700,57 @@ class ProfileService:
 
     @staticmethod
     def _validate_rescan_record_invariants(record: _RescanOp) -> None:
-        """Enforce the spec §2.4 ``--into`` shape invariants upfront.
+        """Enforce spec §2.4 journal-shape invariants upfront.
 
-        ``--into`` mode targets exactly ONE pre-existing profile (every
-        captured tool_id maps to the same profile name), and the
-        ``previous_tools`` snapshot must cover that profile (drives
-        --abort's metadata restoration).
+        Three layers of check:
 
-        A hand-edited or corrupt journal could violate either invariant.
-        Without this guard the compensation paths would iterate
-        ``set(target_profiles.values())`` and proceed silently:
+        1. **General self-consistency** (abby pass-3 blocker, defense-
+           in-depth). The compensation paths iterate
+           ``record.target_profiles.items()`` for active-map checks
+           and ``record.mappings`` per-mapping; a journal where
+           ``target_ids`` and ``target_profiles.keys()`` disagree, or
+           where a mapping references a tool_id outside ``target_ids``,
+           would leak through ``_check_rescan_already_completed``
+           silently (the orphan ``target_id`` never gets an active-map
+           check). _RescanOp's Pydantic validators already enforce this
+           at disk-read time, so reaching the violating branch implies
+           ``model_construct`` was used to bypass validation (test
+           defensive paths, future schema relaxation). Surface it
+           loudly rather than relying on the disk-read invariant alone.
 
-          - ``_check_rescan_already_completed`` could bless a multi-
-            target --into record as "already completed".
-          - ``_compensate_rescan_continue`` / ``_compensate_rescan_abort``
-            would mutate across multiple profiles a clean --into never
-            would, OR silently fall back to an empty previous_tools
-            snapshot via ``(record.previous_tools or {}).get(name, {})``.
+        2. **--into singleton target** (CR pass-2 major). ``--into``
+           targets exactly ONE pre-existing profile per spec §2.4. A
+           hand-edited journal with multiple distinct
+           ``target_profiles`` values would otherwise drive mutations
+           across multiple profiles a clean ``--into`` never would.
 
-        Raised early so service.rescan's recovery dispatch surfaces a
-        clean OpLogCorruptError instead of a confusing short-circuit
-        outcome (CR pass-2 major).
+        3. **--into previous_tools coverage**. _RescanOp's validator
+           chain already enforces this for parsed records; the in-
+           method check is defense-in-depth against model_construct.
 
-        Fresh-profile mode is intentionally NOT constrained here —
-        rescan creates a separate profile per tool by design, so the
-        multi-target shape is the normal case and previous_tools is
-        always None.
+        Fresh-profile mode is intentionally NOT constrained on
+        target-profile cardinality — rescan creates a separate profile
+        per tool by design, so the multi-target shape is the normal
+        case.
         """
+        # General self-consistency (abby pass-3 blocker).
+        target_id_set = set(record.target_ids)
+        target_profile_keys = set(record.target_profiles.keys())
+        if target_id_set != target_profile_keys:
+            raise OpLogCorruptError(
+                f"interrupted rescan record: target_ids "
+                f"{sorted(target_id_set)!r} and target_profiles keys "
+                f"{sorted(target_profile_keys)!r} disagree. Manual "
+                f"recovery required."
+            )
+        for mapping in record.mappings:
+            if mapping.tool_id not in target_id_set:
+                raise OpLogCorruptError(
+                    f"interrupted rescan record: mapping references "
+                    f"tool_id={mapping.tool_id!r} not in target_ids="
+                    f"{sorted(target_id_set)!r}. Manual recovery required."
+                )
+
         if not record.into_mode:
             return
         unique_profiles = set(record.target_profiles.values())

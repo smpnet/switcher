@@ -498,9 +498,7 @@ def test_continue_rejects_each_filter_kwarg(
 # -- writer-side journal hygiene -------------------------------------------
 
 
-def test_rescan_writes_intent_and_marks_completed(
-    service: ProfileService, tmp_home: Path, tmp_state: Path
-) -> None:
+def test_rescan_writes_intent_and_marks_completed(service: ProfileService, tmp_state: Path) -> None:
     """Happy-path writer-side: a successful ``service.rescan()`` writes
     an ``_RescanOp`` intent BEFORE any FS mutation and marks it completed
     after the capture loop succeeds. ``vacuum_completed`` drops it."""
@@ -547,7 +545,7 @@ def test_rescan_writes_intent_and_marks_completed(
 
 
 def test_rescan_cancels_intent_on_pre_mutation_create_failure(
-    service: ProfileService, tmp_home: Path, tmp_state: Path
+    service: ProfileService, tmp_state: Path
 ) -> None:
     """A ``ProfileExistsError`` from the first ``_store.create(target, ...)``
     is a pre-mutation failure: disk is untouched. The in-flight intent
@@ -578,7 +576,7 @@ def test_rescan_cancels_intent_on_pre_mutation_create_failure(
 
 
 def test_rescan_preserves_intent_on_post_mutation_failure(
-    service: ProfileService, tmp_home: Path, tmp_state: Path
+    service: ProfileService, tmp_state: Path
 ) -> None:
     """A failure DURING the capture (i.e. inside
     ``_capture_tool_for_rescan``, after the intent record landed) must
@@ -892,6 +890,60 @@ def test_continue_refuses_when_into_record_has_multiple_target_profiles(
         service.rescan(continue_=True)
     # Journal preserved: refusal is side-effect-free.
     assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_validator_refuses_record_with_target_ids_profiles_mismatch(
+    service: ProfileService,
+) -> None:
+    """abby pass-3 blocker (defense-in-depth): the validator refuses a
+    record whose target_ids set disagrees with target_profiles keys.
+    Unreachable via the journal's normal lifecycle today — _RescanOp's
+    ``_check_target_profiles_keys_match_target_ids`` validator already
+    enforces equality. The in-method check is defense-in-depth so the
+    compensation paths' assumption (active-map check iterates
+    target_profiles, mapping iteration loops on target_ids) can't drift
+    out of sync without surfacing loudly. Constructed via
+    ``model_construct`` to bypass Pydantic validators."""
+    record = _RescanOp.model_construct(
+        op="rescan",
+        started_at=_now(),
+        target_ids=["claude", "copilot"],  # 2 entries
+        target_profiles={"claude": "p1"},  # only 1 — corruption
+        into_mode=False,
+        previous_tools=None,
+        mappings=[],
+    )
+
+    with pytest.raises(OpLogCorruptError, match="disagree"):
+        service._validate_rescan_record_invariants(record)
+
+
+def test_validator_refuses_record_with_mapping_for_unknown_tool(
+    service: ProfileService,
+) -> None:
+    """abby pass-3 blocker (defense-in-depth): the validator refuses
+    a record where a mapping references a tool_id outside target_ids.
+    Unreachable via the journal today — _check_mappings_against_target_ids
+    already enforces it. In-method check is defense-in-depth."""
+    bad_mapping = _MappingIntent.model_construct(
+        tool_id="phantom",  # not in target_ids
+        mapping_index=0,
+        live_path="/tmp/x",
+        profile_subdir="phantom",
+        original_kind="missing",
+    )
+    record = _RescanOp.model_construct(
+        op="rescan",
+        started_at=_now(),
+        target_ids=["claude"],
+        target_profiles={"claude": "p1"},
+        into_mode=False,
+        previous_tools=None,
+        mappings=[bad_mapping],
+    )
+
+    with pytest.raises(OpLogCorruptError, match="phantom"):
+        service._validate_rescan_record_invariants(record)
 
 
 def test_validator_refuses_into_record_with_missing_previous_tools_snapshot(
@@ -1284,7 +1336,7 @@ def test_abort_refuses_when_existing_profile_has_foreign_tools(
 
 
 def test_continue_clears_journal_state_on_zero_mapping_capture(
-    service: ProfileService, tmp_home: Path, tmp_state: Path
+    service: ProfileService, tmp_state: Path
 ) -> None:
     """A target_id with zero mappings (e.g., a registry-only tool) goes
     through rescan compensation as if the per-mapping loop is a no-op.
