@@ -449,13 +449,21 @@ def test_status_surfaces_interrupted_rescan_with_exit_3(tmp_home: Path, tmp_stat
 # -- rename auto-compensation ----------------------------------------------
 
 
-def test_interrupted_rename_auto_compensates_on_next_status(
-    tmp_home: Path, tmp_state: Path
+@pytest.mark.parametrize("readonly_cmd", [["status"], ["list"], ["which", "claude"]])
+def test_interrupted_rename_auto_compensates_on_next_readonly_command(
+    tmp_home: Path, tmp_state: Path, readonly_cmd: list[str]
 ) -> None:
     """Rename's auto-compensation contract: a stale ``_RenameOp`` in
     the journal is transparently rolled forward by the detection hook
-    on the next CLI command — even a read-only one (``switcher status``).
-    Spec §2.3 + the §2.2 hook contract.
+    on the next CLI command — including any read-only one. Spec §2.3
+    + the §2.2 hook contract.
+
+    Parametrized over [status, list, which] (abby pass-5 batch 2):
+    init / rescan already had parametrized read-only coverage; rename
+    only ran via ``status``. A regression that wires the rename
+    auto-compensation only into ``status`` would otherwise pass the
+    suite while RELEASE.md continues to claim "the next switcher
+    command" rolls the rename forward.
 
     Stages the post-store.rename-pre-set_active state: profile dir
     has been renamed on disk, but the active map still references the
@@ -496,10 +504,10 @@ def test_interrupted_rename_auto_compensates_on_next_status(
     )
     OpLogIO(tmp_state).append_record(rename_record)
 
-    # Run a read-only command — `switcher status` triggers the hook,
-    # which transparently rolls the rename forward.
-    r = _run(["status"], tmp_home, tmp_state)
-    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    # Run a read-only command — any of them triggers the hook, which
+    # transparently rolls the rename forward.
+    r = _run(readonly_cmd, tmp_home, tmp_state)
+    assert r.returncode == 0, f"cmd={readonly_cmd!r} stdout={r.stdout!r} stderr={r.stderr!r}"
 
     # Every affected tool's active entry now points at new_name (the
     # whole purpose of affected_ids is to keep the rename atomic
