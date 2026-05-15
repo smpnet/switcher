@@ -21,7 +21,9 @@ from typing import Literal, overload
 from switcher.errors import (
     AbortPreflightError,
     AlreadyLinkedError,
+    InitInProgressError,
     NoInProgressInitError,
+    NoInProgressRescanError,
     NothingToInitializeError,
     NoToolsManagedError,
     OpLogCorruptError,
@@ -846,15 +848,13 @@ class ProfileService:
             # is rescan rather than init — `switcher init --continue` on
             # a rescan-in-flight would otherwise be silently rejected as
             # "wrong type" without telling the user how to actually recover.
-            # PR4 ships init's --continue/--abort; rescan's matching flags
-            # land in PR5 (Phase 7), so the message stays version-agnostic
-            # (don't name flags the binary doesn't expose — CR pass-6 major,
-            # carry-forward of the PR3 abby blocking review).
+            # v0.1.5 PR5 ships rescan's matching flags, so the message
+            # NAMES them directly (symmetric to the init hint wording).
             if isinstance(in_flight, _RescanOp):
                 raise RescanInProgressError(
-                    "an interrupted rescan is in flight; guided recovery "
-                    "for rescan ships in a follow-on release. Manual "
-                    "recovery required on this switcher version."
+                    "an interrupted rescan is in flight; run "
+                    "`switcher rescan --continue` to finish it or "
+                    "`switcher rescan --abort` to reverse pre-rescan state."
                 )
             # `_RenameOp` is auto-compensated by the CLI detection hook on
             # every other command; reaching here with one in flight means
@@ -1661,6 +1661,446 @@ class ProfileService:
         # drop, so unrelated zero-mapping tools survive the rewrite —
         # mirrors the spec's "abort surfaces externally-mutated state
         # for inspection" stance.
+        for tid in record.target_ids:
+            active_snapshot.pop(tid, None)
+            cache_snapshot.pop(tid, None)
+        self._store.set_active_state(active_snapshot, cache_snapshot)
+
+    # -- rescan compensation (spec §2.4) -----------------------------------
+
+    @staticmethod
+    def _expected_tools_for_rescan_target(record: _RescanOp, profile_name: str) -> dict[str, bool]:
+        """Compute the metadata.tools value a clean rescan would have
+        produced for ``profile_name`` after the deferred-metadata
+        write committed.
+
+        - Fresh-profile mode: ``{tid: True for tid in target_ids if
+          target_profiles[tid] == profile_name}`` — only the tools
+          this rescan-allocated profile owns.
+        - --into mode: ``previous_tools[profile_name] | {tid: True
+          for tid in target_ids if target_profiles[tid] == profile_name}``
+          — pre-rescan metadata merged with the captured tool set.
+
+        Shared between ``_check_rescan_already_completed`` (whose
+        equality test gates the short-circuit) and
+        ``_compensate_rescan_continue`` (which uses it to drive the
+        deferred ``update_profile_tools`` write). Aligns the two sites
+        so a regression in one can't drift from the other.
+        """
+        captured_here = {
+            tid: True
+            for tid in record.target_ids
+            if record.target_profiles.get(tid) == profile_name
+        }
+        if record.into_mode:
+            base = dict((record.previous_tools or {}).get(profile_name, {}))
+            base.update(captured_here)
+            return base
+        return captured_here
+
+    def _check_rescan_already_completed(self, record: _RescanOp) -> bool:
+        """Return True ONLY if every observable post-rescan invariant
+        holds on disk: each unique target profile is a real directory
+        with the expected metadata.tools, every mapping classifies
+        COMPLETE, AND ``active`` covers every (tool_id → target_profile)
+        entry the journal recorded.
+
+        Spec §2.4 "committed but log-unmarked" path (symmetric to
+        init's variant). A crash between the final ``set_active_state``
+        and ``mark_completed`` leaves disk consistent but journal
+        stale — continue/abort should be no-ops apart from marking
+        the record completed.
+
+        Unlike init, rescan's ``set_active_state`` ADDS to the active
+        map rather than replacing it (multiple tools, one per
+        ``set_active_state`` call). The active-map check is therefore
+        a per-target subset, not full equality.
+        """
+        unique_profiles = sorted(set(record.target_profiles.values()))
+        for name in unique_profiles:
+            p = self._store.profile_dir(name)
+            if self._resolver.is_link(p) or not p.is_dir():
+                return False
+            try:
+                profile = self._store.get(name)
+            except (UnknownProfileError, StorageError):
+                return False
+            expected_tools = self._expected_tools_for_rescan_target(record, name)
+            if profile.tools != expected_tools:
+                return False
+        profile_dir_by_tool = {
+            tid: self._store.profile_dir(record.target_profiles[tid])
+            for tid in record.target_ids
+            if tid in record.target_profiles
+        }
+        for intent in record.mappings:
+            profile_dir = profile_dir_by_tool.get(intent.tool_id)
+            if profile_dir is None:
+                # journal-corruption: mapping refers to a tool_id with no
+                # target profile assignment. Refuse the short-circuit so
+                # compensation surfaces a clean refusal.
+                return False
+            if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
+                return False
+        active = self._store.get_active()
+        for tid, profile_name in record.target_profiles.items():
+            if active.get(tid) != profile_name:
+                return False
+        return True
+
+    def _compensate_rescan_continue(self, record: _RescanOp) -> None:
+        """Replay any non-COMPLETE mapping per the §2.1.1 continue
+        dispatch table, then finalize per-profile metadata (--into
+        mode) + ``set_active_state``. See spec §2.4.
+
+        First-pass validation: every target profile shape must check
+        out, every mapping must classify into a handleable state.
+        Refuses on AMBIGUOUS or foreign-tools / shape-corrupt
+        profiles BEFORE any mutation runs.
+
+        Second-pass mutation: per-mapping dispatch (COMPLETE skip,
+        MOVE_DONE_LINK_MISSING swap_link only, UNTOUCHED full pair),
+        then per-profile metadata reconciliation (--into mode's
+        deferred ``update_profile_tools``), then a single
+        ``set_active_state`` add of the journal's target_ids →
+        target_profiles entries.
+        """
+        # Preflight config.json BEFORE any FS mutation (symmetric to
+        # _compensate_init_continue's preflight). Surface a malformed
+        # config as StorageError so the user can fix it before any
+        # destructive work runs.
+        active_snapshot = self._store.get_active()
+        live_paths_cache = self._store.get_active_live_paths_raw()
+
+        unique_profiles = sorted(set(record.target_profiles.values()))
+
+        # First-pass validation. No FS mutation.
+        # Profile-dir shape check + foreign-profile refusal per target.
+        for name in unique_profiles:
+            p = self._store.profile_dir(name)
+            if self._resolver.is_link(p):
+                raise OpLogCorruptError(
+                    f"interrupted rescan continue: {name!r} profile at {p} is a "
+                    f"symlink or junction, not a real profile directory; "
+                    f"manual recovery required"
+                )
+            if p.exists() and not p.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted rescan continue: {name!r} profile at {p} exists "
+                    f"but is not a directory; manual recovery required"
+                )
+            if p.is_dir():
+                try:
+                    existing_profile = self._store.get(name)
+                except (UnknownProfileError, StorageError) as e:
+                    raise OpLogCorruptError(
+                        f"interrupted rescan continue: profile {name!r} at {p} "
+                        f"is present but metadata.json is missing or unreadable "
+                        f"({e}); manual recovery required."
+                    ) from e
+                # Foreign-profile refusal: a clean rescan would write
+                # tools = previous_tools (--into) | captured-here, or just
+                # captured-here (fresh-profile). Anything else is foreign.
+                # In --into mode, the journal-time previous_tools snapshot
+                # might equal the CURRENT metadata if the deferred write
+                # never ran — that's the same "previous_tools" we expect
+                # and counts as healthy.
+                expected_tools = self._expected_tools_for_rescan_target(record, name)
+                if record.into_mode:
+                    # Pre-deferred-write window: metadata still equals
+                    # previous_tools (the snapshot we captured at intent
+                    # time). That's a healthy mid-op state — accept it
+                    # and let the second pass run update_profile_tools to
+                    # finalize.
+                    pre_write = dict((record.previous_tools or {}).get(name, {}))
+                    if (
+                        existing_profile.tools != expected_tools
+                        and existing_profile.tools != pre_write
+                    ):
+                        raise OpLogCorruptError(
+                            f"interrupted rescan continue: profile {name!r} at "
+                            f"{p} has tools={existing_profile.tools!r} but the "
+                            f"journal expects either {pre_write!r} (pre-deferred-"
+                            f"write window) or {expected_tools!r} (post-deferred-"
+                            f"write); refusing to adopt a foreign profile. "
+                            f"Manual recovery required."
+                        )
+                else:
+                    # Fresh-profile mode: metadata must match what a clean
+                    # rescan would have written (captured-here only).
+                    if existing_profile.tools != expected_tools:
+                        raise OpLogCorruptError(
+                            f"interrupted rescan continue: profile {name!r} at "
+                            f"{p} has tools={existing_profile.tools!r} but the "
+                            f"journal expects {expected_tools!r}; refusing to "
+                            f"adopt a foreign profile. Manual recovery required."
+                        )
+
+        # Per-mapping shape + AMBIGUOUS refusal.
+        for intent in record.mappings:
+            profile_name = record.target_profiles.get(intent.tool_id)
+            if profile_name is None:
+                raise OpLogCorruptError(
+                    f"interrupted rescan continue: mapping {intent.tool_id!r}."
+                    f"{intent.mapping_index} references tool_id without a "
+                    f"target_profiles entry; manual recovery required"
+                )
+            profile_dir = self._store.profile_dir(profile_name)
+            target = profile_dir / intent.profile_subdir
+            if self._resolver.is_link(target):
+                raise OpLogCorruptError(
+                    f"interrupted rescan continue: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} is a "
+                    f"symlink or junction, not a real profile subdirectory; "
+                    f"manual recovery required"
+                )
+            if target.exists() and not target.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted rescan continue: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} exists "
+                    f"but is not a directory; manual recovery required"
+                )
+            state = classify_mapping(intent, profile_dir)
+            if state is MappingDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted rescan: mapping {intent.tool_id!r}."
+                    f"{intent.mapping_index} at {intent.live_path!r}: on-disk "
+                    f"state is ambiguous; manual recovery required — see "
+                    f"docs/RELEASE.md"
+                )
+
+        # Deferred profile-dir create. The earliest crash window leaves
+        # a target profile dir absent — recreate via store.create AFTER
+        # validation cleared every mapping. In fresh-profile mode the
+        # tools value is the captured-here set; in --into mode the
+        # target pre-existed, so a missing dir would be its own corruption
+        # — refuse rather than fabricate one we don't own.
+        for name in unique_profiles:
+            p = self._store.profile_dir(name)
+            if not p.is_dir():
+                if record.into_mode:
+                    raise OpLogCorruptError(
+                        f"interrupted rescan continue: --into target profile "
+                        f"{name!r} at {p} is missing — refusing to recreate a "
+                        f"profile the rescan didn't own. Manual recovery required."
+                    )
+                self._store.create(name, self._expected_tools_for_rescan_target(record, name))
+
+        # Second pass: per-mapping mutation.
+        for intent in record.mappings:
+            profile_name = record.target_profiles[intent.tool_id]
+            profile_dir = self._store.profile_dir(profile_name)
+            target = profile_dir / intent.profile_subdir
+            live = Path(intent.live_path)
+            state = classify_mapping(intent, profile_dir)
+            if state is MappingDiskState.COMPLETE:
+                continue
+            if state is MappingDiskState.MOVE_DONE_LINK_MISSING:
+                swap_link(target, live)
+                continue
+            if state is MappingDiskState.UNTOUCHED:
+                move_or_seed_dir(live, target)
+                swap_link(target, live)
+                continue
+            raise AssertionError(f"unhandled mapping state {state}")
+
+        # Deferred metadata write for --into mode. Idempotent on the
+        # post-write metadata shape; required when crash happened
+        # before the original op's deferred update_profile_tools ran.
+        if record.into_mode:
+            for name in unique_profiles:
+                expected_tools = self._expected_tools_for_rescan_target(record, name)
+                current_tools = dict(self._store.get(name).tools)
+                if current_tools != expected_tools:
+                    self._store.update_profile_tools(name, expected_tools)
+
+        # Active-map add. Rescan accumulates active entries rather than
+        # replacing the whole map; the journal's target_ids → target_profiles
+        # additions go on top of whatever was there before.
+        for tid, profile_name in record.target_profiles.items():
+            active_snapshot[tid] = profile_name
+        # Per-tool live_paths from the journal (mapping_index ordering),
+        # grouped by tool_id. Zero-mapping tools serialize as [] to match
+        # what a clean rescan would have written.
+        by_tool: dict[str, list[tuple[int, str]]] = {}
+        for intent in record.mappings:
+            by_tool.setdefault(intent.tool_id, []).append((intent.mapping_index, intent.live_path))
+        for tid in record.target_ids:
+            entries = sorted(by_tool.get(tid, []))
+            live_paths_cache[tid] = [p for _, p in entries]
+        self._store.set_active_state(active_snapshot, live_paths_cache)
+
+    def _compensate_rescan_abort(self, record: _RescanOp) -> None:
+        """Reverse every COMPLETE / MOVE_DONE_LINK_MISSING mapping per
+        the §2.1.1 abort-dispatch table, then drop fresh-profile target
+        profiles or restore previous_tools metadata for --into. See
+        spec §2.4.
+
+        Two-pass discipline (mirrors init's). Validation pass checks
+        every mapping AND every abort precondition (AMBIGUOUS refusal,
+        ``original_kind`` defensive refusal, empty-target write-through
+        guard); mutation pass only runs after every mapping cleared
+        validation. Profile-delete (fresh-profile) or
+        update_profile_tools (--into) runs only after the validation
+        + mutation passes both completed cleanly.
+        """
+        # Preflight config.json BEFORE any FS mutation. Active-map /
+        # cache cleanup at the tail reads these maps; failing the read
+        # at tail position would leave the disk half-recovered with
+        # the journal still in flight.
+        active_snapshot = self._store.get_active()
+        cache_snapshot = self._store.get_active_live_paths_raw()
+
+        unique_profiles = sorted(set(record.target_profiles.values()))
+
+        # Validation pass: profile-dir shapes + foreign-profile refusal.
+        for name in unique_profiles:
+            p = self._store.profile_dir(name)
+            if self._resolver.is_link(p):
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: {name!r} profile at {p} is a "
+                    f"symlink or junction, not a real profile directory; "
+                    f"manual recovery required"
+                )
+            if p.exists() and not p.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: {name!r} profile at {p} exists "
+                    f"but is not a directory; manual recovery required"
+                )
+            if p.is_dir():
+                try:
+                    existing_profile = self._store.get(name)
+                except (UnknownProfileError, StorageError) as e:
+                    raise OpLogCorruptError(
+                        f"interrupted rescan abort: {name!r} profile at {p} "
+                        f"is present but metadata.json is missing or "
+                        f"unreadable ({e}); refusing to act without verifying "
+                        f"ownership. Manual recovery required."
+                    ) from e
+                expected_tools = self._expected_tools_for_rescan_target(record, name)
+                if record.into_mode:
+                    # --into mode: metadata can be in either the pre- or
+                    # post-deferred-write shape at abort time. Either is
+                    # journal-owned; both will be restored to previous_tools
+                    # in the mutation pass.
+                    pre_write = dict((record.previous_tools or {}).get(name, {}))
+                    if (
+                        existing_profile.tools != expected_tools
+                        and existing_profile.tools != pre_write
+                    ):
+                        raise OpLogCorruptError(
+                            f"interrupted rescan abort: profile {name!r} at "
+                            f"{p} has tools={existing_profile.tools!r} but "
+                            f"the journal expects {pre_write!r} or "
+                            f"{expected_tools!r}; refusing to act on a "
+                            f"foreign profile. Manual recovery required."
+                        )
+                else:
+                    # Fresh-profile mode: a clean rescan would have written
+                    # captured-here as the .tools value. Anything else is
+                    # foreign and rmtree would be a data-loss path.
+                    if existing_profile.tools != expected_tools:
+                        raise OpLogCorruptError(
+                            f"interrupted rescan abort: profile {name!r} at "
+                            f"{p} has tools={existing_profile.tools!r} but "
+                            f"the journal expects {expected_tools!r}; "
+                            f"refusing to delete a foreign profile. Manual "
+                            f"recovery required."
+                        )
+
+        # Per-mapping shape + AMBIGUOUS / original_kind / write-through
+        # validation. No mutation in this pass.
+        states: dict[int, MappingDiskState] = {}
+        for i, intent in enumerate(record.mappings):
+            profile_name = record.target_profiles.get(intent.tool_id)
+            if profile_name is None:
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: mapping {intent.tool_id!r}."
+                    f"{intent.mapping_index} references tool_id without a "
+                    f"target_profiles entry; manual recovery required"
+                )
+            profile_dir = self._store.profile_dir(profile_name)
+            target = profile_dir / intent.profile_subdir
+            if self._resolver.is_link(target):
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} is a "
+                    f"symlink or junction, not a real profile subdirectory; "
+                    f"manual recovery required"
+                )
+            if target.exists() and not target.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} "
+                    f"exists but is not a directory; manual recovery required"
+                )
+            state = classify_mapping(intent, profile_dir)
+            if state is MappingDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: mapping {intent.tool_id!r}."
+                    f"{intent.mapping_index} is ambiguous; refusing to "
+                    f"abort. Manual recovery required."
+                )
+            if state is MappingDiskState.UNTOUCHED:
+                states[i] = state
+                continue
+            if intent.original_kind not in ("missing", "real-dir"):
+                raise AbortPreflightError(
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index}: "
+                    f"pre-rescan state was {intent.original_kind!r}; rescan "
+                    f"pre-flight rejects this shape, so reaching it at "
+                    f"abort time means external drift since intent. "
+                    f"Refusing to abort defensively. Manual recovery required."
+                )
+            # Empty-target write-through guard. Symmetric to init's
+            # check (§2.1.1 invariant #1).
+            if intent.original_kind == "missing" and target.is_dir() and any(target.iterdir()):
+                raise OpLogCorruptError(
+                    f"abort would delete non-empty target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} "
+                    f"(original_kind='missing'): data may have been "
+                    f"written through the symlink. Manual recovery required."
+                )
+            states[i] = state
+
+        # Mutation pass. Every mapping cleared validation.
+        for i, intent in enumerate(record.mappings):
+            state = states[i]
+            profile_name = record.target_profiles[intent.tool_id]
+            profile_dir = self._store.profile_dir(profile_name)
+            target = profile_dir / intent.profile_subdir
+            live = Path(intent.live_path)
+            if state is MappingDiskState.UNTOUCHED:
+                continue
+            if state is MappingDiskState.COMPLETE:
+                remove_link(live)
+                if intent.original_kind == "real-dir":
+                    move_or_seed_dir(target, live)
+                elif intent.original_kind == "missing" and target.exists():
+                    shutil.rmtree(target)
+            elif state is MappingDiskState.MOVE_DONE_LINK_MISSING:
+                if intent.original_kind == "real-dir":
+                    move_or_seed_dir(target, live)
+                elif intent.original_kind == "missing" and target.exists():
+                    shutil.rmtree(target)
+
+        # Per-profile cleanup. Fresh-profile mode deletes; --into mode
+        # restores previous_tools.
+        if record.into_mode:
+            for name in unique_profiles:
+                pre_write = dict((record.previous_tools or {}).get(name, {}))
+                current_tools = dict(self._store.get(name).tools)
+                if current_tools != pre_write:
+                    self._store.update_profile_tools(name, pre_write)
+        else:
+            for name in unique_profiles:
+                if self._store.profile_dir(name).is_dir():
+                    self._store.delete(name)
+
+        # Active-map / cache cleanup. Only the target_ids this rescan
+        # owns get cleared; external state (other tools' active
+        # entries from prior init/rescan) stays untouched. Same
+        # orphan-tolerance contract init abort uses.
         for tid in record.target_ids:
             active_snapshot.pop(tid, None)
             cache_snapshot.pop(tid, None)
@@ -2525,24 +2965,129 @@ class ProfileService:
 
     # Rescan -----------------------------------------------------------------
 
+    @overload
     def rescan(
         self,
         *,
         only: list[str] | None = None,
         into: str | None = None,
         dry_run: bool = False,
-    ) -> RescanReport:
+        continue_: Literal[False] = False,
+        abort: Literal[False] = False,
+    ) -> RescanReport: ...
+
+    @overload
+    def rescan(
+        self,
+        *,
+        only: list[str] | None = None,
+        into: str | None = None,
+        dry_run: bool = False,
+        continue_: bool = False,
+        abort: bool = False,
+    ) -> RescanReport | RescanAlreadyCompletedReport | None: ...
+
+    def rescan(
+        self,
+        *,
+        only: list[str] | None = None,
+        into: str | None = None,
+        dry_run: bool = False,
+        continue_: bool = False,
+        abort: bool = False,
+    ) -> RescanReport | RescanAlreadyCompletedReport | None:
         """Capture newly-installed tools (spec §4).
 
-        v0.1.5 op-log integration: rescan does NOT yet write an
-        ``_RescanOp`` intent record — that wiring ships in PR5 / Phase 7
-        alongside ``--continue`` / ``--abort`` recovery flags. The CLI
-        detection hook still surfaces a hand-injected or
-        downgrade-stranded ``_RescanOp`` as ``RescanInProgressError``
-        (mutating) / exit 3 (read-only); the recovery surface points at
-        the forthcoming flags rather than executing compensation here.
-        Spec §2.2.
+        v0.1.5: ``continue_`` / ``abort`` drive op-log compensation
+        (spec §2.4). Mutually exclusive with each other AND with
+        ``only`` / ``into`` / ``dry_run`` (recovery scope is taken from
+        the in-flight journal record, not the call site). When either
+        flag is set, the body reads the in-flight ``_RescanOp`` from
+        the journal and dispatches to ``_compensate_rescan_continue``
+        / ``_compensate_rescan_abort``.
+
+        Normal path writes a ``_RescanOp`` intent BEFORE the capture
+        loop and marks it completed after the loop finishes. A crash
+        anywhere between leaves a record the next CLI command's
+        detection hook surfaces as ``RescanInProgressError`` (mutating)
+        / exit 3 (read-only); the user resolves via
+        ``switcher rescan --continue`` / ``--abort``.
+
+        Type-routing for the recovery dispatch (continue/abort with
+        an in-flight op of a different kind):
+          - ``_InitOp`` in flight → ``InitInProgressError`` (route the
+            user to ``switcher init --continue/--abort``).
+          - ``_RenameOp`` in flight → ``OpLogCorruptError``: the CLI
+            detection hook auto-compensates rename on every command;
+            reaching here means the hook never drained it (stale
+            binary or hand-edited journal).
         """
+        # Defense-in-depth mutex (CLI enforces the same invariant ahead
+        # of get_deps; this guard catches direct callers — tests,
+        # alternate front-ends — that bypass the CLI layer). Silently
+        # falling through to ``continue_`` on the both-set case would
+        # let a confused caller compensate-forward when they thought
+        # they were aborting. ValueError matches init's symmetric guard.
+        if continue_ and abort:
+            raise ValueError("rescan: continue_ and abort are mutually exclusive")
+        # Recovery scope comes from the in-flight journal record, NOT
+        # the call site — combining recovery flags with only / into /
+        # dry_run would silently ignore the call-site args.
+        if (continue_ or abort) and (only is not None or into is not None or dry_run):
+            raise ValueError(
+                "rescan: continue_/abort cannot be combined with only, into, "
+                "or dry_run — recovery scope is taken from the in-flight "
+                "journal record, not the call site"
+            )
+
+        oplog = OpLogIO(self._store.state_dir())
+
+        if continue_ or abort:
+            in_flight = oplog.read_in_flight()
+            if in_flight is None:
+                raise NoInProgressRescanError(
+                    "no interrupted rescan detected; nothing to continue/abort"
+                )
+            # Symmetric to init's routing: an in-flight _InitOp wants
+            # init's recovery surface, not rescan's. Name the matching
+            # command + flags so the user can self-correct.
+            if isinstance(in_flight, _InitOp):
+                raise InitInProgressError(
+                    "an interrupted init is in flight; run "
+                    "`switcher init --continue` to finish it or "
+                    "`switcher init --abort` to reverse pre-init state."
+                )
+            # _RenameOp is auto-compensated by the CLI detection hook on
+            # every other command; reaching here with one in flight means
+            # the user invoked `switcher rescan --continue/--abort`
+            # against a journal the hook never got to drain (stale
+            # binary). Refuse loudly rather than run rescan compensation
+            # against a rename's residue.
+            if not isinstance(in_flight, _RescanOp):
+                raise OpLogCorruptError(
+                    f"unexpected in-flight op type {type(in_flight).__name__}; "
+                    f"manual recovery required"
+                )
+            if self._check_rescan_already_completed(in_flight):
+                # Spec §2.4 "committed but log-unmarked" — the original
+                # rescan's work is fully visible on disk; mark the
+                # record completed without running any per-mapping
+                # mutation. Surface the short-circuit as a distinct
+                # return shape so the CLI can disambiguate between
+                # actual compensation (None) and journal-cleanup-only
+                # (RescanAlreadyCompletedReport).
+                oplog.mark_completed(in_flight)
+                return RescanAlreadyCompletedReport(
+                    target_profiles=dict(in_flight.target_profiles),
+                    kind="continue" if continue_ else "abort",
+                )
+            if continue_:
+                self._compensate_rescan_continue(in_flight)
+            else:
+                self._compensate_rescan_abort(in_flight)
+            oplog.mark_completed(in_flight)
+            return None
+
         self._require_initialized()
         active = self._store.get_active()
 
@@ -2611,6 +3156,58 @@ class ProfileService:
         if dry_run:
             return RescanReport(captured=[(t.id, targets[t.id]) for t in candidates])
 
+        # v0.1.5: build the intent record BEFORE any FS mutation. mappings
+        # carry per-(tool,index) live_path + profile_subdir + original_kind
+        # so abort knows how to reverse safely. previous_tools snapshot
+        # for --into mode captures pre-rescan metadata so abort can restore
+        # it exactly; fresh-profile mode leaves previous_tools=None (abort
+        # deletes the target profiles outright). The unique-profile loop
+        # for previous_tools mirrors the spec §2.4 "target_profiles maps
+        # every tool_id to the SAME profile in --into mode" invariant.
+        rescan_mappings: list[_MappingIntent] = []
+        for tool in candidates:
+            for i, dm in enumerate(tool.config_dirs):
+                live = self._resolver.tool_dir(tool, i)
+                if live.is_dir() and not self._resolver.is_link(live):
+                    original_kind = "real-dir"
+                elif not live.exists():
+                    original_kind = "missing"
+                else:
+                    # Pre-flight (a few dozen lines up) already rejected
+                    # link / non-dir-file shapes; this is a defense-in-
+                    # depth assertion mirroring init's pre-flight contract.
+                    raise AssertionError(
+                        f"unexpected pre-flight state for {live}: "
+                        f"is_link={self._resolver.is_link(live)}, "
+                        f"exists={live.exists()}, is_dir={live.is_dir()}"
+                    )
+                rescan_mappings.append(
+                    _MappingIntent.model_validate(
+                        {
+                            "tool_id": tool.id,
+                            "mapping_index": i,
+                            "live_path": os.path.normpath(str(live)),
+                            "profile_subdir": dm.profile_subdir,
+                            "original_kind": original_kind,
+                        }
+                    )
+                )
+        previous_tools_snapshot: dict[str, dict[str, bool]] | None = None
+        if into is not None:
+            previous_tools_snapshot = {into: dict(self._store.get(into).tools)}
+        intent = _RescanOp.model_validate(
+            {
+                "op": "rescan",
+                "started_at": now(),
+                "target_ids": [t.id for t in candidates],
+                "target_profiles": dict(targets),
+                "into_mode": into is not None,
+                "previous_tools": previous_tools_snapshot,
+                "mappings": rescan_mappings,
+            }
+        )
+        oplog.append_record(intent)
+
         # Capture per tool, with rollback on partial failure. The per-tool
         # state write (active + cache, atomic per spec §4.4) lives INSIDE
         # the rollback try/except: a config-write failure after a successful
@@ -2619,6 +3216,7 @@ class ProfileService:
         # hit AlreadyLinkedError instead of recovering cleanly.
         report = RescanReport(captured=[])
         live_paths_cache = self.get_active_live_paths()
+        first_tool = True
         for tool in candidates:
             target = targets[tool.id]
             new_paths = [
@@ -2630,6 +3228,21 @@ class ProfileService:
                 active[tool.id] = target
                 live_paths_cache[tool.id] = new_paths
                 self._store.set_active_state(active, live_paths_cache)
+            except ProfileExistsError:
+                # Pre-mutation cancel scope: ProfileExistsError fires
+                # before _capture_tool_for_rescan touches the live dirs
+                # (store.create's first line is the existence check).
+                # Disk is untouched for this tool; if this is the FIRST
+                # tool, no prior tool has mutated either. The intent
+                # must be canceled or the next command forces "compensate
+                # the rescan that never started". After the first tool
+                # has set_active_state'd, the rescan is partially
+                # committed — preserve the intent for compensation
+                # (mirrors init's narrow cancel scope).
+                if first_tool:
+                    with contextlib.suppress(StorageError):
+                        oplog.cancel_intent(intent)
+                raise
             except Exception as e:
                 # Revert in-memory dict mutations so a rollback after the
                 # state-write step starts cleanly; the on-disk active map
@@ -2656,6 +3269,13 @@ class ProfileService:
                     msg += f"; rollback steps also failed: {'; '.join(rollback_errors)}"
                 raise RescanCaptureError(msg) from e
             report.captured.append((tool.id, target))
+            first_tool = False
+
+        # v0.1.5: entire multi-tool capture loop succeeded. mark_completed
+        # ONLY after the last tool's set_active_state landed — running it
+        # mid-loop would clear the recovery surface for a partially-
+        # captured rescan (the spec's correctness invariant).
+        oplog.mark_completed(intent)
         return report
 
     def _capture_tool_for_rescan(
@@ -3018,6 +3638,26 @@ class InitAlreadyCompletedReport:
     """
 
     profile_name: str
+    kind: Literal["continue", "abort"]
+
+
+@dataclass(frozen=True)
+class RescanAlreadyCompletedReport:
+    """Return shape of ``ProfileService.rescan(continue_=True | abort=True)``
+    when the journal record was already fully completed — spec §2.4
+    "committed but log-unmarked" path (symmetric to init's variant).
+
+    Surfaces the short-circuit case as a distinct return value so the
+    CLI can disambiguate between "compensation ran" (return None) and
+    "the journal was just cleaned up; the underlying rescan was
+    already on disk before the crash" (this report).
+
+    target_profiles: the profile-name map from the journal record so
+        the CLI can name what the now-completed rescan captured.
+    kind: which recovery flag triggered the short-circuit.
+    """
+
+    target_profiles: dict[str, str]
     kind: Literal["continue", "abort"]
 
 
