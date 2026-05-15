@@ -61,12 +61,18 @@ pytestmark = pytest.mark.integration
 # the same convention. A stale or wrong-worktree install would let
 # these tests false-pass against unrelated code. Surface that loudly
 # at collection time rather than silently testing the wrong package.
+#
+# RuntimeError instead of ``assert`` (abby pass-10 batch 2): ``assert``
+# is stripped under ``python -O``, which would silently disable the
+# guard. Unconditional raise keeps the protection active regardless
+# of the interpreter's optimize flag.
 _WORKTREE_SRC = Path(__file__).resolve().parents[2] / "src"
-assert Path(switcher.__file__).resolve().is_relative_to(_WORKTREE_SRC), (
-    f"switcher resolves to {switcher.__file__!r}, not under {_WORKTREE_SRC!r}; "
-    f"the editable install is stale or points at a different checkout. "
-    f"Run `pixi install` to rebuild the environment."
-)
+if not Path(switcher.__file__).resolve().is_relative_to(_WORKTREE_SRC):
+    raise RuntimeError(
+        f"switcher resolves to {switcher.__file__!r}, not under {_WORKTREE_SRC!r}; "
+        f"the editable install is stale or points at a different checkout. "
+        f"Run `pixi install` to rebuild the environment."
+    )
 
 
 def _now() -> datetime:
@@ -236,6 +242,86 @@ def test_interrupted_init_abort_via_subprocess(tmp_home: Path, tmp_state: Path) 
     assert claude_live.is_dir() and not _is_link(claude_live)
     assert (claude_live / "settings.json").read_text() == '{"original": true}'
     assert not store.profile_dir(profile_name).exists()
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
+def test_interrupted_init_continue_mixed_mapping_states(tmp_home: Path, tmp_state: Path) -> None:
+    """abby pass-10 batch 2: per-mapping loop coverage. Single-mapping
+    happy paths don't verify the per-mapping dispatch table runs
+    correctly when mappings have DIFFERENT states. A regression in
+    the per-mapping loop (e.g. accidentally short-circuiting after
+    the first mapping, or replaying COMPLETE mappings) would slip
+    through single-mapping tests while violating the user-facing
+    "each mapping recovered per its disk state" guarantee.
+
+    Stages two mappings with different states:
+    - claude (mapping 0): COMPLETE — live symlinked to populated target
+    - copilot (mapping 0): MOVE_DONE_LINK_MISSING — target populated,
+      live missing entirely (the SIGKILL crash window)
+
+    After ``init --continue``, claude must stay unchanged (no
+    re-running of move_or_seed_dir) and copilot must get only the
+    swap_link replay. Both must end as managed links to their
+    populated targets."""
+    store = FileProfileStore(tmp_state)
+    claude_live = tmp_home / ".claude"
+    copilot_live = tmp_home / ".copilot"
+    shutil.rmtree(claude_live)
+    shutil.rmtree(copilot_live)
+
+    profile_name = "2026-05-12-current"
+    store.create(profile_name, {"claude": True, "copilot": True})
+
+    # Stage claude as COMPLETE: profile subdir populated, live linked.
+    claude_target = store.profile_dir(profile_name) / "claude"
+    claude_target.mkdir(parents=True)
+    (claude_target / "settings.json").write_text('{"claude": "complete"}')
+    _symlink_dir(claude_target, claude_live)
+
+    # Stage copilot as MOVE_DONE_LINK_MISSING: profile subdir populated,
+    # live MISSING (no symlink yet).
+    copilot_target = store.profile_dir(profile_name) / "copilot"
+    copilot_target.mkdir(parents=True)
+    (copilot_target / "config.json").write_text('{"copilot": "mid_window"}')
+
+    record = _InitOp.model_validate(
+        {
+            "op": "init",
+            "started_at": _now(),
+            "target_ids": ["claude", "copilot"],
+            "profile_name": profile_name,
+            "mappings": [
+                {
+                    "tool_id": "claude",
+                    "mapping_index": 0,
+                    "live_path": str(claude_live),
+                    "profile_subdir": "claude",
+                    "original_kind": "real-dir",
+                },
+                {
+                    "tool_id": "copilot",
+                    "mapping_index": 0,
+                    "live_path": str(copilot_live),
+                    "profile_subdir": "copilot",
+                    "original_kind": "real-dir",
+                },
+            ],
+        }
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    r = _run(["init", "--continue"], tmp_home, tmp_state)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+
+    # Both mappings COMPLETE post-recovery, per their respective dispatch
+    # paths. Data integrity preserved.
+    assert _is_link(claude_live)
+    assert (claude_target / "settings.json").read_text() == '{"claude": "complete"}'
+    assert _is_link(copilot_live)
+    assert (copilot_target / "config.json").read_text() == '{"copilot": "mid_window"}'
+    active = store.get_active()
+    assert active.get("claude") == profile_name
+    assert active.get("copilot") == profile_name
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
