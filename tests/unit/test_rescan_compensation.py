@@ -859,6 +859,68 @@ def test_abort_short_circuits_when_already_completed(
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_continue_refuses_when_into_record_has_multiple_target_profiles(
+    service: ProfileService, tmp_state: Path
+) -> None:
+    """CR pass-2 major: --into mode targets exactly ONE pre-existing
+    profile per spec §2.4. A hand-edited journal with multiple distinct
+    target_profiles values would otherwise drive --continue mutations
+    across multiple profiles a clean --into never would. Refuse upfront
+    before short-circuit OR compensation dispatch."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    store.set_active_state({}, {})
+
+    # Two distinct target profiles + into_mode=True = corruption.
+    record = _RescanOp.model_validate(
+        {
+            "op": "rescan",
+            "started_at": _now(),
+            "target_ids": ["claude", "copilot"],
+            "target_profiles": {"claude": "alpha", "copilot": "beta"},
+            "into_mode": True,
+            "previous_tools": {
+                "alpha": {"claude": True},
+                "beta": {"copilot": True},
+            },
+            "mappings": [],
+        }
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="distinct target profiles"):
+        service.rescan(continue_=True)
+    # Journal preserved: refusal is side-effect-free.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_validator_refuses_into_record_with_missing_previous_tools_snapshot(
+    service: ProfileService,
+) -> None:
+    """Defensive: ``_validate_rescan_record_invariants`` rejects an
+    --into record whose previous_tools doesn't carry an entry for the
+    singleton target. Unreachable via the journal's normal lifecycle
+    today — _RescanOp's model validators already enforce
+    ``set(previous_tools.keys()) == set(target_profiles.values())``,
+    AND ``into_mode=True`` requires ``previous_tools`` to be a non-
+    None dict. The in-method check is defense-in-depth against a
+    future schema relaxation. Constructed via ``model_construct`` to
+    bypass the Pydantic validators, mirroring the
+    ``test_abort_rejects_link_original_kind_defensively`` pattern."""
+    record = _RescanOp.model_construct(
+        op="rescan",
+        started_at=_now(),
+        target_ids=["claude"],
+        target_profiles={"claude": "shared"},
+        into_mode=True,
+        previous_tools=None,
+        mappings=[],
+    )
+
+    with pytest.raises(OpLogCorruptError, match="previous_tools snapshot"):
+        service._validate_rescan_record_invariants(record)
+
+
 def test_abort_into_mode_refuses_when_target_profile_missing(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

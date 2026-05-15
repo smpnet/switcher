@@ -1698,6 +1698,55 @@ class ProfileService:
             return base
         return captured_here
 
+    @staticmethod
+    def _validate_rescan_record_invariants(record: _RescanOp) -> None:
+        """Enforce the spec §2.4 ``--into`` shape invariants upfront.
+
+        ``--into`` mode targets exactly ONE pre-existing profile (every
+        captured tool_id maps to the same profile name), and the
+        ``previous_tools`` snapshot must cover that profile (drives
+        --abort's metadata restoration).
+
+        A hand-edited or corrupt journal could violate either invariant.
+        Without this guard the compensation paths would iterate
+        ``set(target_profiles.values())`` and proceed silently:
+
+          - ``_check_rescan_already_completed`` could bless a multi-
+            target --into record as "already completed".
+          - ``_compensate_rescan_continue`` / ``_compensate_rescan_abort``
+            would mutate across multiple profiles a clean --into never
+            would, OR silently fall back to an empty previous_tools
+            snapshot via ``(record.previous_tools or {}).get(name, {})``.
+
+        Raised early so service.rescan's recovery dispatch surfaces a
+        clean OpLogCorruptError instead of a confusing short-circuit
+        outcome (CR pass-2 major).
+
+        Fresh-profile mode is intentionally NOT constrained here —
+        rescan creates a separate profile per tool by design, so the
+        multi-target shape is the normal case and previous_tools is
+        always None.
+        """
+        if not record.into_mode:
+            return
+        unique_profiles = set(record.target_profiles.values())
+        if len(unique_profiles) != 1:
+            raise OpLogCorruptError(
+                f"interrupted rescan record (--into mode) has "
+                f"{len(unique_profiles)} distinct target profiles "
+                f"({sorted(unique_profiles)!r}); spec §2.4 requires "
+                f"exactly one. Manual recovery required."
+            )
+        (singleton,) = unique_profiles
+        previous = record.previous_tools or {}
+        if singleton not in previous:
+            raise OpLogCorruptError(
+                f"interrupted rescan record (--into mode, target "
+                f"{singleton!r}) is missing its previous_tools snapshot; "
+                f"abort cannot restore pre-rescan metadata without it. "
+                f"Manual recovery required."
+            )
+
     def _check_rescan_already_completed(self, record: _RescanOp) -> bool:
         """Return True ONLY if every observable post-rescan invariant
         holds on disk: each unique target profile is a real directory
@@ -3107,6 +3156,13 @@ class ProfileService:
                     f"unexpected in-flight op type {type(in_flight).__name__}; "
                     f"manual recovery required"
                 )
+            # Validate spec §2.4 --into invariants BEFORE the short-
+            # circuit or compensation dispatch (CR pass-2 major). A
+            # corrupt journal with multiple --into target profiles or a
+            # missing previous_tools snapshot would otherwise drive
+            # mutations across multiple profiles or silently bless a
+            # missing snapshot.
+            self._validate_rescan_record_invariants(in_flight)
             if self._check_rescan_already_completed(in_flight):
                 # Spec §2.4 "committed but log-unmarked" — the original
                 # rescan's work is fully visible on disk; mark the
