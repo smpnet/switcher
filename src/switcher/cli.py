@@ -491,13 +491,13 @@ def _print_init_recovery_result(
 
 
 def _print_rescan_recovery_result(
-    result: RescanReport | RescanAlreadyCompletedReport | None,
+    result: RescanAlreadyCompletedReport | None,
     *,
     abort: bool,
 ) -> None:
     """Render the outcome of ``service.rescan(continue_=True | abort=True)``.
 
-    Three return shapes (spec §2.4):
+    Two return shapes the recovery branch can produce (spec §2.4):
 
     - ``RescanAlreadyCompletedReport``: the journal record was committed
       before the crash; ``mark_completed`` ran without invoking
@@ -506,7 +506,13 @@ def _print_rescan_recovery_result(
       tells the user that the rescan is already on disk (abort can't
       reverse a committed rescan).
     - ``None``: compensation actually ran.
-    - ``RescanReport``: not produced by the recovery branches.
+
+    ``RescanReport`` (the normal-path shape) is intentionally excluded
+    from the signature (abby pass-6): the recovery branch can't
+    produce it, and refusing it at the type level protects future
+    callers from accidentally passing the normal-path shape through.
+    The CLI caller narrows the service's wider return union to this
+    helper's input shape via an explicit isinstance gate.
     """
     if isinstance(result, RescanAlreadyCompletedReport):
         profiles_desc = ", ".join(
@@ -524,17 +530,12 @@ def _print_rescan_recovery_result(
                 f"are already managed."
             )
         return
-    if result is None:
-        if abort:
-            console.print("Aborted interrupted rescan; pre-rescan state restored.")
-        else:
-            console.print("Resumed interrupted rescan; captures finalized.")
-        return
-    # Defense-in-depth: service.rescan(continue_=True|abort=True) is
-    # contracted to return only RescanAlreadyCompletedReport or None;
-    # any other shape would be a future contract regression we'd
-    # rather surface than silently swallow. abby pass-1 nit.
-    raise AssertionError(f"unexpected rescan recovery return shape: {type(result).__name__}")
+    # ``result is None`` is the only remaining shape after the
+    # isinstance check above — type system narrows the union here.
+    if abort:
+        console.print("Aborted interrupted rescan; pre-rescan state restored.")
+    else:
+        console.print("Resumed interrupted rescan; captures finalized.")
 
 
 @app.command()
@@ -995,6 +996,14 @@ def rescan(
                     "regressed. Manual recovery required."
                 )
         result = deps.service.rescan(continue_=continue_, abort=abort)
+        # service.rescan's overload returns the wider union; the
+        # recovery branch only ever produces RescanAlreadyCompletedReport
+        # or None. Narrow via assert before passing to the helper —
+        # surfaces a future contract regression (RescanReport leaking
+        # through) loudly rather than masking it as a type-check error.
+        assert not isinstance(result, RescanReport), (
+            "service.rescan(continue_|abort=True) must not return RescanReport"
+        )
         _print_rescan_recovery_result(result, abort=abort)
         return
 
