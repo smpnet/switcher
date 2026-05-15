@@ -339,7 +339,7 @@ def test_continue_short_circuit_returns_already_completed_report(
     shutil.rmtree(claude_live)
 
     profile_name = "2026-05-12-rescan-1"
-    store.create(profile_name, {"claude": True})
+    store.create(profile_name, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     target = store.profile_dir(profile_name) / "claude"
     target.mkdir(parents=True)
     (target / "settings.json").write_text('{"committed": true}')
@@ -837,7 +837,7 @@ def test_abort_short_circuits_when_already_completed(
     claude_live = tmp_home / ".claude"
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-rescan-1"
-    store.create(profile_name, {"claude": True})
+    store.create(profile_name, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     target = store.profile_dir(profile_name) / "claude"
     target.mkdir(parents=True)
     (target / "settings.json").write_text('{"committed": true}')
@@ -1323,6 +1323,60 @@ def test_abort_preflights_config_before_any_filesystem_mutation(
     # Pre-mutation state preserved.
     assert store.profile_dir(profile_name).exists()
     assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_short_circuit_refuses_fresh_target_when_journal_id_does_not_match(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR-3 blocker: the short-circuit predicate
+    ``_check_rescan_already_completed`` must ALSO enforce the
+    fresh-mode journal_id ownership check. Without it, a foreign
+    profile that happens to match .tools / active / cache / mapping
+    invariants by coincidence (the same race window as pass-PR-2)
+    would trigger the short-circuit and silently mark_completed the
+    journal — dropping recovery for a rescan that never finished.
+
+    Stages every other completion signal (mappings COMPLETE, active
+    matches, cache matches, vanilla present) BUT with a foreign
+    profile that has a different journal_id. Continue must fall
+    through to compensation (which then refuses on the same
+    ownership check the compensation path enforces)."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-rescan-1"
+    # Foreign profile: matching tools/shape but different journal_id.
+    store.create(profile_name, {"claude": True}, journal_id="foreign-rescan-id-77")
+    target = store.profile_dir(profile_name) / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"foreign": true}')
+    _symlink_dir(target, claude_live)
+    # Plant matching active + cache — every completion signal except
+    # the journal_id.
+    store.set_active_state({"claude": profile_name}, {"claude": [str(claude_live)]})
+
+    record = _make_rescan_record(
+        target_ids=["claude"],
+        target_profiles={"claude": profile_name},
+        into_mode=False,
+        previous_tools=None,
+        mappings=[_claude_mapping(tmp_home, "real-dir")],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    # Without the pass-PR-3 fix, the short-circuit would fire and
+    # silently mark_completed the journal. With the fix, the short-
+    # circuit refuses → compensation runs → compensation refuses on
+    # the same journal_id check → OpLogCorruptError.
+    with pytest.raises(OpLogCorruptError, match="journal_id"):
+        service.rescan(continue_=True)
+
+    # Journal preserved end-to-end (NOT cleared by mark_completed).
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+    # Foreign profile and its journal_id stamp intact.
+    assert store.get(profile_name).journal_id == "foreign-rescan-id-77"
 
 
 def test_continue_refuses_fresh_target_when_journal_id_does_not_match(

@@ -1924,6 +1924,18 @@ class ProfileService:
             expected_tools = self._expected_tools_for_rescan_target(record, name)
             if profile.tools != expected_tools:
                 return False
+            # Journal-id ownership proof (Hermes pass-PR-3 blocker):
+            # the .tools/active/cache invariants alone are not strong
+            # enough — an external process could race in the
+            # reservation-vs-capture window and create a profile with
+            # coincidentally matching shape at one of our reserved
+            # names. Without the journal_id check here, the
+            # short-circuit would fire on that foreign profile and
+            # silently mark_completed the journal, dropping recovery
+            # for a rescan that never actually finished. Fresh-mode
+            # only — --into targets pre-exist and carry no journal_id.
+            if not record.into_mode and profile.journal_id != record.rescan_id:
+                return False
         profile_dir_by_tool = {
             tid: self._store.profile_dir(record.target_profiles[tid])
             for tid in record.target_ids
