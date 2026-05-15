@@ -382,19 +382,25 @@ def test_continue_rejects_call_site_target_ids(
         service.init(target_ids=["claude"], continue_=True)
 
 
-def test_abort_rejects_call_site_diff_list_args(
-    service: ProfileService,
+@pytest.mark.parametrize(
+    "kwarg_name",
+    [
+        "requested_but_not_installed",
+        "skipped_via_skip_flag",
+        "skipped_via_interactive",
+    ],
+)
+def test_abort_rejects_each_call_site_diff_list_arg(
+    service: ProfileService, kwarg_name: str
 ) -> None:
     """Symmetric to ``target_ids`` rejection: the three informational
     diff lists are call-site context for fresh-init reporting and
     have no meaning during recovery. Passing them with
-    ``abort=True`` would silently discard the data."""
+    ``abort=True`` would silently discard the data. Parametrized per
+    behavior-named convention (CR pass-PR-2 refactor)."""
+    extra_kwargs: dict[str, object] = {kwarg_name: ["foo"]}
     with pytest.raises(ValueError, match="continue_/abort cannot be combined"):
-        service.init(abort=True, requested_but_not_installed=["foo"])
-    with pytest.raises(ValueError, match="continue_/abort cannot be combined"):
-        service.init(abort=True, skipped_via_skip_flag=["foo"])
-    with pytest.raises(ValueError, match="continue_/abort cannot be combined"):
-        service.init(abort=True, skipped_via_interactive=["foo"])
+        service.init(abort=True, **extra_kwargs)  # pyright: ignore[reportCallIssue, reportArgumentType]
 
 
 # -- writer-side journal hygiene ---------------------------------------------
@@ -494,6 +500,7 @@ def test_abort_complete_mapping_real_dir(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -520,6 +527,7 @@ def test_abort_complete_mapping_missing_empty_target(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -545,6 +553,7 @@ def test_abort_complete_mapping_missing_nonempty_target_refuses(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -572,6 +581,7 @@ def test_abort_move_done_link_missing_real_dir(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -595,8 +605,8 @@ def test_abort_untouched_skips(service: ProfileService, tmp_home: Path, tmp_stat
     (claude_live / "settings.json").write_text('{"original": true}')
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
-    profile_dir.mkdir(parents=True)
     record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
     OpLogIO(tmp_state).append_record(record)
 
@@ -620,6 +630,7 @@ def test_abort_validates_all_mappings_before_mutating_any(
     shutil.rmtree(copilot_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True, "copilot": True})
     profile_dir = store.profile_dir(profile_name)
     claude_target = profile_dir / "claude"
     claude_target.mkdir(parents=True)
@@ -846,6 +857,147 @@ def test_continue_refuses_and_keeps_journal_when_current_profile_metadata_missin
     # (don't mutate when the recovery path can't actually heal).
     assert profile_dir.is_dir()
     assert claude_live.is_symlink()
+
+
+def test_continue_refusal_with_missing_profile_dir_does_not_create_it(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR-2 blocker: a refused recovery must be side-effect
+    free. Previously the missing-profile-dir branch recreated
+    ``profile_dir`` BEFORE per-mapping validation, so a continue that
+    refused on (e.g.) an AMBIGUOUS mapping still left a fresh
+    ``metadata.json`` behind. A retry would then see a different
+    starting state than the refused first attempt.
+
+    Trigger: earliest crash window (intent landed, first ``_store.create``
+    did not) AND one mapping has diverged from its journaled
+    ``original_kind`` (e.g., ``original_kind="missing"`` but the live
+    dir has been externally recreated → classifier returns AMBIGUOUS).
+    """
+    claude_live = tmp_home / ".claude"
+    (claude_live / "settings.json").write_text('{"externally_recreated": true}')
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # No store.create — earliest crash window.
+    # original_kind="missing" + live now exists as a real dir →
+    # classify_mapping returns AMBIGUOUS in compensation's validation.
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "missing")])
+    OpLogIO(tmp_state).append_record(record)
+    profile_dir = store.profile_dir(profile_name)
+    assert not profile_dir.exists()  # precondition
+
+    with pytest.raises(OpLogCorruptError):
+        service.init(continue_=True)
+
+    # Refusal is side-effect free: profile_dir must NOT have been created
+    # by the recovery attempt. The user's next retry sees the same disk
+    # state the first attempt did.
+    assert not profile_dir.exists()
+    # Journal stays in flight so the user can fix manually and retry.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_continue_refuses_when_existing_profile_has_foreign_tools(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR-2 blocker: continue must not silently adopt a
+    foreign profile occupying ``profiles/<record.profile_name>``.
+
+    Trigger: a profile dir with READABLE metadata that doesn't match
+    ``record.target_ids`` already exists at the recovery pathname (e.g.,
+    a prior init for an unrelated tool set, or a hand-edited journal).
+    Without this check, continue would replay mappings, write
+    ``active = {target_id: record.profile_name}``, and leave
+    ``store.get(record.profile_name).tools`` saying the profile manages
+    DIFFERENT tools — internally inconsistent persisted state.
+    """
+    claude_live = tmp_home / ".claude"
+    (claude_live / "settings.json").write_text('{"data": true}')
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # Foreign profile: tools={"external": True}, NOT matching
+    # record.target_ids=["claude"].
+    store.create(profile_name, {"external": True})
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError):
+        service.init(continue_=True)
+
+    # Foreign metadata preserved (NOT silently overwritten).
+    assert store.get(profile_name).tools == {"external": True}
+    # No active map mutation either.
+    assert store.get_active() == {}
+    # Journal stays in flight.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_abort_refuses_when_existing_profile_has_foreign_tools(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR-2 blocker: abort must NOT ``rmtree`` a foreign
+    profile dir. Previously abort's only gate was directory shape
+    (is_dir + not is_link), so a profile occupying the recovery
+    pathname with metadata for an unrelated tool set would be
+    recursively deleted = data loss.
+    """
+    claude_live = tmp_home / ".claude"
+    (claude_live / "settings.json").write_text('{"data": true}')
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # Foreign profile with its own data.
+    store.create(profile_name, {"external": True})
+    foreign_data = store.profile_dir(profile_name) / "external" / "config.json"
+    foreign_data.parent.mkdir(parents=True)
+    foreign_data.write_text('{"user_data": "important"}')
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError):
+        service.init(abort=True)
+
+    # Foreign profile preserved end-to-end: dir + metadata + user data.
+    assert store.profile_dir(profile_name).is_dir()
+    assert store.get(profile_name).tools == {"external": True}
+    assert foreign_data.read_text() == '{"user_data": "important"}'
+    # Live state untouched.
+    assert (claude_live / "settings.json").read_text() == '{"data": true}'
+    # Journal stays in flight.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_abort_refuses_when_existing_vanilla_has_foreign_tools(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR-2 blocker, vanilla variant: abort's profile-dir
+    delete loop also covers ``vanilla``. A foreign vanilla profile
+    (different metadata) must NOT be deleted — same data-loss
+    concern as the dated-current case.
+    """
+    claude_live = tmp_home / ".claude"
+    (claude_live / "settings.json").write_text('{"data": true}')
+    profile_name = "2026-05-12-current"
+    store = FileProfileStore(tmp_state)
+    # Current profile matches; vanilla is foreign.
+    store.create(profile_name, {"claude": True})
+    store.create("vanilla", {"unrelated_tool": True})
+    foreign_data = store.profile_dir("vanilla") / "unrelated_tool" / "config.json"
+    foreign_data.parent.mkdir(parents=True)
+    foreign_data.write_text('{"preserve": true}')
+    record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError):
+        service.init(abort=True)
+
+    # Foreign vanilla preserved.
+    assert store.profile_dir("vanilla").is_dir()
+    assert store.get("vanilla").tools == {"unrelated_tool": True}
+    assert foreign_data.read_text() == '{"preserve": true}'
+    # Current profile also preserved (refusal is two-pass: validate first).
+    assert store.profile_dir(profile_name).is_dir()
+    # Journal stays in flight.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
 def test_continue_preflights_config_before_any_filesystem_mutation(
@@ -1106,6 +1258,7 @@ def test_abort_clears_active_and_cache_for_target_ids(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -1155,6 +1308,7 @@ def test_abort_preserves_unrelated_zero_mapping_cache_entry(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)
@@ -1194,8 +1348,7 @@ def test_abort_idempotent_second_call_raises_no_in_progress(
     claude_live = tmp_home / ".claude"
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
-    profile_dir = store.profile_dir(profile_name)
-    profile_dir.mkdir(parents=True)
+    store.create(profile_name, {"claude": True})
     record = _make_init_record(profile_name, ["claude"], [_claude_mapping(tmp_home, "real-dir")])
     OpLogIO(tmp_state).append_record(record)
 
@@ -1419,8 +1572,8 @@ def test_abort_refuses_when_target_subdir_is_symlink(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
-    profile_dir.mkdir(parents=True)
     elsewhere = tmp_state / "elsewhere"
     elsewhere.mkdir(parents=True)
     (elsewhere / "important.txt").write_text("user data")
@@ -1528,6 +1681,7 @@ def test_abort_rejects_link_original_kind_defensively(
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-current"
     store = FileProfileStore(tmp_state)
+    store.create(profile_name, {"claude": True})
     profile_dir = store.profile_dir(profile_name)
     target = profile_dir / "claude"
     target.mkdir(parents=True)

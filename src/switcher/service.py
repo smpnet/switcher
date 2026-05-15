@@ -1245,7 +1245,7 @@ class ProfileService:
         # captured from live dirs).
         if profile_dir.is_dir():
             try:
-                self._store.get(record.profile_name)
+                existing_profile = self._store.get(record.profile_name)
             except (UnknownProfileError, StorageError) as e:
                 raise OpLogCorruptError(
                     f"interrupted init continue: profile {record.profile_name!r} "
@@ -1255,18 +1255,22 @@ class ProfileService:
                     f"Manual recovery required: delete {profile_dir} and "
                     f"re-run `switcher init --continue`."
                 ) from e
-        else:
-            # Earliest crash window (CR pass-PR-1 critical): the journal
-            # holds an intent for a profile the store never got to
-            # create. Without this branch the mapping replay below would
-            # mkdir profile_dir/<subdir> (via move_or_seed_dir) without
-            # writing metadata.json, leaving active[tid] = profile_name
-            # pointing at a dir that _store.get can't load — and the
-            # journal would be marked completed at the tail, clearing
-            # the recovery record. Recreate through the canonical store
-            # API so the post-recovery state matches what a clean init
-            # would have produced.
-            self._store.create(record.profile_name, dict.fromkeys(record.target_ids, True))
+            # Foreign-profile refusal (Hermes pass-PR-2 blocker): a
+            # readable profile dir at the recovery pathname is only
+            # journal-owned if its .tools matches dict.fromkeys(
+            # record.target_ids, True) — what a clean init would have
+            # written. Otherwise this directory belongs to some other
+            # init / hand-edited journal / race scenario; silently
+            # adopting it would write active = {tid: profile_name}
+            # while store.get(profile_name).tools says otherwise.
+            expected_tools = dict.fromkeys(record.target_ids, True)
+            if existing_profile.tools != expected_tools:
+                raise OpLogCorruptError(
+                    f"interrupted init continue: profile {record.profile_name!r} "
+                    f"at {profile_dir} has tools={existing_profile.tools!r} but "
+                    f"the journal expects {expected_tools!r}; refusing to "
+                    f"adopt a foreign profile. Manual recovery required."
+                )
         for intent in record.mappings:
             target = profile_dir / intent.profile_subdir
             # Per-target shape refusal. `classify_mapping` returns
@@ -1301,6 +1305,18 @@ class ProfileService:
                     f"on-disk state is ambiguous; manual recovery "
                     f"required — see docs/RELEASE.md"
                 )
+
+        # Deferred profile-dir create (Hermes pass-PR-2 blocker):
+        # the earliest crash window (intent landed, first _store.create
+        # never ran) leaves profile_dir absent. Recreating BEFORE the
+        # per-mapping validation loop above would let a refused
+        # validation (e.g., AMBIGUOUS mapping due to externally-
+        # recreated live) leave a fresh metadata.json behind, breaking
+        # the "validate then mutate" guarantee. Defer until the
+        # validation loop has cleared every mapping; this is the
+        # last gate before the mutation pass below.
+        if not profile_dir.is_dir():
+            self._store.create(record.profile_name, dict.fromkeys(record.target_ids, True))
 
         # Second pass: per-mapping dispatch.
         for intent in record.mappings:
@@ -1460,6 +1476,34 @@ class ProfileService:
                     f"interrupted init abort: {name!r} profile at {p} exists "
                     f"but is not a directory; manual recovery required"
                 )
+            # Foreign-profile refusal (Hermes pass-PR-2 blocker): abort
+            # mutation deletes both profile dirs via ``_store.delete``
+            # (= ``shutil.rmtree``). If a foreign profile occupies
+            # either pathname (different .tools from what this init
+            # would have written), the rmtree would be a data-loss
+            # path. A clean init writes both dated-current AND vanilla
+            # with tools=dict.fromkeys(record.target_ids, True), so
+            # any mismatch indicates a hand-edited journal / race /
+            # cancel_intent failure. Refuse loudly so the user
+            # manually inspects and decides whether to delete.
+            if p.is_dir():
+                try:
+                    existing_profile = self._store.get(name)
+                except (UnknownProfileError, StorageError) as e:
+                    raise OpLogCorruptError(
+                        f"interrupted init abort: {name!r} profile at {p} is "
+                        f"present but metadata.json is missing or unreadable "
+                        f"({e}); refusing to rmtree without verifying ownership. "
+                        f"Manual recovery required."
+                    ) from e
+                expected_tools = dict.fromkeys(record.target_ids, True)
+                if existing_profile.tools != expected_tools:
+                    raise OpLogCorruptError(
+                        f"interrupted init abort: {name!r} profile at {p} has "
+                        f"tools={existing_profile.tools!r} but the journal "
+                        f"expects {expected_tools!r}; refusing to delete a "
+                        f"foreign profile. Manual recovery required."
+                    )
         states: dict[int, MappingDiskState] = {}
         for i, intent in enumerate(record.mappings):
             target = profile_dir / intent.profile_subdir
