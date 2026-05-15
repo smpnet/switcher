@@ -272,6 +272,49 @@ def test_continue_refuses_on_ambiguous_mapping(
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
+def test_continue_does_not_short_circuit_when_cache_is_stale(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """abby pass-1 blocker: ``_check_rescan_already_completed`` must
+    validate ``active_live_paths`` against the journal's expected
+    per-target shape — a missing or stale cache entry would otherwise
+    short-circuit recovery and permanently skip the cache-rebuild step.
+
+    Test stages every other completion signal (mapping COMPLETE, active
+    matches, metadata matches) BUT plants a stale cache value.
+    Continue must fall through to compensation, which rebuilds the
+    cache from the journal."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-rescan-1"
+    store.create(profile_name, {"claude": True})
+    target = store.profile_dir(profile_name) / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"committed": true}')
+    _symlink_dir(target, claude_live)
+    # Stale cache: journal expects str(claude_live); plant a wrong path.
+    store.set_active_state({"claude": profile_name}, {"claude": ["/wrong/path"]})
+
+    record = _make_rescan_record(
+        target_ids=["claude"],
+        target_profiles={"claude": profile_name},
+        into_mode=False,
+        previous_tools=None,
+        mappings=[_claude_mapping(tmp_home, "real-dir")],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    service.rescan(continue_=True)
+
+    # Compensation rebuilt the cache from the journal.
+    config = json.loads((tmp_state / "config.json").read_text())
+    assert config["active_live_paths"]["claude"] == [str(claude_live)]
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
 def test_continue_short_circuit_returns_already_completed_report(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

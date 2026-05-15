@@ -1746,6 +1746,30 @@ class ProfileService:
         for tid, profile_name in record.target_profiles.items():
             if active.get(tid) != profile_name:
                 return False
+        # Cache invariant (abby pass-1 blocker): the short-circuit would
+        # otherwise mark_completed and clear the journal while
+        # ``active_live_paths`` was stale or missing. Init's symmetric
+        # check is stricter (full dict equality) because init REPLACES
+        # the cache; rescan ADDS, so we verify per-target only — every
+        # target_id must have its expected per-mapping live_paths
+        # (sorted by mapping_index), or ``[]`` for zero-mapping tools.
+        # ``get_active_live_paths`` normalizes ``[]`` to absent at read
+        # time, so we compare against the post-normalization view.
+        cache = self._store.get_active_live_paths()
+        by_tool: dict[str, list[tuple[int, str]]] = {}
+        for intent in record.mappings:
+            by_tool.setdefault(intent.tool_id, []).append((intent.mapping_index, intent.live_path))
+        for tid in record.target_ids:
+            expected_paths = [p for _, p in sorted(by_tool.get(tid, []))]
+            if expected_paths:
+                if cache.get(tid) != expected_paths:
+                    return False
+            else:
+                # Zero-mapping tool: clean rescan writes [] which
+                # get_active_live_paths normalizes to absent. Any present
+                # entry would be drift.
+                if tid in cache:
+                    return False
         return True
 
     def _compensate_rescan_continue(self, record: _RescanOp) -> None:

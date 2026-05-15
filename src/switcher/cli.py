@@ -46,6 +46,7 @@ from switcher.service import (
     InitReport,
     ProfileService,
     RescanAlreadyCompletedReport,
+    RescanReport,
     UninstallMappingState,
 )
 from switcher.store import FileProfileStore, ProfileStore
@@ -490,7 +491,7 @@ def _print_init_recovery_result(
 
 
 def _print_rescan_recovery_result(
-    result: object,
+    result: RescanReport | RescanAlreadyCompletedReport | None,
     *,
     abort: bool,
 ) -> None:
@@ -529,6 +530,11 @@ def _print_rescan_recovery_result(
         else:
             console.print("Resumed interrupted rescan; captures finalized.")
         return
+    # Defense-in-depth: service.rescan(continue_=True|abort=True) is
+    # contracted to return only RescanAlreadyCompletedReport or None;
+    # any other shape would be a future contract regression we'd
+    # rather surface than silently swallow. abby pass-1 nit.
+    raise AssertionError(f"unexpected rescan recovery return shape: {type(result).__name__}")
 
 
 @app.command()
