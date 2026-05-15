@@ -86,9 +86,20 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
 
     Mirrors tests/e2e/test_cli.py's helper — re-sets HOME / state-dir
     so the subprocess sees the same isolation the in-process tests get
-    from monkeypatch."""
+    from monkeypatch.
+
+    Pins the subprocess's switcher resolution to THIS worktree (abby
+    pass-9 batch 2): prepends this worktree's ``src/`` to PYTHONPATH so
+    ``python -m switcher`` resolves to the code under review even on
+    a stale or multi-checkout install. The collection-time assert
+    above proves the pytest process's import is correct; PYTHONPATH
+    extends the same guarantee to the subprocess."""
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{_WORKTREE_SRC}{os.pathsep}{existing_pp}" if existing_pp else str(_WORKTREE_SRC)
+    )
     if IS_WINDOWS:
         env["USERPROFILE"] = str(home)
         env["LOCALAPPDATA"] = str(home / "AppData" / "Local")
