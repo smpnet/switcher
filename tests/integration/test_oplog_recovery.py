@@ -381,6 +381,42 @@ def test_interrupted_rescan_abort_via_subprocess(tmp_home: Path, tmp_state: Path
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+@pytest.mark.parametrize("readonly_cmd", [["status"], ["list"], ["which", "claude"]])
+def test_readonly_commands_surface_interrupted_rescan_with_exit_3(
+    tmp_home: Path, tmp_state: Path, readonly_cmd: list[str]
+) -> None:
+    """Symmetric to the init parametrized test: every read-only command
+    must surface an in-flight rescan, not just ``status`` (abby pass-4
+    batch 2). Matches the RELEASE.md claim that "any other command"
+    triggers the detection hook."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    store.set_active_state({}, {})
+
+    record = _RescanOp.model_validate(
+        {
+            "op": "rescan",
+            "started_at": _now(),
+            "target_ids": ["claude"],
+            "target_profiles": {"claude": "2026-05-12-rescan-1"},
+            "into_mode": False,
+            "previous_tools": None,
+            "mappings": [],
+        }
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    r = _run(readonly_cmd, tmp_home, tmp_state)
+    assert r.returncode == 3, (
+        f"expected exit 3 from {readonly_cmd!r}, got {r.returncode}; "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    )
+    combined = _flatten(r.stdout + r.stderr)
+    assert "Interrupted `switcher rescan`" in combined
+    assert "switcher rescan --continue" in combined
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
 def test_status_surfaces_interrupted_rescan_with_exit_3(tmp_home: Path, tmp_state: Path) -> None:
     """Read-only command surfaces in-flight rescan as exit 3 + hint
     naming the new flags."""
@@ -522,9 +558,41 @@ def test_use_refuses_with_in_flight_init(tmp_home: Path, tmp_state: Path) -> Non
 
     r = _run(["use", "vanilla"], tmp_home, tmp_state)
     assert r.returncode == 1, f"expected exit 1, got {r.returncode}"
-    combined = r.stdout + r.stderr
+    combined = _flatten(r.stdout + r.stderr)
     assert "Interrupted `switcher init`" in combined
     assert "switcher init --continue" in combined
+    # Mutating refusal must not have changed state.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_use_refuses_with_in_flight_rescan(tmp_home: Path, tmp_state: Path) -> None:
+    """Symmetric to the init refusal: a mutating command (here:
+    ``switcher use``) refuses with exit 1 + recovery hint when an
+    in-flight rescan is detected. Without this coverage, a regression
+    that only wires the in-flight-init refusal to mutating commands
+    would slip through the suite (abby pass-4 batch 2)."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {"claude": True})
+    store.set_active_state({"claude": "vanilla"}, {})
+
+    record = _RescanOp.model_validate(
+        {
+            "op": "rescan",
+            "started_at": _now(),
+            "target_ids": ["claude"],
+            "target_profiles": {"claude": "2026-05-12-rescan-1"},
+            "into_mode": False,
+            "previous_tools": None,
+            "mappings": [],
+        }
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    r = _run(["use", "vanilla"], tmp_home, tmp_state)
+    assert r.returncode == 1, f"expected exit 1, got {r.returncode}"
+    combined = _flatten(r.stdout + r.stderr)
+    assert "Interrupted `switcher rescan`" in combined
+    assert "switcher rescan --continue" in combined
     # Mutating refusal must not have changed state.
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
