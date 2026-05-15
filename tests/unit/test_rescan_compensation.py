@@ -859,6 +859,46 @@ def test_abort_short_circuits_when_already_completed(
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_abort_into_mode_refuses_when_target_profile_missing(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """abby pass-2 blocker: ``_compensate_rescan_abort`` must refuse
+    upfront when the --into target profile is missing — abort doesn't
+    own recreating it, and without an explicit guard the validation
+    pass falls through, per-mapping mutation runs, and the cleanup
+    pass's ``update_profile_tools`` raises UnknownProfileError
+    mid-mutation. Symmetric to the continue path's existing check."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    store.set_active_state({}, {})
+
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+
+    # NO ``shared`` profile created — earliest possible crash window for
+    # an --into rescan (intent landed, ``_capture_tool_for_rescan`` never
+    # ran). target_profiles still references it.
+    assert not store.profile_dir("shared").exists()  # precondition
+
+    record = _make_rescan_record(
+        target_ids=["claude"],
+        target_profiles={"claude": "shared"},
+        into_mode=True,
+        previous_tools={"shared": {"existing-tool": True}},
+        mappings=[_claude_mapping(tmp_home, "real-dir")],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="shared"):
+        service.rescan(abort=True)
+
+    # No mutation: live state untouched, target profile still missing,
+    # journal still in flight.
+    assert not claude_live.exists()
+    assert not store.profile_dir("shared").exists()
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
 def test_abort_into_mode_untouched_does_not_delete_target_profile(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:

@@ -1991,6 +1991,21 @@ class ProfileService:
                     f"interrupted rescan abort: {name!r} profile at {p} exists "
                     f"but is not a directory; manual recovery required"
                 )
+            # --into target-profile existence guard (abby pass-2 blocker,
+            # symmetric to the continue path's check). A missing --into
+            # target at abort time is corruption: the profile pre-existed
+            # before rescan, this abort doesn't own recreating it. Without
+            # this gate, validation would fall through, per-mapping
+            # mutation would run, and the cleanup pass's
+            # update_profile_tools would raise UnknownProfileError mid-
+            # mutation — exactly the half-applied state the validate-then-
+            # mutate discipline exists to prevent.
+            if record.into_mode and not p.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: --into target profile "
+                    f"{name!r} at {p} is missing — refusing to act on a "
+                    f"profile the rescan didn't own. Manual recovery required."
+                )
             if p.is_dir():
                 try:
                     existing_profile = self._store.get(name)
