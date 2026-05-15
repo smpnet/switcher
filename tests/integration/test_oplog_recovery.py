@@ -212,6 +212,44 @@ def test_interrupted_init_abort_via_subprocess(tmp_home: Path, tmp_state: Path) 
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+@pytest.mark.parametrize("readonly_cmd", [["status"], ["list"], ["which", "claude"]])
+def test_readonly_commands_surface_interrupted_init_with_exit_3(
+    tmp_home: Path, tmp_state: Path, readonly_cmd: list[str]
+) -> None:
+    """Spec §2.2: the detection hook runs at the top of EVERY command
+    callback, not just ``status``. RELEASE.md says interrupted init/
+    rescan are surfaced by "``switcher status`` (and any other command)"
+    — abby pass-3 batch 2: explicit coverage for multiple read-only
+    commands guards against a regression that wires the hook to only
+    one entry point. Each parametrized command must produce exit 3
+    with the recovery hint."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    store.set_active_state({}, {})
+
+    record = _InitOp.model_validate(
+        {
+            "op": "init",
+            "started_at": _now(),
+            "target_ids": ["claude"],
+            "profile_name": "2026-05-12-current",
+            "mappings": [],
+        }
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    r = _run(readonly_cmd, tmp_home, tmp_state)
+    assert r.returncode == 3, (
+        f"expected exit 3 from {readonly_cmd!r}, got {r.returncode}; "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    )
+    combined = _flatten(r.stdout + r.stderr)
+    assert "Interrupted `switcher init`" in combined
+    assert "switcher init --continue" in combined
+    # Journal stays in flight — read-only hook MUST NOT mutate state.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
 def test_status_surfaces_interrupted_init_with_exit_3(tmp_home: Path, tmp_state: Path) -> None:
     """Read-only commands surface an in-flight init as exit 3 + hint
     text on stderr. The hint must name both recovery flags so the
