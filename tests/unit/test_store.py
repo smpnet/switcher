@@ -362,6 +362,55 @@ def test_set_active_alone_preserves_existing_active_live_paths(tmp_path: Path) -
     assert s.get_active_live_paths() == {"copilot": ["/p"]}
 
 
+def test_set_active_preserves_empty_cache_entries_for_zero_mapping_tools(
+    tmp_path: Path,
+) -> None:
+    """v0.1.5 carry-forward of the [] preservation contract.
+
+    A zero-mapping tool (registry entry with no ``config_dirs``)
+    serializes as ``cache[tid] = []`` on disk — clean init writes that
+    shape deliberately (see ``test_continue_serializes_empty_cache_entry_for_zero_mapping_tool``).
+
+    Active-only writes via the ``set_active`` wrapper MUST preserve
+    those entries. The wrapper previously round-tripped through the
+    normalizing reader ``get_active_live_paths`` which drops ``[]``
+    entries — flows like ``ProfileService.rename`` (which calls
+    ``set_active`` to update the active map after a profile rename)
+    would then silently erase the zero-mapping cache state every
+    other layer (init compensation, abort) is now careful to preserve.
+
+    CR pass-2 major finding.
+    """
+    state_dir = _bare_state(tmp_path)
+    s = FileProfileStore(state_dir)
+    # Pre-stage two interchangeable empty shapes:
+    # - "zero-mapping-tool": [] (modern shape)
+    # - "legacy-null-tool": None (legacy nullable shape that the raw
+    #   reader normalizes to [] for round-trip safety — exercise that
+    #   branch too so the null→[] compatibility path is covered when
+    #   set_active uses the raw reader). CR pass-6 nit.
+    s.set_active_state(
+        {"copilot": "A", "zero-mapping-tool": "B", "legacy-null-tool": "D"},
+        {"copilot": ["/p"], "zero-mapping-tool": []},
+    )
+    # Inject the legacy null directly so set_active_state's input-shape
+    # normalization (which only sees the typed dict[str, list[str]])
+    # doesn't strip it. Reading via raw normalizes the null to [].
+    config = json.loads((state_dir / "config.json").read_text(encoding="utf-8"))
+    config["active_live_paths"]["legacy-null-tool"] = None
+    (state_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    # Active-only wrapper write (e.g., rename re-pointing active entries).
+    s.set_active({"copilot": "A", "zero-mapping-tool": "C", "legacy-null-tool": "D"})
+    # Raw reader: [] preserved, legacy null normalized to [] (both
+    # entries survive instead of being silently dropped).
+    assert s.get_active_live_paths_raw() == {
+        "copilot": ["/p"],
+        "zero-mapping-tool": [],
+        "legacy-null-tool": [],
+    }
+
+
 def test_set_active_live_paths_alone_preserves_existing_active(tmp_path: Path) -> None:
     state_dir = _bare_state(tmp_path)
     s = FileProfileStore(state_dir)

@@ -16,9 +16,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
+from typing import Literal, overload
 
 from switcher.errors import (
+    AbortPreflightError,
     AlreadyLinkedError,
+    NoInProgressInitError,
     NothingToInitializeError,
     NoToolsManagedError,
     OpLogCorruptError,
@@ -27,6 +30,7 @@ from switcher.errors import (
     ProfileIsActiveError,
     PruneError,
     RescanCaptureError,
+    RescanInProgressError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
     StorageError,
@@ -44,7 +48,15 @@ from switcher.models import Profile, Tool
 # them as internal-to-switcher, not a user-facing surface). Service is the
 # legitimate cross-module consumer that builds and dispatches them; the
 # per-line suppression keeps the convention without leaking module-wide.
-from switcher.oplog import OpLogIO, _RenameOp  # pyright: ignore[reportPrivateUsage]
+from switcher.oplog import (
+    MappingDiskState,
+    OpLogIO,
+    _InitOp,  # pyright: ignore[reportPrivateUsage]
+    _MappingIntent,  # pyright: ignore[reportPrivateUsage]
+    _RenameOp,  # pyright: ignore[reportPrivateUsage]
+    _RescanOp,  # pyright: ignore[reportPrivateUsage]
+    classify_mapping,
+)
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import find_tool
 from switcher.store import ProfileStore
@@ -694,6 +706,19 @@ class ProfileService:
 
     # Operations ------------------------------------------------------------
 
+    # v0.1.5: callers using the default (compensation-flag-free) shape
+    # still get a non-None InitReport. The compensation branches return
+    # one of three shapes:
+    #   - InitAlreadyCompletedReport — short-circuit fired (journal
+    #     was committed but log-unmarked; mark_completed ran; no
+    #     compensation needed).
+    #   - None — compensation actually ran (continue replayed mappings
+    #     and step 6-7, or abort reversed mappings and cleaned up).
+    # The overload narrowing keeps existing tests like
+    # `service.init().profile_name` typing cleanly without per-site
+    # `assert is not None` noise; recovery callers (continue_=True /
+    # abort=True) get the three-shape union and must handle it.
+    @overload
     def init(
         self,
         target_ids: Sequence[str] | None = None,
@@ -701,8 +726,50 @@ class ProfileService:
         requested_but_not_installed: Sequence[str] = (),
         skipped_via_skip_flag: Sequence[str] = (),
         skipped_via_interactive: Sequence[str] = (),
-    ) -> InitReport:
+        continue_: Literal[False] = False,
+        abort: Literal[False] = False,
+    ) -> InitReport: ...
+
+    @overload
+    def init(
+        self,
+        target_ids: Sequence[str] | None = None,
+        *,
+        requested_but_not_installed: Sequence[str] = (),
+        skipped_via_skip_flag: Sequence[str] = (),
+        skipped_via_interactive: Sequence[str] = (),
+        continue_: bool = False,
+        abort: bool = False,
+    ) -> InitReport | InitAlreadyCompletedReport | None: ...
+
+    def init(
+        self,
+        target_ids: Sequence[str] | None = None,
+        *,
+        requested_but_not_installed: Sequence[str] = (),
+        skipped_via_skip_flag: Sequence[str] = (),
+        skipped_via_interactive: Sequence[str] = (),
+        continue_: bool = False,
+        abort: bool = False,
+    ) -> InitReport | InitAlreadyCompletedReport | None:
         """v0.1.4: target_ids filters which detected tools to capture.
+
+        **Return-shape note (v0.1.5):** the default path returns an
+        ``InitReport`` as before. The recovery path
+        (``continue_=True`` / ``abort=True``) returns one of:
+
+          - ``InitAlreadyCompletedReport`` — short-circuit fired
+            (journal was committed but log-unmarked; mark_completed
+            ran without invoking compensation). ``kind`` distinguishes
+            continue vs abort so the CLI can tailor the message.
+          - ``None`` — compensation actually ran (continue replayed
+            mappings and steps 6-7, or abort reversed mappings and
+            cleaned up active/cache).
+
+        The ``@overload`` above keeps the default-args call site
+        typed as ``-> InitReport``; direct callers that pass either
+        flag get ``-> InitReport | InitAlreadyCompletedReport | None``
+        and must handle the three-shape union explicitly.
 
         target_ids:
           None — capture every detected tool (v0.1.3 default-path behavior,
@@ -714,7 +781,117 @@ class ProfileService:
         The three keyword-only diff lists are pass-through informational
         fields populated by the CLI (which knows user intent). The service
         layer doesn't compute them; it echoes them back in the report.
+
+        v0.1.5: ``continue_`` / ``abort`` drive op-log compensation (spec
+        §2.2). Mutually exclusive; the CLI enforces the mutex AND the
+        mutex with ``--only`` / ``--skip`` / ``--interactive`` before
+        reaching the service. When either flag is set, the body reads
+        the in-flight ``_InitOp`` from the journal and dispatches to
+        ``_compensate_init_continue`` / ``_compensate_init_abort``.
+        The normal path writes an ``_InitOp`` intent record BEFORE
+        ``_store.create`` and marks it completed after the final
+        ``set_active_state``. A crash anywhere between leaves a record
+        the next CLI command's detection hook surfaces as
+        ``InitInProgressError`` (mutating) / exit 3 (read-only); the
+        user resolves via ``switcher init --continue`` / ``--abort``.
+
+        Type-routing for the recovery dispatch (continue/abort with
+        an in-flight op of a different kind):
+          - ``_RescanOp`` in flight → ``RescanInProgressError`` (route
+            user to ``switcher rescan --continue/--abort``).
+          - ``_RenameOp`` in flight → ``OpLogCorruptError`` (the CLI
+            detection hook auto-compensates rename on every other
+            command; reaching here means the hook never got to drain
+            it, e.g. a stale binary or hand-edited journal).
         """
+        # Defense-in-depth mutex (CLI enforces the same invariant ahead
+        # of get_deps; this guard catches direct callers — tests,
+        # alternative front-ends — that bypass the CLI layer). Silently
+        # falling through to the `continue_` branch would let a confused
+        # caller compensate-forward when they thought they were aborting.
+        # ValueError matches the "in-memory caller bug" shape, same as
+        # OpLogIO.append_record's completed-record rejection.
+        if continue_ and abort:
+            raise ValueError("init: continue_ and abort are mutually exclusive")
+        # Recovery scope comes from the in-flight journal record, NOT
+        # the call site — combining recovery flags with target_ids
+        # filtering or the informational diff lists would silently
+        # ignore the call-site args, leading a caller to believe
+        # recovery was scoped when it actually compensates the full
+        # journal entry. Refuse loudly. (CLI enforces this through
+        # typer's BadParameter; the service-layer guard is for direct
+        # callers — tests, alternate front-ends — that bypass the CLI.)
+        if (continue_ or abort) and (
+            target_ids is not None
+            or requested_but_not_installed
+            or skipped_via_skip_flag
+            or skipped_via_interactive
+        ):
+            raise ValueError(
+                "init: continue_/abort cannot be combined with target_ids, "
+                "requested_but_not_installed, skipped_via_skip_flag, or "
+                "skipped_via_interactive — recovery scope is taken from "
+                "the in-flight journal record, not the call site"
+            )
+
+        oplog = OpLogIO(self._store.state_dir())
+
+        if continue_ or abort:
+            in_flight = oplog.read_in_flight()
+            if in_flight is None:
+                raise NoInProgressInitError(
+                    "no interrupted init detected; nothing to continue/abort"
+                )
+            # Route the user to the matching command if the in-flight op
+            # is rescan rather than init — `switcher init --continue` on
+            # a rescan-in-flight would otherwise be silently rejected as
+            # "wrong type" without telling the user how to actually recover.
+            # PR4 ships init's --continue/--abort; rescan's matching flags
+            # land in PR5 (Phase 7), so the message stays version-agnostic
+            # (don't name flags the binary doesn't expose — CR pass-6 major,
+            # carry-forward of the PR3 abby blocking review).
+            if isinstance(in_flight, _RescanOp):
+                raise RescanInProgressError(
+                    "an interrupted rescan is in flight; guided recovery "
+                    "for rescan ships in a follow-on release. Manual "
+                    "recovery required on this switcher version."
+                )
+            # `_RenameOp` is auto-compensated by the CLI detection hook on
+            # every other command; reaching here with one in flight means
+            # the user invoked `switcher init --continue/--abort` against
+            # a journal the hook never got to drain (e.g. a stale binary).
+            # Refusing loudly is safer than running init compensation
+            # against a rename's residue.
+            if not isinstance(in_flight, _InitOp):
+                raise OpLogCorruptError(
+                    f"unexpected in-flight op type {type(in_flight).__name__}; "
+                    f"manual recovery required"
+                )
+            if self._check_init_already_completed(in_flight):
+                # Spec §2.2 "committed but log-unmarked" — the original
+                # init's work is fully visible on disk; mark the record
+                # completed without running any per-mapping mutation.
+                # Surface the short-circuit as a distinct return shape
+                # so the CLI can disambiguate between actual
+                # compensation (None) and journal-cleanup-only
+                # (InitAlreadyCompletedReport). Critical for the
+                # abort path: without this, `init --abort` on an
+                # already-committed init looks identical to a
+                # successful rollback while the init is actually still
+                # in place — the user would need `switcher uninstall`
+                # to reverse it.
+                oplog.mark_completed(in_flight)
+                return InitAlreadyCompletedReport(
+                    profile_name=in_flight.profile_name,
+                    kind="continue" if continue_ else "abort",
+                )
+            if continue_:
+                self._compensate_init_continue(in_flight)
+            else:
+                self._compensate_init_abort(in_flight)
+            oplog.mark_completed(in_flight)
+            return None
+
         if self._store.list():
             raise StateAlreadyInitializedError("switcher is already initialized")
         installed = self.detect_installed()
@@ -752,7 +929,95 @@ class ProfileService:
                         f"{live} exists but is not a directory; cannot initialize"
                     )
         current_name = now().strftime("%Y-%m-%d") + "-current"
-        self._store.create(current_name, {t.id: True for t in installed})
+
+        # v0.1.5: build the intent record BEFORE any FS mutation. live_path
+        # goes through `os.path.normpath` after `PathResolver.expand()` so
+        # `..` segments fold out — the journal's `AbsolutePath` validator
+        # rejects them, and a registry-side path with `..` would otherwise
+        # only surface as a load-time corruption error on the recovery
+        # pass. original_kind derives from the same pre-flight observations
+        # the loop above just validated (link/file shapes are impossible
+        # here, so the assertion at the tail of the branch is a
+        # defense-in-depth barrier against future pre-flight drift).
+        mappings: list[_MappingIntent] = []
+        for tool in installed:
+            for i, dm in enumerate(tool.config_dirs):
+                live = self._resolver.tool_dir(tool, i)
+                if live.is_dir() and not self._resolver.is_link(live):
+                    original_kind = "real-dir"
+                elif not live.exists():
+                    original_kind = "missing"
+                else:
+                    raise AssertionError(
+                        f"unexpected pre-flight state for {live}: "
+                        f"is_link={self._resolver.is_link(live)}, "
+                        f"exists={live.exists()}, is_dir={live.is_dir()}"
+                    )
+                mappings.append(
+                    _MappingIntent.model_validate(
+                        {
+                            "tool_id": tool.id,
+                            "mapping_index": i,
+                            "live_path": os.path.normpath(str(live)),
+                            "profile_subdir": dm.profile_subdir,
+                            "original_kind": original_kind,
+                        }
+                    )
+                )
+        intent = _InitOp.model_validate(
+            {
+                "op": "init",
+                "started_at": now(),
+                "target_ids": [t.id for t in installed],
+                "profile_name": current_name,
+                "mappings": mappings,
+            }
+        )
+        oplog.append_record(intent)
+
+        # Pre-mutation cancel scope (mirrors service.rename): the first
+        # `_store.create(current_name, ...)` is the entry point to all FS
+        # mutation. The catch is narrow on purpose — ProfileExistsError
+        # is the ONLY exception we can prove leaves the disk
+        # untouched, so it's the only one safe to interpret as "the
+        # init never started":
+        #
+        #   - ProfileExistsError (CAUGHT): _store.create's first line
+        #     is `if self.profile_dir(name).exists(): raise`, before
+        #     any Profile model construction or mkdir. The disk is
+        #     untouched; the intent must be canceled or the next
+        #     command forces "compensate the init that never started".
+        #   - ValueError from Profile(name=current_name, ...) (NOT
+        #     caught): unreachable in practice — current_name is
+        #     `now().strftime("%Y-%m-%d") + "-current"` which always
+        #     passes Profile.name validation. Catching defensively
+        #     would obscure the unreachable-branch property.
+        #   - OSError from `d.mkdir(parents=True, exist_ok=True)`
+        #     (NOT caught): mid-mutation. `parents=True` means mkdir
+        #     can succeed at intermediate dirs before failing at the
+        #     target, leaving partial FS state. Cancelling the intent
+        #     here would drop the recovery record for a state that
+        #     genuinely needs it. Mirrors rename's `OSError` posture
+        #     (set_active failure inside store.rename preserves the
+        #     intent for the same reason).
+        #   - OSError from _atomic_write inside _store.create (NOT
+        #     caught): create's own try/finally runs shutil.rmtree(d,
+        #     ignore_errors=True) on this path — `ignore_errors=True`
+        #     means d MAY remain on partial cleanup failure. Treat
+        #     as potentially-mid-mutation and preserve intent.
+        #
+        # Suppression scope matches rename's: best-effort on
+        # StorageError (if the same FS error broke both store.create
+        # and cancel_intent's tmp+rename write, prefer the original
+        # ProfileExistsError so the user sees the root cause);
+        # OpLogCorruptError propagates as a race-on-the-journal-itself
+        # signal that must surface loudly.
+        try:
+            self._store.create(current_name, {t.id: True for t in installed})
+        except ProfileExistsError:
+            with contextlib.suppress(StorageError):
+                oplog.cancel_intent(intent)
+            raise
         live_paths_cache: dict[str, list[str]] = {}
         for tool in installed:
             live_paths_cache[tool.id] = self._capture_tool(current_name, tool)
@@ -763,6 +1028,11 @@ class ProfileService:
         # set_active_live_paths separately (crash window).
         active = {t.id: current_name for t in installed}
         self._store.set_active_state(active, live_paths_cache)
+
+        # v0.1.5: mark the intent record completed. The next CLI command's
+        # vacuum drops it.
+        oplog.mark_completed(intent)
+
         return InitReport(
             profile_name=current_name,
             captured=[t.id for t in installed],
@@ -770,6 +1040,631 @@ class ProfileService:
             skipped_via_skip_flag=list(skipped_via_skip_flag),
             skipped_via_interactive=list(skipped_via_interactive),
         )
+
+    @staticmethod
+    def _expected_nonempty_live_paths(record: _InitOp) -> dict[str, list[str]]:
+        """Group ``record.mappings`` by tool_id and produce the
+        sorted-by-mapping_index live_path list per tool — the journal's
+        expected non-empty cache slice. Shared between two callers
+        whose invariants must stay aligned:
+
+          - ``_check_init_already_completed`` compares this against
+            ``get_active_live_paths`` (which normalizes [] to absent,
+            so the dict-equality check matches exactly).
+          - ``_compensate_init_continue`` overlays this on top of a
+            ``{tid: [] for tid in target_ids}`` seed to build the full
+            cache for ``set_active_state``.
+
+        Extracted (abby-review pass-10 readability note) so the
+        recovery invariants stay readable and the two call sites
+        can't drift out of sync.
+        """
+        by_tool: dict[str, list[tuple[int, str]]] = {}
+        for mapping in record.mappings:
+            by_tool.setdefault(mapping.tool_id, []).append(
+                (mapping.mapping_index, mapping.live_path)
+            )
+        return {tid: [p for _, p in sorted(entries)] for tid, entries in by_tool.items()}
+
+    def _check_init_already_completed(self, record: _InitOp) -> bool:
+        """Return True ONLY if every observable post-init invariant
+        holds on disk: both profile dirs are real directories, every
+        mapping classifies COMPLETE, ``active`` covers target_ids,
+        AND ``active_live_paths`` matches the journal's expected
+        shape per-target.
+
+        Spec §2.2 "committed but log-unmarked" path — a crash between
+        the final ``set_active_state`` and ``mark_completed`` leaves
+        the disk consistent but the journal stale. Continue/abort
+        against this state should be a no-op apart from marking the
+        record completed.
+
+        Vanilla is part of the init workflow (step 6 in the normal
+        path), so a missing-or-corrupt vanilla profile means the work
+        ISN'T fully complete — the short-circuit must NOT fire there,
+        or continue would mark the journal completed and skip the
+        vanilla-recovery step. Falling through to
+        ``_compensate_init_continue`` re-creates a missing vanilla and
+        re-runs credential seeding; falling through to
+        ``_compensate_init_abort`` surfaces a corrupt vanilla as
+        OpLogCorruptError in its validation pass.
+
+        ``active_live_paths`` is verified against the journal's
+        per-target expectations too — without that check, a missing
+        / stale cache entry would short-circuit and permanently skip
+        the cache-rebuild step ``_compensate_init_continue`` would
+        run. ``[]`` cache entries are normalized to "absent" at
+        ``get_active_live_paths`` read time, so the comparison is
+        against the post-normalization view (non-empty entries only,
+        matching the journal's grouped live_paths_by_tool).
+
+        The profile-dir checks reject link shapes too: ``is_dir()``
+        follows symlinks, so a symlink-to-dir at either profile path
+        satisfies it alone — without the explicit ``is_link`` refusal
+        we'd bless an externally-mutated profile shape as healthy.
+
+        Metadata readability for BOTH profiles (CR pass-5/6 + abby
+        pass-7 blocker carry-forward): ``_store.get`` must return a
+        valid Profile for ``record.profile_name`` AND ``vanilla``.
+        Without this check, a rmtree-silent-failure window during
+        ``_store.create("...")`` could leave a dir without metadata
+        while every OTHER invariant holds (mapping classifier sees
+        COMPLETE, set_active_state succeeded), so the short-circuit
+        would mark_completed and clear the recovery record on a
+        secretly-broken state.
+
+        Vanilla AND dated-current both checked here. The empty-
+        leftover repair path in ``_compensate_init_continue`` handles
+        vanilla recovery (``_store.delete + _store.create``). The
+        dated-current profile holds user data captured from live
+        dirs and CANNOT be regenerated by compensation, but failing
+        the short-circuit still helps: it keeps the journal record
+        in flight so the user can manually delete the broken dir
+        and re-run init. Without the short-circuit gate, the journal
+        would clear and the user would hit ``UnknownProfileError``
+        on the next ``switcher use`` with no recovery path left.
+        """
+        expected_tools = dict.fromkeys(record.target_ids, True)
+        for name in (record.profile_name, "vanilla"):
+            p = self._store.profile_dir(name)
+            if self._resolver.is_link(p) or not p.is_dir():
+                return False
+            try:
+                profile = self._store.get(name)
+            except (UnknownProfileError, StorageError):
+                return False
+            # Tools-equality gate (Hermes pass-PR-3 blocker): the
+            # compensation paths refuse on foreign profiles, but
+            # bypassing them via the short-circuit would let the
+            # journal clear while persisted ``.tools`` stays foreign.
+            # Mirror the check both compensation paths apply: a
+            # mismatch means this directory is NOT the journal-owned
+            # profile, so short-circuit can't fire — falling through
+            # to compensation lets the user see the same loud refusal
+            # they'd get on any other recovery path.
+            if profile.tools != expected_tools:
+                return False
+        profile_dir = self._store.profile_dir(record.profile_name)
+        for intent in record.mappings:
+            if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
+                return False
+        # Active invariant: dict equality, not subset. A clean init's
+        # `set_active_state(active, ...)` REPLACES the active map with
+        # `{tid: profile_name for tid in target_ids}` — no leftover
+        # keys. An extra entry on disk (e.g., a stale entry from a
+        # previous init that didn't get cleaned up, or external
+        # mutation since intent) is drift; short-circuiting would mark
+        # the journal completed and let the stale entry survive
+        # indefinitely. The check mirrors the cache invariant below;
+        # both maps come out of the same atomic set_active_state
+        # write, so they should have the same exactness contract.
+        expected_active = dict.fromkeys(record.target_ids, record.profile_name)
+        if self._store.get_active() != expected_active:
+            return False
+        # Cache invariant: actual_cache must equal the journal's
+        # expected non-empty slice exactly. Dict equality catches both
+        # missing-key and stale-value drift (a zero-mapping tool with
+        # a stale non-empty cache value would otherwise short-circuit
+        # under a per-key subset check). `get_active_live_paths`
+        # normalizes [] to absent at read time, so the post-read view
+        # of a clean init's cache equals exactly the non-empty slice.
+        expected_nonempty = self._expected_nonempty_live_paths(record)
+        return self._store.get_active_live_paths() == expected_nonempty
+
+    def _compensate_init_continue(self, record: _InitOp) -> None:
+        """Replay any non-COMPLETE mapping per the §2.1.1 continue
+        dispatch table, then finish steps 6-7 (vanilla profile +
+        active map). See spec §2.2.
+
+        First pass: refuse on any AMBIGUOUS mapping. The classifier's
+        AMBIGUOUS state covers data-in-two-places, link-to-wrong-target,
+        and shape drift relative to the recorded ``original_kind`` —
+        anything we'd be guessing at. Refusing keeps the corruption
+        boundary fail-fast.
+
+        Second pass dispatches per mapping: COMPLETE skips,
+        MOVE_DONE_LINK_MISSING runs only swap_link, UNTOUCHED runs the
+        full move_or_seed_dir + swap_link pair.
+
+        Steps 6-7 always run unconditionally because the
+        "already-completed" short-circuit (handled by
+        ``_check_init_already_completed``) ran before this method was
+        called. Reaching this method means at least one mapping needed
+        forward progress, or the active map didn't yet cover
+        target_ids; running the per-tool seed + active-map writes is
+        idempotent on already-complete data anyway.
+
+        **Active/cache REPLACE contract.** Step 7's
+        ``set_active_state`` writes the FULL active map and live-paths
+        cache derived from ``record.target_ids`` — same shape a clean
+        init produces. Any unrelated existing entries in ``active`` or
+        ``active_live_paths`` (drift from external mutation since
+        intent, residue from a prior partially-cleaned run, etc.) are
+        REPLACED, not merged. This intentional asymmetry with
+        ``_compensate_init_abort`` — which clears only
+        ``record.target_ids``-owned entries and preserves external
+        state — reflects the spec's "abort surfaces externally-mutated
+        state for inspection" vs. "continue commits the journal's
+        recorded intent" stance.
+        """
+        profile_dir = self._store.profile_dir(record.profile_name)
+        vanilla_dir = self._store.profile_dir("vanilla")
+
+        # Preflight config.json BEFORE any FS mutation (Hermes pass-PR-1
+        # blocker, symmetric to _compensate_init_abort's pass-7 fix).
+        # Compensation's tail-end ``set_active_state`` loads config.json
+        # via ``_load_config``; a malformed config.json would raise
+        # StorageError there, but only AFTER replaying mappings
+        # (move_or_seed_dir, swap_link), creating/regenerating vanilla,
+        # and reseeding credentials. The half-applied state (live
+        # converted to a managed link, journal still in flight) is
+        # exactly what the abort-side preflight was designed to avoid.
+        # An early read forces the parse so corruption surfaces before
+        # any destructive work runs.
+        self._store.get_active()
+
+        # First-pass validation (no FS mutation). Two checks, both
+        # MUST run before any per-mapping mutation — otherwise a
+        # corrupt vanilla profile dir would only surface AFTER live
+        # symlinks had already been swapped, leaving partial state.
+        # Profile-dir invariant: every profile path is either a real
+        # directory or absent. A symlink / junction / file at a
+        # profile path is corruption (would let _seed_credentials or
+        # _store.create write into / through external state).
+        for name, p in ((record.profile_name, profile_dir), ("vanilla", vanilla_dir)):
+            if self._resolver.is_link(p):
+                raise OpLogCorruptError(
+                    f"interrupted init continue: {name!r} profile at {p} is a "
+                    f"symlink or junction, not a real profile directory; "
+                    f"manual recovery required"
+                )
+            if p.exists() and not p.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted init continue: {name!r} profile at {p} exists "
+                    f"but is not a directory; manual recovery required"
+                )
+        # Current-profile metadata refusal (abby pass-10 blocker).
+        # Without this, a state where mappings classify COMPLETE but
+        # record.profile_name's metadata.json is missing/corrupt
+        # would run idempotent no-op compensation and mark_completed,
+        # clearing the journal and leaving the user dead-ended on
+        # the next `switcher use` (UnknownProfileError, no recovery
+        # record left). Refuse loudly so the journal stays in flight
+        # and the user can manually delete the broken dir + retry.
+        # Vanilla's metadata IS handled by the empty-leftover repair
+        # path below — we can regenerate vanilla (no user data); we
+        # CANNOT regenerate the dated-current profile (user data
+        # captured from live dirs).
+        if profile_dir.is_dir():
+            try:
+                existing_profile = self._store.get(record.profile_name)
+            except (UnknownProfileError, StorageError) as e:
+                raise OpLogCorruptError(
+                    f"interrupted init continue: profile {record.profile_name!r} "
+                    f"at {profile_dir} is present but metadata.json is missing "
+                    f"or unreadable ({e}); compensation cannot regenerate the "
+                    f"profile (it captured user data from live dirs). "
+                    f"Manual recovery required: delete {profile_dir} and "
+                    f"re-run `switcher init --continue`."
+                ) from e
+            # Foreign-profile refusal (Hermes pass-PR-2 blocker): a
+            # readable profile dir at the recovery pathname is only
+            # journal-owned if its .tools matches dict.fromkeys(
+            # record.target_ids, True) — what a clean init would have
+            # written. Otherwise this directory belongs to some other
+            # init / hand-edited journal / race scenario; silently
+            # adopting it would write active = {tid: profile_name}
+            # while store.get(profile_name).tools says otherwise.
+            expected_tools = dict.fromkeys(record.target_ids, True)
+            if existing_profile.tools != expected_tools:
+                raise OpLogCorruptError(
+                    f"interrupted init continue: profile {record.profile_name!r} "
+                    f"at {profile_dir} has tools={existing_profile.tools!r} but "
+                    f"the journal expects {expected_tools!r}; refusing to "
+                    f"adopt a foreign profile. Manual recovery required."
+                )
+        for intent in record.mappings:
+            target = profile_dir / intent.profile_subdir
+            # Per-target shape refusal. `classify_mapping` returns
+            # AMBIGUOUS for link-shape targets (target_is_real_dir
+            # excludes them, target_missing excludes them, so the
+            # classifier falls to its final AMBIGUOUS branch) — the
+            # explicit check below gives a clearer error for that
+            # case and documents the corruption boundary at the
+            # mutation site rather than relying on a fall-through.
+            # Without this, a future refactor that adds a new
+            # classifier state could miss the AMBIGUOUS catch and
+            # let `move_or_seed_dir(target, ...)` or `swap_link(target,
+            # live)` operate on a path that escapes the profile store.
+            if self._resolver.is_link(target):
+                raise OpLogCorruptError(
+                    f"interrupted init continue: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} is "
+                    f"a symlink or junction, not a real profile "
+                    f"subdirectory; manual recovery required"
+                )
+            if target.exists() and not target.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted init continue: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} "
+                    f"exists but is not a directory; manual recovery required"
+                )
+            state = classify_mapping(intent, profile_dir)
+            if state is MappingDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init: mapping {intent.tool_id!r}."
+                    f"{intent.mapping_index} at {intent.live_path!r}: "
+                    f"on-disk state is ambiguous; manual recovery "
+                    f"required — see docs/RELEASE.md"
+                )
+
+        # Deferred profile-dir create (Hermes pass-PR-2 blocker):
+        # the earliest crash window (intent landed, first _store.create
+        # never ran) leaves profile_dir absent. Recreating BEFORE the
+        # per-mapping validation loop above would let a refused
+        # validation (e.g., AMBIGUOUS mapping due to externally-
+        # recreated live) leave a fresh metadata.json behind, breaking
+        # the "validate then mutate" guarantee. Defer until the
+        # validation loop has cleared every mapping; this is the
+        # last gate before the mutation pass below.
+        if not profile_dir.is_dir():
+            self._store.create(record.profile_name, dict.fromkeys(record.target_ids, True))
+
+        # Second pass: per-mapping dispatch.
+        for intent in record.mappings:
+            state = classify_mapping(intent, profile_dir)
+            target = profile_dir / intent.profile_subdir
+            live = Path(intent.live_path)
+            if state is MappingDiskState.COMPLETE:
+                continue
+            if state is MappingDiskState.MOVE_DONE_LINK_MISSING:
+                swap_link(target, live)
+                continue
+            if state is MappingDiskState.UNTOUCHED:
+                move_or_seed_dir(live, target)
+                swap_link(target, live)
+                continue
+            # AMBIGUOUS was caught in the first-pass scan; reaching here
+            # would mean the classifier's state set drifted out from
+            # under us. Defensive AssertionError surfaces the bug
+            # loudly rather than letting compensation continue against
+            # an unknown state.
+            raise AssertionError(f"unhandled mapping state {state}")
+
+        # Step 6: vanilla profile + credential seeding. Shape of
+        # vanilla_dir was already validated in the first-pass scan; a
+        # symlink / file at profiles/vanilla raised OpLogCorruptError
+        # before any mutation ran. Idempotent on a vanilla profile
+        # that already exists (e.g. init crashed AFTER vanilla
+        # creation but BEFORE set_active_state).
+        #
+        # Empty-leftover repair (CR pass-3 major): a mkdir-only
+        # leftover from a ``_store.create("vanilla", ...)`` failure
+        # whose ``shutil.rmtree(d, ignore_errors=True)`` rollback was
+        # silenced (rare Windows file-lock window) leaves the dir
+        # without metadata.json. Treat empty dirs as "needs
+        # regeneration" — delete + recreate through the canonical
+        # store API. Dirs with content but no metadata are too risky
+        # to overwrite (could nuke user data); surface those as
+        # OpLogCorruptError so the user manually inspects. Validating
+        # vanilla as a profile (not just a directory) is the narrower
+        # form of CR's pass-2 metadata concern — scoped here because
+        # compensation CAN heal vanilla (we own its content) but
+        # CANNOT regenerate the dated-current profile (holds user
+        # data captured from live dirs).
+        if not vanilla_dir.is_dir():
+            self._store.create("vanilla", dict.fromkeys(record.target_ids, True))
+        else:
+            try:
+                existing_vanilla = self._store.get("vanilla")
+            except (UnknownProfileError, StorageError) as e:
+                # Empty leftover: safe to delete + recreate.
+                if not any(vanilla_dir.iterdir()):
+                    self._store.delete("vanilla")
+                    self._store.create("vanilla", dict.fromkeys(record.target_ids, True))
+                else:
+                    raise OpLogCorruptError(
+                        f"interrupted init continue: 'vanilla' profile at "
+                        f"{vanilla_dir} has no readable metadata.json but "
+                        f"contains other files; refusing to overwrite. "
+                        f"Manual recovery required: inspect {vanilla_dir} "
+                        f"and either delete it or restore metadata.json "
+                        f"before re-running `switcher init --continue`."
+                    ) from e
+            else:
+                # Foreign-vanilla refusal (CR pass-PR-3 major): mirror
+                # the dated-current branch's tools-equality check.
+                # Without it, _seed_credentials would write into a
+                # vanilla whose .tools doesn't list this init's
+                # target_ids — clobbering foreign credentials and
+                # leaving metadata that disagrees with the seeded
+                # content. Abort's symmetric refusal is in
+                # _compensate_init_abort's validation loop.
+                expected_vanilla_tools = dict.fromkeys(record.target_ids, True)
+                if existing_vanilla.tools != expected_vanilla_tools:
+                    raise OpLogCorruptError(
+                        f"interrupted init continue: 'vanilla' profile at "
+                        f"{vanilla_dir} has tools={existing_vanilla.tools!r} "
+                        f"but the journal expects {expected_vanilla_tools!r}; "
+                        f"refusing to adopt a foreign profile. Manual "
+                        f"recovery required."
+                    )
+        for tid in record.target_ids:
+            tool = find_tool(self._registry, tid)
+            if tool is None:
+                continue
+            self._seed_credentials(record.profile_name, "vanilla", tool)
+
+        # Step 7: active map + live-paths cache, one atomic write. Both
+        # maps cover the SAME set — `record.target_ids` — so the
+        # serialized state matches the shape a clean init would write:
+        #
+        #   - `active` carries every target_id (orphans whose tool
+        #     registration vanished between intent and recovery
+        #     included). The on-disk symlink the compensation step
+        #     already swapped exists regardless of registry state;
+        #     the active map must stay consistent with that observation.
+        #     Same orphan-tolerance contract rename uses.
+        #
+        #   - `live_paths_cache` is keyed by every target_id with `[]`
+        #     defaults so a registry-only tool (zero ``config_dirs``,
+        #     zero mappings) serializes as ``cache[tid] = []`` —
+        #     matching the normal init path where ``_capture_tool``
+        #     returns ``[]`` for those tools. Per-mapping live_paths
+        #     come from the journal (not the resolver) so orphans keep
+        #     the live_path snapshot the resolver can no longer
+        #     reproduce, sorted by ``mapping_index`` to match
+        #     ``tool.config_dirs`` ordering.
+        #
+        # Mismatched-coverage (active populated, cache key missing) was
+        # the asymmetric-state failure mode for both the orphan-tool
+        # and the zero-config_dirs cases — keep both maps anchored on
+        # ``target_ids``.
+        live_paths_cache: dict[str, list[str]] = {tid: [] for tid in record.target_ids}
+        live_paths_cache.update(self._expected_nonempty_live_paths(record))
+        active = dict.fromkeys(record.target_ids, record.profile_name)
+        self._store.set_active_state(active, live_paths_cache)
+
+    def _compensate_init_abort(self, record: _InitOp) -> None:
+        """Reverse every COMPLETE / MOVE_DONE_LINK_MISSING mapping per
+        the §2.1.1 abort-dispatch table, then drop the partial profile
+        dirs. See spec §2.2.
+
+        Two-pass model. The VALIDATION pass classifies every mapping
+        AND checks every abort precondition (AMBIGUOUS refusal,
+        ``original_kind`` in {"link","file"} defensive refusal,
+        ``original_kind == "missing"`` empty-target write-through
+        guard); no filesystem mutation runs in this pass. The MUTATION
+        pass only starts after every mapping cleared validation.
+
+        The two-pass discipline is the key correctness invariant: if
+        mapping[0] is reversible and mapping[1] is
+        ``original_kind="missing"`` with a non-empty target
+        (write-through scenario), the empty-target check on mapping[1]
+        must fail BEFORE mapping[0]'s reversal runs. A naive
+        classify-and-mutate loop would partially mutate before
+        discovering the ambiguity — exactly the failure mode the
+        consultant flagged in spec §2.1.1.
+
+        Profile-delete runs only after the validation+mutation passes
+        both completed cleanly. ``vanilla`` is dropped too: init's
+        pre-flight requires ``_store.list()`` to be empty, so any
+        ``vanilla`` profile on disk at abort time was created by this
+        crashed run.
+        """
+        profile_dir = self._store.profile_dir(record.profile_name)
+        vanilla_dir = self._store.profile_dir("vanilla")
+
+        # Preflight config.json BEFORE any FS mutation (CR pass-7
+        # major). The active-map / cache cleanup at the tail reads
+        # these maps to strip target_ids and rewrite. If config.json
+        # is malformed, that read raises StorageError — but at the
+        # tail position, abort would already have restored live dirs
+        # and deleted profile dirs, leaving the disk half-recovered
+        # and the journal still in flight. Reading early surfaces the
+        # corruption BEFORE any destructive work runs, so the user
+        # can fix config.json and re-run cleanly.
+        active_snapshot = self._store.get_active()
+        cache_snapshot = self._store.get_active_live_paths_raw()
+
+        # VALIDATION pass. No FS mutation; states cached by index.
+        # Profile-dir shape check runs FIRST so a corrupt vanilla /
+        # dated-current path can't slip through to the per-mapping
+        # mutation pass. The profile-store invariant is "profile_dir
+        # is a real directory"; a symlink / junction / file at a
+        # profile path would let `_store.delete`'s `shutil.rmtree`
+        # follow the symlink and trash unrelated data.
+        for name, p in ((record.profile_name, profile_dir), ("vanilla", vanilla_dir)):
+            if self._resolver.is_link(p):
+                raise OpLogCorruptError(
+                    f"interrupted init abort: {name!r} profile at {p} is a "
+                    f"symlink or junction, not a real profile directory; "
+                    f"manual recovery required"
+                )
+            if p.exists() and not p.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted init abort: {name!r} profile at {p} exists "
+                    f"but is not a directory; manual recovery required"
+                )
+            # Foreign-profile refusal (Hermes pass-PR-2 blocker): abort
+            # mutation deletes both profile dirs via ``_store.delete``
+            # (= ``shutil.rmtree``). If a foreign profile occupies
+            # either pathname (different .tools from what this init
+            # would have written), the rmtree would be a data-loss
+            # path. A clean init writes both dated-current AND vanilla
+            # with tools=dict.fromkeys(record.target_ids, True), so
+            # any mismatch indicates a hand-edited journal / race /
+            # cancel_intent failure. Refuse loudly so the user
+            # manually inspects and decides whether to delete.
+            if p.is_dir():
+                try:
+                    existing_profile = self._store.get(name)
+                except (UnknownProfileError, StorageError) as e:
+                    raise OpLogCorruptError(
+                        f"interrupted init abort: {name!r} profile at {p} is "
+                        f"present but metadata.json is missing or unreadable "
+                        f"({e}); refusing to rmtree without verifying ownership. "
+                        f"Manual recovery required."
+                    ) from e
+                expected_tools = dict.fromkeys(record.target_ids, True)
+                if existing_profile.tools != expected_tools:
+                    raise OpLogCorruptError(
+                        f"interrupted init abort: {name!r} profile at {p} has "
+                        f"tools={existing_profile.tools!r} but the journal "
+                        f"expects {expected_tools!r}; refusing to delete a "
+                        f"foreign profile. Manual recovery required."
+                    )
+        states: dict[int, MappingDiskState] = {}
+        for i, intent in enumerate(record.mappings):
+            target = profile_dir / intent.profile_subdir
+            # Per-target shape refusal — same defense-in-depth as
+            # _compensate_init_continue's first-pass. `shutil.rmtree`
+            # raises on a symlink at the top level (Python docs:
+            # "If path is a symbolic link, an OSError is raised"),
+            # but documenting the corruption boundary explicitly
+            # protects against future primitive substitutions.
+            if self._resolver.is_link(target):
+                raise OpLogCorruptError(
+                    f"interrupted init abort: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} is "
+                    f"a symlink or junction, not a real profile "
+                    f"subdirectory; manual recovery required"
+                )
+            if target.exists() and not target.is_dir():
+                raise OpLogCorruptError(
+                    f"interrupted init abort: target {target} for "
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index} "
+                    f"exists but is not a directory; manual recovery required"
+                )
+            state = classify_mapping(intent, profile_dir)
+            if state is MappingDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init abort: mapping {intent.tool_id!r}."
+                    f"{intent.mapping_index} is ambiguous; refusing to "
+                    f"abort. Manual recovery required."
+                )
+            if state is MappingDiskState.UNTOUCHED:
+                states[i] = state
+                continue
+            # COMPLETE or MOVE_DONE_LINK_MISSING — check original_kind.
+            # _MappingIntent.original_kind is narrowed to
+            # {"missing","real-dir"} at the type level, but a
+            # hand-edited journal could carry "link" / "file" via
+            # model_construct (Pydantic's escape hatch) or a future
+            # schema bump — refuse defensively rather than mutate on
+            # an unrecognized value.
+            if intent.original_kind not in ("missing", "real-dir"):
+                raise AbortPreflightError(
+                    f"mapping {intent.tool_id!r}.{intent.mapping_index}: "
+                    f"pre-init state was {intent.original_kind!r}; "
+                    f"init pre-flight rejects this shape, so reaching it "
+                    f"at abort time means external drift since intent. "
+                    f"Refusing to abort defensively. Manual recovery required."
+                )
+            if intent.original_kind == "missing":
+                # Empty-target guard: a non-empty target subdir whose
+                # original live was "missing" means data was written
+                # through the symlink (or directly into target, in
+                # MOVE_DONE_LINK_MISSING state) between init and abort.
+                # Reclassify as corruption and refuse — silently
+                # deleting that data would defeat the journal's
+                # correctness role.
+                target = profile_dir / intent.profile_subdir
+                if target.is_dir() and any(target.iterdir()):
+                    raise OpLogCorruptError(
+                        f"abort would delete non-empty target {target} for "
+                        f"mapping {intent.tool_id!r}.{intent.mapping_index} "
+                        f"(original_kind='missing'): data may have been "
+                        f"written through the symlink. Manual recovery required."
+                    )
+            states[i] = state
+
+        # MUTATION pass. Every mapping cleared validation; safe to mutate.
+        for i, intent in enumerate(record.mappings):
+            state = states[i]
+            target = profile_dir / intent.profile_subdir
+            live = Path(intent.live_path)
+            if state is MappingDiskState.UNTOUCHED:
+                continue
+            if state is MappingDiskState.COMPLETE:
+                remove_link(live)
+                if intent.original_kind == "real-dir":
+                    move_or_seed_dir(target, live)
+                # Empty-target invariant already verified in the
+                # validation pass; `target.exists()` guards against a
+                # previous MUTATION-pass iteration removing it
+                # (shouldn't happen for distinct profile_subdir
+                # entries, defense in depth).
+                elif intent.original_kind == "missing" and target.exists():
+                    shutil.rmtree(target)
+            elif state is MappingDiskState.MOVE_DONE_LINK_MISSING:
+                if intent.original_kind == "real-dir":
+                    move_or_seed_dir(target, live)
+                elif intent.original_kind == "missing" and target.exists():
+                    # Defensive exists() guard mirrors the COMPLETE
+                    # branch above — protects against a target
+                    # disappearing between classification and mutation
+                    # (race / external removal). CR pass-10 nit.
+                    shutil.rmtree(target)
+
+        # Profile-delete. Both dated-current and vanilla — init
+        # pre-flight requires `_store.list()` to be empty, so any
+        # `vanilla` profile on disk at abort time was created by this
+        # crashed run. Shape of each profile dir was already validated
+        # in the VALIDATION pass; we only delete real-dir paths here
+        # (absent paths skip — a crash that never reached
+        # `_store.create("vanilla", ...)` doesn't have vanilla on disk).
+        if profile_dir.is_dir():
+            self._store.delete(record.profile_name)
+        if vanilla_dir.is_dir():
+            self._store.delete("vanilla")
+
+        # Active-map / cache cleanup. If init had progressed far
+        # enough to call `set_active_state`, the active map and the
+        # live_paths cache reference `record.profile_name` (and may
+        # have entries for every target_id). After abort restores
+        # the per-mapping live state and deletes the profile dirs,
+        # those active/cache entries would dangle: active claims
+        # management of a deleted profile, the cache holds a path
+        # that's no longer a switcher symlink. Clear ONLY the
+        # target_ids this run owns — external state outside the
+        # journal's target_ids snapshot stays untouched (mirrors
+        # rename's orphan-tolerance contract and respects the spec's
+        # "abort surfaces externally-mutated state for inspection"
+        # stance). `.pop(_, None)` is the safe idempotent form:
+        # tids that never landed in active/cache (crash before
+        # `set_active_state`) skip cleanly.
+        #
+        # Use the validation-pass snapshots (read BEFORE any FS
+        # mutation — CR pass-7 major). The raw cache reader preserves
+        # serialized `[]` entries that the normalizing reader would
+        # drop, so unrelated zero-mapping tools survive the rewrite —
+        # mirrors the spec's "abort surfaces externally-mutated state
+        # for inspection" stance.
+        for tid in record.target_ids:
+            active_snapshot.pop(tid, None)
+            cache_snapshot.pop(tid, None)
+        self._store.set_active_state(active_snapshot, cache_snapshot)
 
     def use(self, profile_name: str, only: list[str] | None = None) -> None:
         self._require_initialized()
@@ -1637,7 +2532,17 @@ class ProfileService:
         into: str | None = None,
         dry_run: bool = False,
     ) -> RescanReport:
-        """Capture newly-installed tools (spec §4)."""
+        """Capture newly-installed tools (spec §4).
+
+        v0.1.5 op-log integration: rescan does NOT yet write an
+        ``_RescanOp`` intent record — that wiring ships in PR5 / Phase 7
+        alongside ``--continue`` / ``--abort`` recovery flags. The CLI
+        detection hook still surfaces a hand-injected or
+        downgrade-stranded ``_RescanOp`` as ``RescanInProgressError``
+        (mutating) / exit 3 (read-only); the recovery surface points at
+        the forthcoming flags rather than executing compensation here.
+        Spec §2.2.
+        """
         self._require_initialized()
         active = self._store.get_active()
 
@@ -2089,6 +2994,31 @@ class InitReport:
     requested_but_not_installed: list[str]
     skipped_via_skip_flag: list[str]
     skipped_via_interactive: list[str]
+
+
+@dataclass(frozen=True)
+class InitAlreadyCompletedReport:
+    """Return shape of ``ProfileService.init(continue_=True | abort=True)``
+    when the journal record was already fully completed (committed but
+    log-unmarked) — spec §2.2 "committed but log-unmarked" path.
+
+    Surfaces the short-circuit case as a distinct return value so
+    the CLI can disambiguate between "compensation ran" (return None)
+    and "the journal was just cleaned up; the underlying init was
+    already on disk before the crash" (this report). Without this
+    distinction, ``init --abort`` would be a silent no-op on a
+    committed init — the user would think they reversed the init
+    when in fact the init is still in place.
+
+    profile_name: the dated-current profile the journal record was for.
+    kind: which recovery flag triggered the short-circuit. CLI tailors
+        the message; the abort variant points the user at
+        ``switcher uninstall`` if they actually want to reverse the
+        committed init.
+    """
+
+    profile_name: str
+    kind: Literal["continue", "abort"]
 
 
 @dataclass

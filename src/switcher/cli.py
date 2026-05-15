@@ -18,6 +18,7 @@ from rich.table import Table
 from switcher.errors import (
     InitInProgressError,
     NothingToInitializeError,
+    OpLogCorruptError,
     RescanInProgressError,
     StateAlreadyInitializedError,
     StateNotInitializedError,
@@ -40,7 +41,12 @@ from switcher.oplog import (
 )
 from switcher.paths import IS_WINDOWS, PathResolver
 from switcher.registry import build_registry, scaffold_tool
-from switcher.service import InitReport, ProfileService, UninstallMappingState
+from switcher.service import (
+    InitAlreadyCompletedReport,
+    InitReport,
+    ProfileService,
+    UninstallMappingState,
+)
 from switcher.store import FileProfileStore, ProfileStore
 
 # Reconfigure stdout/stderr to UTF-8 so the v0.1.4 tools table can emit its
@@ -134,15 +140,13 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
     consistent across multiple invocations of the same broken state.
     Rename has no hint — it is auto-compensated transparently.
 
-    The hint deliberately does NOT name `--continue` / `--abort` because
-    those flags don't ship until init/rescan compensation lands (Phase 6
-    / Phase 7 = PR4 / PR5). A PR3-only build can still encounter an
-    in-flight ``_InitOp`` / ``_RescanOp`` via hand-edited journals,
-    mixed-version installs, or version downgrades; pointing the user at
-    a flag that the binary doesn't expose would fail with "no such
-    option" and burn their first recovery attempt (abby review). The
-    text says "manual recovery required" and references the future
-    compensation surface so the user knows what to look for.
+    The init branch names ``--continue`` / ``--abort`` directly (v0.1.5
+    PR4). The rescan branch still defers to "manual recovery / follow-on
+    release" wording: rescan's matching flags don't ship until PR5
+    (Phase 7). Pointing a PR4 user at ``switcher rescan --continue`` /
+    ``--abort`` would fail with "no such option" and burn the first
+    recovery attempt (abby blocking review carry-forward). When PR5
+    ships, the rescan branch gets parallel flag-naming wording.
     """
     if isinstance(record, _InitOp):
         targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
@@ -151,8 +155,8 @@ def _format_in_progress_hint(record: OpLogRecord) -> str:
             f"(started {record.started_at.isoformat()}).\n"
             f"  Profile: {record.profile_name}\n"
             f"  Targets: {targets}\n"
-            f"Manual recovery required on this switcher version. Guided "
-            f"continue/abort handlers for init ship in a follow-on release."
+            f"Run `switcher init --continue` to finish the interrupted init, "
+            f"or `switcher init --abort` to reverse pre-init state."
         )
     if isinstance(record, _RescanOp):
         targets = ", ".join(record.target_ids) if record.target_ids else "(none)"
@@ -439,6 +443,55 @@ def _print_init_report(report: InitReport) -> None:
             console.print(f"    To add it later: switcher rescan --only {tid}")
 
 
+def _print_init_recovery_result(
+    result: InitReport | InitAlreadyCompletedReport | None,
+    *,
+    abort: bool,
+) -> None:
+    """Render the outcome of ``service.init(continue_=True | abort=True)``.
+
+    Three return shapes (spec §2.2):
+
+    - ``InitAlreadyCompletedReport``: the journal record was committed
+      before the crash; ``mark_completed`` ran without invoking
+      compensation. The ``kind`` field distinguishes:
+        - ``continue``: the user wanted to finish; tell them it's
+          already done.
+        - ``abort``: the user wanted to reverse; tell them the init is
+          already committed and point at ``switcher uninstall`` (abort
+          can't reverse a committed init — that distinction matters
+          because a silent no-op would let the user believe they had
+          reversed the init when it's still in place).
+    - ``None``: compensation actually ran. Print a success line keyed
+      to which flag drove it.
+    - ``InitReport``: not produced by the recovery branches, only the
+      normal init path; the union is the service's typed shape.
+      Defense-in-depth — if a future change routes a normal-path
+      InitReport through this helper, render it via the existing
+      ``_print_init_report``.
+    """
+    if isinstance(result, InitAlreadyCompletedReport):
+        if result.kind == "continue":
+            console.print(
+                f"Init for profile {result.profile_name!r} was already complete; "
+                f"journal record cleaned up. Nothing further to do."
+            )
+        else:
+            console.print(
+                f"Init for profile {result.profile_name!r} was already committed "
+                f"before the crash; abort cannot reverse it. "
+                f"Run `switcher uninstall` if you want to reverse the init."
+            )
+        return
+    if result is None:
+        if abort:
+            console.print("Aborted interrupted init; pre-init state restored.")
+        else:
+            console.print("Resumed interrupted init; mappings replayed.")
+        return
+    _print_init_report(result)
+
+
 @app.command()
 @handle_errors
 def init(
@@ -457,14 +510,90 @@ def init(
         "--interactive",
         help="Prompt per-detected-tool. Mutually exclusive with --only/--skip.",
     ),
+    continue_: bool = typer.Option(
+        False,
+        "--continue",
+        help="Resume an interrupted init using the op-log intent record.",
+    ),
+    abort: bool = typer.Option(
+        False,
+        "--abort",
+        help="Abort an interrupted init; reverse pre-init state.",
+    ),
 ) -> None:
     """Initialize switcher; optionally restrict to a subset of detected tools."""
+    # Recovery-flag mutex runs BEFORE get_deps. The flags are not
+    # ambiguous like --interactive vs --only (where the user might have
+    # a real broken state and the abby hook-first rule applies); they
+    # are explicit recovery intent, so a malformed combination is a
+    # pure usage error. Bailing out before reading state also keeps the
+    # error surface clean — no journal probe on `--continue --abort`.
+    if continue_ and abort:
+        raise typer.BadParameter("--continue and --abort are mutually exclusive")
+    if (continue_ or abort) and (only is not None or skip is not None or interactive):
+        raise typer.BadParameter(
+            "--continue/--abort are mutually exclusive with --only/--skip/--interactive"
+        )
+
+    deps = get_deps()
+
+    if continue_ or abort:
+        # Recovery dispatch MUST run before the generic detection hook
+        # would raise InitInProgressError on the in-flight _InitOp. But
+        # an in-flight _RenameOp (left from a crash on a prior rename)
+        # is supposed to be transparently auto-compensated on EVERY
+        # CLI command — spec §2.3 + the read-only/mutating branch of
+        # _detect_or_compensate_oplog. Bypassing that contract here
+        # would elevate a recoverable state to a scary OpLogCorruptError
+        # (service.init's "not an _InitOp" guard fires on _RenameOp).
+        # Drain rename first, then dispatch init recovery against
+        # whatever is still in flight (or nothing).
+        #
+        # The service raises NoInProgressInitError /
+        # RescanInProgressError / OpLogCorruptError / AbortPreflightError
+        # — all SwitcherError subclasses that handle_errors routes
+        # through err_console.
+        # vacuum_completed CANNOT drop the in-flight record this
+        # recovery path consumes (abby pass-9 concern push-back):
+        # vacuum acts only on records where `completed_at is not None`
+        # (oplog.py:vacuum_completed), and `read_in_flight` filters on
+        # `completed_at is None` independently. So a record that's
+        # still in-flight at recovery time survives vacuum; a record
+        # already mark_completed'd is invisible to `read_in_flight`
+        # regardless of vacuum, so the user-facing outcome
+        # (NoInProgressInitError on the post-mark_completed crash
+        # window) is unchanged. Vacuum is here purely as journal
+        # hygiene — drops stale completed records before the
+        # recovery dispatch reads.
+        deps.oplog.vacuum_completed()
+        in_flight = deps.oplog.read_in_flight()
+        if isinstance(in_flight, _RenameOp):
+            deps.service._compensate_rename(in_flight)  # pyright: ignore[reportPrivateUsage]
+            # Defensive refresh: service._compensate_rename owns
+            # mark_completed (service.py:1265), so a subsequent
+            # read_in_flight returns None on success. If the
+            # rename is still in flight after the drain call returned,
+            # the method's contract has regressed and silently falling
+            # through to service.init would mask it as a generic
+            # OpLogCorruptError from the "not an _InitOp" guard.
+            # Surface the contract breakage at the CLI layer with a
+            # clearer message. abby pass-2 blocker.
+            in_flight = deps.oplog.read_in_flight()
+            if isinstance(in_flight, _RenameOp):
+                raise OpLogCorruptError(
+                    "rename auto-compensation did not drain the in-flight "
+                    "journal record; service._compensate_rename contract "
+                    "regressed. Manual recovery required."
+                )
+        result = deps.service.init(continue_=continue_, abort=abort)
+        _print_init_recovery_result(result, abort=abort)
+        return
+
     # Hook FIRST — an in-flight init/rescan must surface ahead of any
     # flag-mutex BadParameter (abby blocking review). A user with broken
     # state who accidentally passes `--interactive --only` should see
     # the recovery hint, not a misleading "mutually exclusive" error
     # for flags they could have corrected after fixing the state.
-    deps = get_deps()
     _detect_or_compensate_oplog(deps, allow_mutation=True)
     if interactive and (only is not None or skip is not None):
         raise typer.BadParameter("--interactive is mutually exclusive with --only/--skip")
