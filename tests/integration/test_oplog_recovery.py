@@ -228,6 +228,127 @@ def test_interrupted_init_abort_via_subprocess(tmp_home: Path, tmp_state: Path) 
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
+def test_interrupted_init_abort_preserves_originally_missing_live(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """abby pass-8 batch 2 — safety-critical abort branch coverage.
+    RELEASE.md claims ``--abort`` uses per-mapping ``original_kind``
+    to avoid corrupting originally-missing paths. Without subprocess
+    coverage, a regression that re-created the live dir on abort
+    (the consultant's "abort recreates fake install" scenario)
+    could pass the suite while violating the user-facing guarantee.
+
+    Stages the COMPLETE state with original_kind=missing + an empty
+    target: live is a symlink to an empty target subdir. Abort must
+    remove the symlink + drop the empty target subdir + leave live
+    ABSENT (no real dir recreated). Spec §2.1.1 abort matrix."""
+    store = FileProfileStore(tmp_state)
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+
+    profile_name = "2026-05-12-current"
+    store.create(profile_name, {"claude": True})
+    target = store.profile_dir(profile_name) / "claude"
+    target.mkdir(parents=True)
+    # Target is EMPTY (no files inside) — invariant of the
+    # original_kind=missing branch: init seeded an empty dir for the
+    # originally-missing live path.
+    _symlink_dir(target, claude_live)
+
+    record = _InitOp.model_validate(
+        {
+            "op": "init",
+            "started_at": _now(),
+            "target_ids": ["claude"],
+            "profile_name": profile_name,
+            "mappings": [
+                {
+                    "tool_id": "claude",
+                    "mapping_index": 0,
+                    "live_path": str(claude_live),
+                    "profile_subdir": "claude",
+                    "original_kind": "missing",
+                }
+            ],
+        }
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    r = _run(["init", "--abort"], tmp_home, tmp_state)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+
+    # The safety-critical invariant: live stays missing. A regression
+    # that recreated live as an empty real dir would violate the
+    # spec's "abort uses original_kind to avoid corruption" guarantee.
+    assert not claude_live.exists(), (
+        f"abort recreated {claude_live} but original_kind='missing' "
+        f"requires it to stay absent — data-integrity guarantee broken"
+    )
+    assert not store.profile_dir(profile_name).exists()
+    assert OpLogIO(tmp_state).read_in_flight() is None
+
+
+def test_interrupted_init_continue_refuses_on_ambiguous_state(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """abby pass-8 batch 2 — safety-critical refusal branch coverage.
+    RELEASE.md claims recovery refuses on ambiguous on-disk states
+    rather than guessing. Without subprocess coverage, a regression
+    that silently chose ONE interpretation could pass the suite while
+    violating the "no corrupt-state-recovery" guarantee.
+
+    Stages an AMBIGUOUS pair: live is a populated real dir AND target
+    is also a populated real dir (data in two places — classifier
+    can't decide). ``init --continue`` must refuse with exit 1, leave
+    both copies of the data intact, and keep the journal in flight."""
+    store = FileProfileStore(tmp_state)
+    claude_live = tmp_home / ".claude"
+    (claude_live / "settings.json").write_text('{"live_data": true}')
+
+    profile_name = "2026-05-12-current"
+    store.create(profile_name, {"claude": True})
+    target = store.profile_dir(profile_name) / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"target_data": true}')
+    # No symlink: live is a real dir AND target is a real dir →
+    # AMBIGUOUS per the §2.1.1 classifier.
+
+    record = _InitOp.model_validate(
+        {
+            "op": "init",
+            "started_at": _now(),
+            "target_ids": ["claude"],
+            "profile_name": profile_name,
+            "mappings": [
+                {
+                    "tool_id": "claude",
+                    "mapping_index": 0,
+                    "live_path": str(claude_live),
+                    "profile_subdir": "claude",
+                    "original_kind": "real-dir",
+                }
+            ],
+        }
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    r = _run(["init", "--continue"], tmp_home, tmp_state)
+    # Refusal: exit 1 (handle_errors-routed SwitcherError), state preserved.
+    assert r.returncode == 1, (
+        f"expected exit 1 from AMBIGUOUS refusal, got {r.returncode}; "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    )
+    combined = _flatten(r.stdout + r.stderr)
+    assert "ambiguous" in combined.lower()
+    # Both copies of the data preserved end-to-end — the whole
+    # safety case for refusing rather than guessing.
+    assert claude_live.is_dir() and not _is_link(claude_live)
+    assert (claude_live / "settings.json").read_text() == '{"live_data": true}'
+    assert (target / "settings.json").read_text() == '{"target_data": true}'
+    # Journal stays in flight — user can fix manually + retry.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
 @pytest.mark.parametrize("readonly_cmd", [["status"], ["list"], ["which", "claude"]])
 def test_readonly_commands_surface_interrupted_init_with_exit_3(
     tmp_home: Path, tmp_state: Path, readonly_cmd: list[str]
