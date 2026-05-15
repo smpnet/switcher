@@ -4,6 +4,36 @@ Operational doc for cutting a release. Recipe-first; rationale below.
 
 ## Release notes
 
+### v0.1.5 — 2026-05-15
+
+**Added**
+
+- Guided recovery for interrupted `init`, `rename`, and `rescan` operations via a per-state-dir op-log journal at `<state_dir>/oplog.json`. Reduces manual recovery when a command is interrupted (process kill, crash, mid-op FS error).
+  - `rename` auto-compensates on the next `switcher` command — idempotent roll-forward, no user input.
+  - `init` and `rescan` interruptions are surfaced by `switcher status` (and any other command) and resolved with new `--continue` / `--abort` recovery flags. These are the only new CLI flags in v0.1.5; everyday workflow is unchanged.
+  - Best-effort restoration: `--abort` uses per-mapping `original_kind` metadata to avoid corrupting originally-missing paths and refuses on ambiguous on-disk states rather than guessing.
+- CI build job now produces a downloadable `switcher-dist` artifact (wheel + sdist) per push, built once on `ubuntu-latest` instead of three times across the OS matrix.
+- New `CONTRIBUTING.md` at the repo root covering dev environment setup, test layout, the spec→plan→implementation workflow, pre-PR and open-PR review loops, commit conventions, a walkthrough for adding a built-in tool, and an architecture overview.
+
+**Changed**
+
+- README `## Usage` rewritten as eight task-oriented sections: start, switch, save and manage, add a tool, stop managing one, stop entirely, inspect, maintain. The lifecycle is now the primary framing. README `## Development` collapses to a one-paragraph `## Contributing` pointer.
+- CI test matrix invokes `pixi run check` (was `pixi run ci`). `pixi run ci` remains the local-dev one-stop and is unchanged.
+- Pinned action SHAs bumped: `actions/checkout` to the current v4 SHA, `prefix-dev/setup-pixi` to the current v0.8.x SHA. Pixi version pin unchanged (still `v0.66.0`).
+
+**Internal**
+
+- New `src/switcher/oplog.py` module: Pydantic models for `_InitOp` / `_RenameOp` / `_RescanOp` (discriminated union), `MappingDiskState` four-state classifier (`COMPLETE` / `MOVE_DONE_LINK_MISSING` / `UNTOUCHED` / `AMBIGUOUS`), and an `OpLogIO` thin wrapper for atomic read/append/mark-completed/vacuum operations.
+- `service.py` `init` / `rename` / `rescan` write an intent record before any FS mutation and mark it completed after the final atomic state write. Compensation derives progress from disk on every pass — never from in-record progress booleans — so a crash between any FS step and the subsequent journal update is handled deterministically.
+- New CLI `_detect_or_compensate_oplog` hook invoked at the top of every command callback: auto-compensates `_RenameOp` records on every command (incl. read-only `status`), surfaces in-flight `_InitOp`/`_RescanOp` as exit 3 (read-only) or `InitInProgressError`/`RescanInProgressError` (mutating), and vacuums completed records on mutating commands.
+- Two `.coderabbit.yaml` `custom_checks` added (mode: error): active-profile-guard on `delete`, orphan-relink on `rename`. Merge-blocking on regression.
+
+**Schema**
+
+- **No state-file schema change.** `config.json` is unchanged. The new `oplog.json` is a sibling file at the state-dir level; older switcher versions ignore it. Op-log file absence is the normal pre-v0.1.5 state and remains a valid v0.1.5 state.
+
+---
+
 ### v0.1.4 — 2026-05-11
 
 **Added**
