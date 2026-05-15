@@ -9,8 +9,8 @@ Operational doc for cutting a release. Recipe-first; rationale below.
 **Added**
 
 - Guided recovery for interrupted `init`, `rename`, and `rescan` operations via a per-state-dir op-log journal at `<state_dir>/oplog.json`. Reduces manual recovery when a command is interrupted (process kill, crash, mid-op FS error).
-  - `rename` auto-compensates on the next `switcher` command — idempotent roll-forward, no user input.
-  - `init` and `rescan` interruptions are surfaced by `switcher status` (and any other command) and resolved with new `--continue` / `--abort` recovery flags. These are the only new CLI flags in v0.1.5; everyday workflow is unchanged.
+  - `rename` auto-compensates on the next state-touching `switcher` command — idempotent roll-forward, no user input. (`switcher version` intentionally bypasses the hook.)
+  - `init` and `rescan` interruptions are surfaced by `switcher status` (and any other state-touching command) and resolved with new `--continue` / `--abort` recovery flags. These are the only new CLI flags in v0.1.5; everyday workflow is unchanged.
   - Best-effort restoration: `--abort` uses per-mapping `original_kind` metadata to avoid corrupting originally-missing paths and refuses on ambiguous on-disk states rather than guessing.
 - CI build job now produces a downloadable `switcher-dist` artifact (wheel + sdist) per push, built once on `ubuntu-latest` instead of three times across the OS matrix.
 - New `CONTRIBUTING.md` at the repo root covering dev environment setup, test layout, the spec→plan→implementation workflow, pre-PR and open-PR review loops, commit conventions, a walkthrough for adding a built-in tool, and an architecture overview.
@@ -25,7 +25,7 @@ Operational doc for cutting a release. Recipe-first; rationale below.
 
 - New `src/switcher/oplog.py` module: Pydantic models for `_InitOp` / `_RenameOp` / `_RescanOp` (discriminated union), `MappingDiskState` four-state classifier (`COMPLETE` / `MOVE_DONE_LINK_MISSING` / `UNTOUCHED` / `AMBIGUOUS`), and an `OpLogIO` thin wrapper for atomic read/append/mark-completed/vacuum operations.
 - `service.py` `init` / `rename` / `rescan` write an intent record before any FS mutation and mark it completed after the final atomic state write. Compensation derives progress from disk on every pass — never from in-record progress booleans — so a crash between any FS step and the subsequent journal update is handled deterministically.
-- New CLI `_detect_or_compensate_oplog` hook invoked at the top of every command callback: auto-compensates `_RenameOp` records on every command (incl. read-only `status`), surfaces in-flight `_InitOp`/`_RescanOp` as exit 3 (read-only) or `InitInProgressError`/`RescanInProgressError` (mutating), and vacuums completed records on mutating commands.
+- New CLI `_detect_or_compensate_oplog` hook invoked at the top of every state-touching command callback (`switcher version` is the one intentional exception per spec §5.2): auto-compensates `_RenameOp` records on every such command (incl. read-only `status`), surfaces in-flight `_InitOp`/`_RescanOp` as exit 3 (read-only) or `InitInProgressError`/`RescanInProgressError` (mutating), and vacuums completed records on mutating commands.
 - Two `.coderabbit.yaml` `custom_checks` added (mode: error): active-profile-guard on `delete`, orphan-relink on `rename`. Merge-blocking on regression.
 
 **Schema**

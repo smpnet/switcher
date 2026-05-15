@@ -1669,6 +1669,47 @@ class ProfileService:
     # -- rescan compensation (spec §2.4) -----------------------------------
 
     @staticmethod
+    def _is_valid_rescan_into_metadata_state(
+        record: _RescanOp, profile_name: str, existing_tools: Mapping[str, bool]
+    ) -> bool:
+        """Return True if ``existing_tools`` is a valid mid-op shape
+        for the ``--into`` target ``profile_name``.
+
+        A multi-tool ``--into`` rescan writes ``metadata.tools``
+        progressively: each per-tool ``_capture_tool_for_rescan``
+        ends with ``update_profile_tools`` containing
+        ``previous_tools | {tool.id: True}`` for the captured tools
+        so far. A crash mid-loop leaves
+        ``previous_tools | subset(captured_here)`` — neither the
+        pre-write snapshot nor the fully-finalized expected state
+        (CR pass-PR major).
+
+        Accept any state where:
+          - The pre-existing tools (those NOT captured by this
+            rescan) equal ``previous_tools`` exactly.
+          - The captured-here tools are each either present (True)
+            or absent. Partial subset OK.
+
+        Anything else means the profile's metadata has been
+        externally mutated since intent — refuse.
+        """
+        pre_write = dict((record.previous_tools or {}).get(profile_name, {}))
+        captured_here_keys = {
+            tid for tid in record.target_ids if record.target_profiles.get(tid) == profile_name
+        }
+        # External (non-captured-here) keys must match pre_write exactly.
+        external_actual = {k: v for k, v in existing_tools.items() if k not in captured_here_keys}
+        external_expected = {k: v for k, v in pre_write.items() if k not in captured_here_keys}
+        if external_actual != external_expected:
+            return False
+        # Captured-here keys: each must be either True (added) or
+        # absent (not yet added). Both accepted.
+        for tid in captured_here_keys:
+            if tid in existing_tools and existing_tools[tid] is not True:
+                return False
+        return True
+
+    @staticmethod
     def _expected_tools_for_rescan_target(record: _RescanOp, profile_name: str) -> dict[str, bool]:
         """Compute the metadata.tools value a clean rescan would have
         produced for ``profile_name`` after the deferred-metadata
@@ -1804,6 +1845,55 @@ class ProfileService:
                 f"metadata. Manual recovery required."
             )
 
+    def _validate_rescan_target_ownership(
+        self,
+        record: _RescanOp,
+        active: Mapping[str, str],
+    ) -> None:
+        """Refuse if any target_id's ``active`` entry has been rebound
+        to a foreign profile since the crash (Hermes pass-PR blocker).
+
+        Spec §2.4 has compensation own only the target_ids the
+        journal records. The short-circuit's
+        ``_check_rescan_already_completed`` already requires
+        ``active[tid] == record.target_profiles[tid]`` to fire; the
+        compensation paths don't run only because they CAN'T
+        short-circuit (mapping not COMPLETE yet, etc.). Without this
+        guard, an ``active[tid] = "other"`` drift between intent and
+        recovery lets ``--continue`` rewrite the active entry to the
+        rescan profile (silently stealing ownership) or ``--abort``
+        pop it (silently deleting an unrelated active entry).
+
+        Per target_id, allow:
+          - ``active[tid]`` is absent (clean rescan case: tool was
+            unmanaged at intent time).
+          - ``active[tid] == record.target_profiles[tid]`` (this
+            interrupted rescan already wrote the active entry, or
+            recovery is being re-run after partial progress).
+
+        Active in a third profile is drift — refuse with
+        OpLogCorruptError.
+
+        The ``active_live_paths`` cache is NOT checked: cache is a
+        derived view that compensation legitimately overwrites with
+        the journal's authoritative live_path values (see
+        ``test_continue_does_not_short_circuit_when_cache_is_stale``
+        — compensation's job there is to rebuild a stale cache from
+        the journal, not refuse on it).
+        """
+        for tid in record.target_ids:
+            expected_profile = record.target_profiles.get(tid)
+            actual_profile = active.get(tid)
+            if actual_profile is not None and actual_profile != expected_profile:
+                raise OpLogCorruptError(
+                    f"interrupted rescan: target {tid!r} is now active in "
+                    f"profile {actual_profile!r} but the journal expects "
+                    f"{expected_profile!r}. External state has drifted "
+                    f"since intent (manual repair, hand-edited config, or "
+                    f"a competing op). Refusing to overwrite. Manual "
+                    f"recovery required."
+                )
+
     def _check_rescan_already_completed(self, record: _RescanOp) -> bool:
         """Return True ONLY if every observable post-rescan invariant
         holds on disk: each unique target profile is a real directory
@@ -1901,6 +1991,12 @@ class ProfileService:
         active_snapshot = self._store.get_active()
         live_paths_cache = self._store.get_active_live_paths_raw()
 
+        # Per-target ownership check BEFORE any mutation (Hermes
+        # pass-PR blocker). External drift on any target_id's active
+        # entry would otherwise let continue silently steal an
+        # unrelated active mapping.
+        self._validate_rescan_target_ownership(record, active_snapshot)
+
         unique_profiles = sorted(set(record.target_profiles.values()))
 
         # First-pass validation. No FS mutation.
@@ -1936,20 +2032,25 @@ class ProfileService:
                 # and counts as healthy.
                 expected_tools = self._expected_tools_for_rescan_target(record, name)
                 if record.into_mode:
-                    # Pre-deferred-write window: metadata still equals
-                    # previous_tools (the snapshot we captured at intent
-                    # time). That's a healthy mid-op state — accept it
-                    # and let the second pass run update_profile_tools to
-                    # finalize.
-                    pre_write = dict((record.previous_tools or {}).get(name, {}))
-                    if existing_profile.tools not in (expected_tools, pre_write):
+                    # --into mode: accept any partial-mid-write state
+                    # between previous_tools and expected_tools. The
+                    # per-tool _capture_tool_for_rescan writes
+                    # update_profile_tools progressively, so a
+                    # multi-tool crash mid-loop leaves
+                    # ``previous_tools | subset(captured_here)`` —
+                    # neither the pre-write nor the fully-finalized
+                    # shape (CR pass-PR major).
+                    if not self._is_valid_rescan_into_metadata_state(
+                        record, name, existing_profile.tools
+                    ):
+                        pre_write = dict((record.previous_tools or {}).get(name, {}))
                         raise OpLogCorruptError(
                             f"interrupted rescan continue: profile {name!r} at "
-                            f"{p} has tools={existing_profile.tools!r} but the "
-                            f"journal expects either {pre_write!r} (pre-deferred-"
-                            f"write window) or {expected_tools!r} (post-deferred-"
-                            f"write); refusing to adopt a foreign profile. "
-                            f"Manual recovery required."
+                            f"{p} has tools={existing_profile.tools!r}, which is "
+                            f"neither {pre_write!r} (pre-write), nor "
+                            f"{expected_tools!r} (post-write), nor a valid "
+                            f"partial-mid-write between them; refusing to adopt "
+                            f"a foreign profile. Manual recovery required."
                         )
                 else:
                     # Fresh-profile mode: metadata must match what a clean
@@ -2077,6 +2178,13 @@ class ProfileService:
         active_snapshot = self._store.get_active()
         cache_snapshot = self._store.get_active_live_paths_raw()
 
+        # Per-target ownership check BEFORE any mutation (Hermes
+        # pass-PR blocker, symmetric to continue). External drift on
+        # any target_id's active entry would otherwise let abort
+        # silently delete an unrelated active mapping via the pop()
+        # loop at the tail.
+        self._validate_rescan_target_ownership(record, active_snapshot)
+
         unique_profiles = sorted(set(record.target_profiles.values()))
 
         # Validation pass: profile-dir shapes + foreign-profile refusal.
@@ -2120,18 +2228,23 @@ class ProfileService:
                     ) from e
                 expected_tools = self._expected_tools_for_rescan_target(record, name)
                 if record.into_mode:
-                    # --into mode: metadata can be in either the pre- or
-                    # post-deferred-write shape at abort time. Either is
-                    # journal-owned; both will be restored to previous_tools
-                    # in the mutation pass.
-                    pre_write = dict((record.previous_tools or {}).get(name, {}))
-                    if existing_profile.tools not in (expected_tools, pre_write):
+                    # --into mode: accept any state between pre_write
+                    # and expected_tools, including partial-mid-write
+                    # (CR pass-PR major, symmetric to the continue
+                    # path). The mutation pass below restores
+                    # previous_tools regardless of which mid-state was
+                    # reached on disk.
+                    if not self._is_valid_rescan_into_metadata_state(
+                        record, name, existing_profile.tools
+                    ):
+                        pre_write = dict((record.previous_tools or {}).get(name, {}))
                         raise OpLogCorruptError(
                             f"interrupted rescan abort: profile {name!r} at "
-                            f"{p} has tools={existing_profile.tools!r} but "
-                            f"the journal expects {pre_write!r} or "
-                            f"{expected_tools!r}; refusing to act on a "
-                            f"foreign profile. Manual recovery required."
+                            f"{p} has tools={existing_profile.tools!r}, which is "
+                            f"neither {pre_write!r} (pre-write), nor "
+                            f"{expected_tools!r} (post-write), nor a valid "
+                            f"partial-mid-write between them; refusing to act "
+                            f"on a foreign profile. Manual recovery required."
                         )
                 else:
                     # Fresh-profile mode: a clean rescan would have written

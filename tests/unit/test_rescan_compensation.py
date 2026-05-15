@@ -949,7 +949,7 @@ def test_validator_refuses_record_with_target_ids_profiles_mismatch(
 
 
 def test_validator_refuses_record_with_mapping_for_unknown_tool(
-    service: ProfileService,
+    service: ProfileService, tmp_path: Path
 ) -> None:
     """abby pass-3 blocker (defense-in-depth): the validator refuses
     a record where a mapping references a tool_id outside target_ids.
@@ -958,7 +958,7 @@ def test_validator_refuses_record_with_mapping_for_unknown_tool(
     bad_mapping = _MappingIntent.model_construct(
         tool_id="phantom",  # not in target_ids
         mapping_index=0,
-        live_path="/tmp/x",
+        live_path=str(tmp_path / "phantom"),
         profile_subdir="phantom",
         original_kind="missing",
     )
@@ -1313,6 +1313,152 @@ def test_abort_preflights_config_before_any_filesystem_mutation(
     # Pre-mutation state preserved.
     assert store.profile_dir(profile_name).exists()
     assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_continue_refuses_when_target_active_rebound_to_other_profile(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR blocker: a target_id's ``active`` entry that
+    has drifted to a foreign profile since intent (manual repair,
+    hand-edited config) MUST refuse compensation rather than silently
+    rewriting it. The short-circuit already enforces this; the
+    compensation paths previously did not.
+
+    Stages an in-flight ``_RescanOp`` for claude → rescan-1, then
+    plants ``active["claude"] = "other-profile"``. Without the
+    ownership check, ``--continue`` would write ``active["claude"]
+    = "rescan-1"`` and silently steal the foreign binding."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    store.create("other-profile", {"claude": True})
+    # Foreign owner of the active entry — simulates external drift.
+    store.set_active_state({"claude": "other-profile"}, {})
+
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-rescan-1"
+    # Stage MOVE_DONE_LINK_MISSING so the short-circuit fails and
+    # compensation runs (otherwise the short-circuit's pre-existing
+    # active check would catch this case).
+    store.create(profile_name, {"claude": True})
+    target = store.profile_dir(profile_name) / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"captured": true}')
+
+    record = _make_rescan_record(
+        target_ids=["claude"],
+        target_profiles={"claude": profile_name},
+        into_mode=False,
+        previous_tools=None,
+        mappings=[_claude_mapping(tmp_home, "real-dir")],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="active in profile"):
+        service.rescan(continue_=True)
+
+    # Foreign active binding preserved end-to-end.
+    assert store.get_active().get("claude") == "other-profile"
+    # Journal stays in flight — user fixes manually.
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_abort_refuses_when_target_active_rebound_to_other_profile(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Symmetric to the continue case: Hermes pass-PR blocker for
+    ``--abort``. Without the ownership check, the tail ``pop()``
+    loop would silently delete an active entry the user rebound
+    manually after the crash."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    store.create("other-profile", {"claude": True})
+    store.set_active_state({"claude": "other-profile"}, {})
+
+    claude_live = tmp_home / ".claude"
+    profile_name = "2026-05-12-rescan-1"
+    store.create(profile_name, {"claude": True})
+    # UNTOUCHED state — live is original real dir.
+    (claude_live / "settings.json").write_text('{"original": true}')
+
+    record = _make_rescan_record(
+        target_ids=["claude"],
+        target_profiles={"claude": profile_name},
+        into_mode=False,
+        previous_tools=None,
+        mappings=[_claude_mapping(tmp_home, "real-dir")],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="active in profile"):
+        service.rescan(abort=True)
+
+    # Foreign active binding preserved; target profile NOT deleted
+    # (we refused before the rmtree pass).
+    assert store.get_active().get("claude") == "other-profile"
+    assert store.profile_dir(profile_name).is_dir()
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_continue_accepts_partial_into_metadata_midwrite(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """CR pass-PR major: multi-tool ``--into`` rescan writes
+    ``metadata.tools`` progressively (per-tool
+    ``update_profile_tools`` inside ``_capture_tool_for_rescan``).
+    A crash mid-loop leaves ``previous_tools | subset(captured_here)``
+    on disk — neither the pre-write snapshot nor the fully-finalized
+    expected state. Recovery must accept that valid mid-state and
+    finalize it, not refuse it as a foreign profile."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    # --into target pre-existed with one tool. Multi-tool rescan
+    # would add claude and copilot. The partial-mid-write state
+    # has claude already added but copilot NOT yet.
+    store.create("shared", {"existing-tool": True})
+    store.update_profile_tools("shared", {"existing-tool": True, "claude": True})
+    store.set_active_state({}, {})
+
+    claude_live = tmp_home / ".claude"
+    copilot_live = tmp_home / ".copilot"
+    shutil.rmtree(claude_live)
+    shutil.rmtree(copilot_live)
+
+    # Stage claude as COMPLETE (its per-tool capture finished).
+    claude_target = store.profile_dir("shared") / "claude"
+    claude_target.mkdir(parents=True)
+    (claude_target / "settings.json").write_text('{"claude": "captured"}')
+    _symlink_dir(claude_target, claude_live)
+
+    # Stage copilot as MOVE_DONE_LINK_MISSING (mid per-tool window).
+    copilot_target = store.profile_dir("shared") / "copilot-config"
+    copilot_target.mkdir(parents=True)
+    (copilot_target / "config.json").write_text('{"copilot": "mid"}')
+
+    record = _make_rescan_record(
+        target_ids=["claude", "copilot"],
+        target_profiles={"claude": "shared", "copilot": "shared"},
+        into_mode=True,
+        previous_tools={"shared": {"existing-tool": True}},
+        mappings=[
+            _claude_mapping(tmp_home, "real-dir"),
+            _copilot_mapping(tmp_home, "real-dir"),
+        ],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    service.rescan(continue_=True)
+
+    # Final metadata: pre_write | both captured tools.
+    refreshed = store.get("shared")
+    assert refreshed.tools == {
+        "existing-tool": True,
+        "claude": True,
+        "copilot": True,
+    }
+    assert service._resolver.is_link(claude_live)
+    assert service._resolver.is_link(copilot_live)
+    assert OpLogIO(tmp_state).read_in_flight() is None
 
 
 def test_continue_refuses_when_existing_profile_has_foreign_tools(

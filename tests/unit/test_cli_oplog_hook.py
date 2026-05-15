@@ -948,6 +948,11 @@ def test_rescan_abort_already_completed_signals_committed(
     out = _combined(result)
     assert "2026-05-12-rescan-1" in out
     assert "already" in out.lower()
+    # CR pass-PR minor: verify abort-specific wording, not just
+    # generic "already". Without this, continue and abort could
+    # regress to identical messaging.
+    out_lower = out.lower()
+    assert "committed" in out_lower or "cannot" in out_lower
 
 
 def test_rescan_continue_compensation_ran_prints_success(

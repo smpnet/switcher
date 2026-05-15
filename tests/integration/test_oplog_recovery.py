@@ -196,6 +196,10 @@ def test_interrupted_init_continue_via_subprocess(tmp_home: Path, tmp_state: Pat
     # Final state: live is a managed link to target, vanilla exists,
     # active map points at the dated-current profile, journal cleared.
     assert _is_link(claude_live), f"live={claude_live} not a managed link"
+    # CR pass-PR major: verify the link's *destination*, not just
+    # that it's a link. A stale link from a prior run would pass the
+    # is_link check; the resolve() comparison guards that.
+    assert claude_live.resolve() == target.resolve()
     assert (target / "settings.json").read_text() == '{"original": true}'
     assert store.profile_dir("vanilla").is_dir()
     assert store.get_active().get("claude") == profile_name
@@ -242,6 +246,10 @@ def test_interrupted_init_abort_via_subprocess(tmp_home: Path, tmp_state: Path) 
     assert claude_live.is_dir() and not _is_link(claude_live)
     assert (claude_live / "settings.json").read_text() == '{"original": true}'
     assert not store.profile_dir(profile_name).exists()
+    # Active-map rolled back too (CR pass-PR major): a regression
+    # that left active["claude"] pointing at the deleted profile
+    # would otherwise pass.
+    assert store.get_active().get("claude") != profile_name
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
@@ -316,8 +324,11 @@ def test_interrupted_init_continue_mixed_mapping_states(tmp_home: Path, tmp_stat
     # Both mappings COMPLETE post-recovery, per their respective dispatch
     # paths. Data integrity preserved.
     assert _is_link(claude_live)
+    # Verify destination, not just link-ness (CR pass-PR major).
+    assert claude_live.resolve() == claude_target.resolve()
     assert (claude_target / "settings.json").read_text() == '{"claude": "complete"}'
     assert _is_link(copilot_live)
+    assert copilot_live.resolve() == copilot_target.resolve()
     assert (copilot_target / "config.json").read_text() == '{"copilot": "mid_window"}'
     active = store.get_active()
     assert active.get("claude") == profile_name
@@ -382,6 +393,8 @@ def test_interrupted_init_abort_preserves_originally_missing_live(
         f"requires it to stay absent — data-integrity guarantee broken"
     )
     assert not store.profile_dir(profile_name).exists()
+    # Active-map rolled back (CR pass-PR major).
+    assert store.get_active().get("claude") != profile_name
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
@@ -562,6 +575,8 @@ def test_interrupted_rescan_continue_via_subprocess(tmp_home: Path, tmp_state: P
 
     # Final state: live → managed link, active map updated, journal cleared.
     assert _is_link(claude_live)
+    # Verify destination, not just link-ness (CR pass-PR major).
+    assert claude_live.resolve() == target.resolve()
     assert (target / "settings.json").read_text() == '{"captured": true}'
     assert store.get_active().get("claude") == profile_name
     assert OpLogIO(tmp_state).read_in_flight() is None
@@ -612,6 +627,9 @@ def test_interrupted_rescan_abort_via_subprocess(tmp_home: Path, tmp_state: Path
     assert claude_live.is_dir() and not _is_link(claude_live)
     assert (claude_live / "settings.json").read_text() == '{"captured": true}'
     assert not store.profile_dir(profile_name).exists()
+    # Active-map rolled back too (CR pass-PR major): pop loop must
+    # have cleared the rescan's target_id entries.
+    assert store.get_active().get("claude") != profile_name
     assert OpLogIO(tmp_state).read_in_flight() is None
 
 
@@ -994,6 +1012,8 @@ def test_continue_short_circuit_on_committed_init(tmp_home: Path, tmp_state: Pat
     assert "already" in combined.lower()
     # Disk untouched, journal cleared.
     assert _is_link(claude_live)
+    # Verify destination too (CR pass-PR major).
+    assert claude_live.resolve() == target.resolve()
     config = json.loads((tmp_state / "config.json").read_text())
     assert config["active"]["claude"] == profile_name
     assert OpLogIO(tmp_state).read_in_flight() is None
