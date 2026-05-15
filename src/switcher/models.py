@@ -284,6 +284,19 @@ class Profile(BaseModel):
         serialization_alias="createdAt",
     )
     tools: dict[str, bool]
+    # v0.1.5 PR5: opaque token written by ``_store.create`` when the
+    # profile is created as part of a journaled op (currently:
+    # fresh-mode rescan). Lets recovery refuse fresh-mode targets
+    # whose ``.tools`` match by coincidence but whose journal_id
+    # doesn't match the in-flight record's ``rescan_id`` — closes
+    # the cross-profile data-loss path from a reservation-vs-capture
+    # name-collision race (Hermes pass-PR-2 blocker). ``None`` for
+    # profiles created by older versions or non-rescan code paths.
+    journal_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("journalId", "journal_id"),
+        serialization_alias="journalId",
+    )
 
     @field_validator("name")
     @classmethod

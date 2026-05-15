@@ -2062,6 +2062,24 @@ class ProfileService:
                             f"journal expects {expected_tools!r}; refusing to "
                             f"adopt a foreign profile. Manual recovery required."
                         )
+                    # Journal-id ownership proof (Hermes pass-PR-2
+                    # blocker): ``.tools`` equality alone isn't proof
+                    # the rescan created this profile — an external
+                    # process could race between intent-write and per-
+                    # tool capture and create a profile with
+                    # coincidentally-matching tools at one of the
+                    # reserved names. The rescan's rescan_id was
+                    # stamped into the profile's journal_id at create
+                    # time; mismatch = not ours = refuse.
+                    if existing_profile.journal_id != record.rescan_id:
+                        raise OpLogCorruptError(
+                            f"interrupted rescan continue: profile {name!r} at "
+                            f"{p} has journal_id={existing_profile.journal_id!r} "
+                            f"but the in-flight rescan expects "
+                            f"{record.rescan_id!r}; this profile was not "
+                            f"created by this rescan. Refusing to adopt a "
+                            f"foreign profile. Manual recovery required."
+                        )
 
         # Per-mapping shape + AMBIGUOUS refusal.
         for intent in record.mappings:
@@ -2111,7 +2129,14 @@ class ProfileService:
                         f"{name!r} at {p} is missing — refusing to recreate a "
                         f"profile the rescan didn't own. Manual recovery required."
                     )
-                self._store.create(name, self._expected_tools_for_rescan_target(record, name))
+                # Deferred fresh-profile create: stamp the rescan's
+                # journal_id so a subsequent recovery still sees this
+                # as journal-owned (Hermes pass-PR-2 blocker).
+                self._store.create(
+                    name,
+                    self._expected_tools_for_rescan_target(record, name),
+                    journal_id=record.rescan_id,
+                )
 
         # Second pass: per-mapping mutation.
         for intent in record.mappings:
@@ -2257,6 +2282,19 @@ class ProfileService:
                             f"the journal expects {expected_tools!r}; "
                             f"refusing to delete a foreign profile. Manual "
                             f"recovery required."
+                        )
+                    # Journal-id ownership proof (Hermes pass-PR-2
+                    # blocker, symmetric to continue). rmtree on a
+                    # profile whose journal_id doesn't match would be
+                    # the cross-profile data-loss path.
+                    if existing_profile.journal_id != record.rescan_id:
+                        raise OpLogCorruptError(
+                            f"interrupted rescan abort: profile {name!r} at "
+                            f"{p} has journal_id={existing_profile.journal_id!r} "
+                            f"but the in-flight rescan expects "
+                            f"{record.rescan_id!r}; this profile was not "
+                            f"created by this rescan. Refusing to delete a "
+                            f"foreign profile. Manual recovery required."
                         )
 
         # Per-mapping shape + AMBIGUOUS / original_kind / write-through
@@ -3482,7 +3520,16 @@ class ProfileService:
             ]
             previous_tools: dict[str, bool] | None = None
             try:
-                previous_tools = self._capture_tool_for_rescan(tool, target, into=into is not None)
+                previous_tools = self._capture_tool_for_rescan(
+                    tool,
+                    target,
+                    into=into is not None,
+                    # Stamp the rescan's id into fresh-mode profiles so
+                    # recovery can prove ownership and refuse races
+                    # (Hermes pass-PR-2 blocker). --into mode targets
+                    # pre-exist; their ownership comes from previous_tools.
+                    journal_id=intent.rescan_id if into is None else None,
+                )
                 active[tool.id] = target
                 live_paths_cache[tool.id] = new_paths
                 self._store.set_active_state(active, live_paths_cache)
@@ -3537,7 +3584,12 @@ class ProfileService:
         return report
 
     def _capture_tool_for_rescan(
-        self, tool: Tool, target: str, *, into: bool
+        self,
+        tool: Tool,
+        target: str,
+        *,
+        into: bool,
+        journal_id: str | None = None,
     ) -> dict[str, bool] | None:
         """Per-tool capture with metadata semantics from §4.4.
 
@@ -3553,13 +3605,20 @@ class ProfileService:
         (e.g. `set_active_state`) fails after this method already updated
         metadata.json. Default mode returns None because its rollback
         rmtree's the whole partial profile dir.
+
+        ``journal_id`` (fresh-mode only): stamps the rescan's identifier
+        into the created profile's metadata so recovery can refuse
+        fresh-mode targets whose ``.tools`` match by coincidence but
+        weren't actually created by this rescan (Hermes pass-PR-2
+        blocker — closes the cross-profile data-loss race from a
+        reservation-vs-capture name collision).
         """
         target_dir = self._store.profile_dir(target)
         previous_tools: dict[str, bool] | None = None
         updated_tools: dict[str, bool] | None = None  # for post-capture --into write
 
         if not into:
-            self._store.create(target, {tool.id: True})
+            self._store.create(target, {tool.id: True}, journal_id=journal_id)
         else:
             existing = self._store.get(target)
             previous_tools = dict(existing.tools)

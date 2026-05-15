@@ -69,6 +69,13 @@ def _copilot_mapping(tmp_home: Path, original_kind: str) -> _MappingIntent:
     )
 
 
+# Stable rescan_id for tests that pre-stage fresh-mode target profiles
+# (which need profile.journal_id == record.rescan_id per the Hermes
+# pass-PR-2 ownership check). Tests pass this same value as
+# ``journal_id=`` to ``store.create`` when seeding the fresh profile.
+_TEST_RESCAN_ID = "test-rescan-id-0123456789abcdef0123456789abcdef"
+
+
 def _make_rescan_record(
     *,
     target_ids: list[str],
@@ -76,6 +83,7 @@ def _make_rescan_record(
     into_mode: bool,
     previous_tools: dict[str, dict[str, bool]] | None,
     mappings: list[_MappingIntent],
+    rescan_id: str = _TEST_RESCAN_ID,
 ) -> _RescanOp:
     return _RescanOp.model_validate(
         {
@@ -86,6 +94,7 @@ def _make_rescan_record(
             "into_mode": into_mode,
             "previous_tools": previous_tools,
             "mappings": mappings,
+            "rescan_id": rescan_id,
         }
     )
 
@@ -134,7 +143,7 @@ def test_continue_fresh_profile_mid_capture_window(
     profile_b = "2026-05-12-rescan-2"
 
     # Pre-stage A as COMPLETE: profile dir + target populated + live symlinked.
-    store.create(profile_a, {"claude": True})
+    store.create(profile_a, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     target_a = store.profile_dir(profile_a) / "claude"
     target_a.mkdir(parents=True)
     (target_a / "settings.json").write_text('{"captured": true}')
@@ -142,7 +151,7 @@ def test_continue_fresh_profile_mid_capture_window(
 
     # Pre-stage B as MOVE_DONE_LINK_MISSING: profile dir + target populated,
     # live MISSING (no symlink yet).
-    store.create(profile_b, {"copilot": True})
+    store.create(profile_b, {"copilot": True}, journal_id=_TEST_RESCAN_ID)
     target_b = store.profile_dir(profile_b) / "copilot-config"
     target_b.mkdir(parents=True)
     (target_b / "config.json").write_text('{"copilot": true}')
@@ -290,7 +299,7 @@ def test_continue_does_not_short_circuit_when_cache_is_stale(
     claude_live = tmp_home / ".claude"
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-rescan-1"
-    store.create(profile_name, {"claude": True})
+    store.create(profile_name, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     target = store.profile_dir(profile_name) / "claude"
     target.mkdir(parents=True)
     (target / "settings.json").write_text('{"committed": true}')
@@ -630,7 +639,7 @@ def test_abort_fresh_profile_complete_real_dir_deletes_target_profile(
     claude_live = tmp_home / ".claude"
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-rescan-1"
-    store.create(profile_name, {"claude": True})
+    store.create(profile_name, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     target = store.profile_dir(profile_name) / "claude"
     target.mkdir(parents=True)
     (target / "settings.json").write_text('{"original": true}')
@@ -673,13 +682,13 @@ def test_abort_multiple_fresh_profiles_all_deleted_on_clean_pass(
     profile_a = "2026-05-12-rescan-1"
     profile_b = "2026-05-12-rescan-2"
 
-    store.create(profile_a, {"claude": True})
+    store.create(profile_a, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     target_a = store.profile_dir(profile_a) / "claude"
     target_a.mkdir(parents=True)
     (target_a / "settings.json").write_text('{"claude_orig": true}')
     _symlink_dir(target_a, claude_live)
 
-    store.create(profile_b, {"copilot": True})
+    store.create(profile_b, {"copilot": True}, journal_id=_TEST_RESCAN_ID)
     target_b = store.profile_dir(profile_b) / "copilot-config"
     target_b.mkdir(parents=True)
     (target_b / "config.json").write_text('{"copilot_orig": true}')
@@ -1177,7 +1186,7 @@ def test_abort_idempotent_second_call_raises_no_in_progress(
     store.set_active_state({}, {})
 
     profile_name = "2026-05-12-rescan-1"
-    store.create(profile_name, {"claude": True})
+    store.create(profile_name, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     record = _make_rescan_record(
         target_ids=["claude"],
         target_profiles={"claude": profile_name},
@@ -1211,7 +1220,7 @@ def test_abort_rejects_link_original_kind_defensively(
     claude_live = tmp_home / ".claude"
     shutil.rmtree(claude_live)
     profile_name = "2026-05-12-rescan-1"
-    store.create(profile_name, {"claude": True})
+    store.create(profile_name, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     target = store.profile_dir(profile_name) / "claude"
     target.mkdir(parents=True)
     _symlink_dir(target, claude_live)
@@ -1231,6 +1240,7 @@ def test_abort_rejects_link_original_kind_defensively(
         into_mode=False,
         previous_tools=None,
         mappings=[bad_mapping],
+        rescan_id=_TEST_RESCAN_ID,
     )
 
     with pytest.raises(AbortPreflightError):
@@ -1312,6 +1322,95 @@ def test_abort_preflights_config_before_any_filesystem_mutation(
 
     # Pre-mutation state preserved.
     assert store.profile_dir(profile_name).exists()
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_continue_refuses_fresh_target_when_journal_id_does_not_match(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR-2 blocker: a fresh-mode target profile whose
+    ``.tools`` happens to match what this rescan would have written
+    is NOT proof of ownership. External processes can race in the
+    window between intent-write and per-tool ``_store.create`` and
+    create a profile at one of our reserved names with coincidentally
+    matching tools. The ownership check requires
+    ``profile.journal_id == record.rescan_id``; without it,
+    ``--continue`` would capture into an unrelated profile and
+    ``--abort`` would delete it.
+
+    Stages a foreign profile with the SAME ``.tools`` value but a
+    different journal_id (simulating: external creation, OR a stale
+    profile from a previous rescan with the same name). Confirms
+    refusal."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    store.set_active_state({}, {})
+
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-rescan-1"
+    # Foreign profile: same tools shape, but DIFFERENT journal_id.
+    # Simulates the race Hermes describes.
+    store.create(profile_name, {"claude": True}, journal_id="foreign-rescan-id-99")
+    target = store.profile_dir(profile_name) / "claude"
+    target.mkdir(parents=True)
+    (target / "settings.json").write_text('{"foreign": true}')
+
+    record = _make_rescan_record(
+        target_ids=["claude"],
+        target_profiles={"claude": profile_name},
+        into_mode=False,
+        previous_tools=None,
+        mappings=[_claude_mapping(tmp_home, "real-dir")],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="journal_id"):
+        service.rescan(continue_=True)
+
+    # Foreign profile preserved end-to-end: its data is intact, its
+    # journal_id stamp unchanged, the in-flight record stays alive.
+    profile = store.get(profile_name)
+    assert profile.journal_id == "foreign-rescan-id-99"
+    assert (target / "settings.json").read_text() == '{"foreign": true}'
+    assert OpLogIO(tmp_state).read_in_flight() is not None
+
+
+def test_abort_refuses_fresh_target_when_journal_id_does_not_match(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Symmetric to the continue case: abort must REFUSE to rmtree a
+    fresh-mode target whose journal_id doesn't match the in-flight
+    rescan. Otherwise a coincidentally-shaped foreign profile would
+    be silently destroyed."""
+    store = FileProfileStore(tmp_state)
+    store.create("vanilla", {})
+    store.set_active_state({}, {})
+
+    claude_live = tmp_home / ".claude"
+    shutil.rmtree(claude_live)
+    profile_name = "2026-05-12-rescan-1"
+    store.create(profile_name, {"claude": True}, journal_id="foreign-rescan-id-99")
+    target = store.profile_dir(profile_name) / "claude"
+    target.mkdir(parents=True)
+    (target / "important.json").write_text('{"foreign_user_data": true}')
+
+    record = _make_rescan_record(
+        target_ids=["claude"],
+        target_profiles={"claude": profile_name},
+        into_mode=False,
+        previous_tools=None,
+        mappings=[_claude_mapping(tmp_home, "real-dir")],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match="journal_id"):
+        service.rescan(abort=True)
+
+    # Foreign data preserved end-to-end.
+    assert store.profile_dir(profile_name).is_dir()
+    assert store.get(profile_name).journal_id == "foreign-rescan-id-99"
+    assert (target / "important.json").read_text() == '{"foreign_user_data": true}'
     assert OpLogIO(tmp_state).read_in_flight() is not None
 
 
@@ -1551,7 +1650,7 @@ def test_continue_clears_journal_state_on_zero_mapping_capture(
     store.set_active_state({}, {})
 
     profile_name = "2026-05-12-rescan-1"
-    store.create(profile_name, {"registry-only-tool": True})
+    store.create(profile_name, {"registry-only-tool": True}, journal_id=_TEST_RESCAN_ID)
 
     record = _make_rescan_record(
         target_ids=["registry-only-tool"],

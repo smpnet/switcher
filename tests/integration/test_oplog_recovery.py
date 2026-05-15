@@ -79,6 +79,12 @@ def _now() -> datetime:
     return datetime(2026, 5, 12, 10, 30, tzinfo=UTC)
 
 
+# Stable rescan_id for tests that pre-stage fresh-mode rescan target
+# profiles (which need profile.journal_id == record.rescan_id per the
+# Hermes pass-PR-2 ownership check).
+_TEST_RESCAN_ID = "test-rescan-id-0123456789abcdef0123456789abcdef"
+
+
 def _is_link(p: Path) -> bool:
     return p.is_symlink() or (IS_WINDOWS and os.path.isjunction(p))
 
@@ -543,7 +549,7 @@ def test_interrupted_rescan_continue_via_subprocess(tmp_home: Path, tmp_state: P
     shutil.rmtree(claude_live)
 
     profile_name = "2026-05-12-rescan-1"
-    store.create(profile_name, {"claude": True})
+    store.create(profile_name, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     target = store.profile_dir(profile_name) / "claude"
     target.mkdir(parents=True)
     (target / "settings.json").write_text('{"captured": true}')
@@ -557,6 +563,7 @@ def test_interrupted_rescan_continue_via_subprocess(tmp_home: Path, tmp_state: P
             "target_profiles": {"claude": profile_name},
             "into_mode": False,
             "previous_tools": None,
+            "rescan_id": _TEST_RESCAN_ID,
             "mappings": [
                 {
                     "tool_id": "claude",
@@ -593,7 +600,7 @@ def test_interrupted_rescan_abort_via_subprocess(tmp_home: Path, tmp_state: Path
     shutil.rmtree(claude_live)
 
     profile_name = "2026-05-12-rescan-1"
-    store.create(profile_name, {"claude": True})
+    store.create(profile_name, {"claude": True}, journal_id=_TEST_RESCAN_ID)
     target = store.profile_dir(profile_name) / "claude"
     target.mkdir(parents=True)
     (target / "settings.json").write_text('{"captured": true}')
@@ -607,6 +614,7 @@ def test_interrupted_rescan_abort_via_subprocess(tmp_home: Path, tmp_state: Path
             "target_profiles": {"claude": profile_name},
             "into_mode": False,
             "previous_tools": None,
+            "rescan_id": _TEST_RESCAN_ID,
             "mappings": [
                 {
                     "tool_id": "claude",

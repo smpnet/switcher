@@ -29,7 +29,13 @@ from switcher.models import Profile, validate_safe_name
 class ProfileStore(Protocol):
     """Surface that ProfileService and CLI use. Tests can supply fakes."""
 
-    def create(self, name: str, tools: Mapping[str, bool]) -> Profile: ...
+    def create(
+        self,
+        name: str,
+        tools: Mapping[str, bool],
+        *,
+        journal_id: str | None = None,
+    ) -> Profile: ...
     def get(self, name: str) -> Profile: ...
     def list(self) -> list[Profile]: ...
     def delete(self, name: str) -> None: ...
@@ -103,13 +109,20 @@ class FileProfileStore:
 
     # -- profile CRUD -------------------------------------------------------
 
-    def create(self, name: str, tools: Mapping[str, bool]) -> Profile:
+    def create(
+        self,
+        name: str,
+        tools: Mapping[str, bool],
+        *,
+        journal_id: str | None = None,
+    ) -> Profile:
         if self.profile_dir(name).exists():
             raise ProfileExistsError(f"profile {name!r} already exists")
         profile = Profile(
             name=name,
             created_at=datetime.now(UTC).replace(microsecond=0),
             tools=dict(tools),
+            journal_id=journal_id,
         )
         d = self.profile_dir(name)
         d.mkdir(parents=True, exist_ok=True)
