@@ -56,6 +56,13 @@ def test_parse_rejects_filter():
         parse_owned_path(".foo[?(@.bar)]")
 
 
+def test_parse_rejects_iter_as_leaf():
+    """``[]`` at the end has no defined semantics in v1. The parser is the
+    single source of truth, so it must reject — not just the walker."""
+    with pytest.raises(InvalidOwnedPath, match="must not end with"):
+        parse_owned_path(".projects[]")
+
+
 # ---------------------------------------------------------------------------
 # Extract
 # ---------------------------------------------------------------------------

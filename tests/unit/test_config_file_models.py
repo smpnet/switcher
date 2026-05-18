@@ -121,6 +121,20 @@ def test_config_file_rejects_unsupported_owned_path_token():
         )
 
 
+def test_config_file_rejects_iter_as_leaf_in_owned_paths():
+    """``[]`` as a leaf segment has no v1 semantics; ConfigFile must reject
+    at load time, not defer to the walker."""
+    with pytest.raises(ValidationError, match="invalid owned_json_paths entry"):
+        ConfigFile(
+            posix_path="~/.claude.json",
+            windows_path="%USERPROFILE%\\.claude.json",
+            profile_subdir="claude",
+            profile_filename="claude.json",
+            merge_strategy="json_subtree_merge",
+            owned_json_paths=(".projects[]",),
+        )
+
+
 def test_config_file_rejects_duplicate_owned_json_paths():
     with pytest.raises(ValidationError, match="duplicate owned_json_paths entry"):
         ConfigFile(

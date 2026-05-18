@@ -50,9 +50,17 @@ def parse_owned_path(path: str) -> tuple[_Segment, ...]:
 
     Grammar (per spec §3.4)::
 
-        path  := ('.' KEY | '[]')+
-        KEY   := matches ``[A-Za-z0-9_-]+`` (no dots — ``.`` is always a
-                 segment separator; keys with dots are out of scope for v1)
+        path     := '.' KEY (subpath)*
+        subpath  := '.' KEY | '[]' '.' KEY
+        KEY      := matches ``[A-Za-z0-9_-]+`` (no dots — ``.`` is always a
+                    segment separator; keys with dots are out of scope for v1)
+
+    Concretely: paths start with a ``.KEY`` segment, may compose further
+    ``.KEY`` and ``[]`` segments, and **must end on a ``.KEY`` segment**.
+    ``[]`` as a leaf has no defined semantics in v1 (would mean "iterate
+    every entry as a snapshot value") and is rejected here so the parser
+    is the single source of truth — the walker's defense-in-depth check
+    is then unreachable in practice.
     """
     if not path or not path.startswith("."):
         raise InvalidOwnedPath(f"owned path must start with '.': {path!r}")
@@ -88,6 +96,11 @@ def parse_owned_path(path: str) -> tuple[_Segment, ...]:
                 f"unexpected character {ch!r} at position {i} in {path!r}"
             )
 
+    if segments and segments[-1][0] == "iter":
+        raise InvalidOwnedPath(
+            f"owned path must not end with '[]': {path!r}; "
+            "v1 grammar does not allow '[]' as a leaf segment"
+        )
     return tuple(segments)
 
 
