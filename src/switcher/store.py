@@ -84,6 +84,23 @@ class FileProfileStore:
         # through validate_safe_name before a name can become a real path.
         return self._state_dir / "profiles" / validate_safe_name(name)
 
+    def config_file_snapshot_path(
+        self, profile_name: str, profile_subdir: str, profile_filename: str
+    ) -> Path:
+        # Single source of truth for the .switcher/config_files/<subdir>/<filename>
+        # layout. Every caller — save, use, init, create, rescan, op-log
+        # classifier, compensation — routes through here so the layout doesn't
+        # drift the first time someone adds a seventh call site. validate_safe_name
+        # rejects leading dots, so no tool's profile_subdir can collide with
+        # the reserved .switcher subtree.
+        return (
+            self.profile_dir(profile_name)
+            / ".switcher"
+            / "config_files"
+            / validate_safe_name(profile_subdir)
+            / validate_safe_name(profile_filename)
+        )
+
     def _profiles_dir(self) -> Path:
         return self._state_dir / "profiles"
 
