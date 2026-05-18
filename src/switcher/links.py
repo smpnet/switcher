@@ -30,6 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from switcher.errors import (
@@ -282,3 +283,49 @@ def restore_real_dir(temp_dir: Path, live_path: Path) -> None:
         )
     remove_link(live_path)
     temp_dir.rename(live_path)
+
+
+def atomic_write_file(target: Path, content: bytes) -> None:
+    """Atomically write ``content`` to ``target`` via tmp-file + rename.
+
+    Mirrors the discipline in ``oplog._write_records``:
+
+    - ``mkdir(parents=True, exist_ok=True)`` on the parent first, so callers
+      don't need to remember the contract. The ``.switcher/config_files/<subdir>/``
+      reserved path used by ConfigFile snapshots won't exist on the first
+      snapshot write per profile.
+    - ``tempfile.mkstemp`` for the staging file — ``O_EXCL`` defeats the
+      pre-placed-symlink class flagged on the journal write, the random
+      suffix prevents collisions across overlapping callers, and
+      same-directory placement keeps the rename within one filesystem so
+      it's atomic on POSIX and Windows alike.
+    - ``Path.replace`` for the rename (cross-platform since Python 3.3).
+    - On any failure after ``mkstemp`` but before ``replace`` succeeds,
+      ``unlink(missing_ok=True)`` the tmp file so retries don't accumulate
+      orphans.
+
+    Scope: torn-write prevention, not power-loss durability. No fsync on
+    the tmp file or parent directory — matches the explicit trade-off
+    documented in ``oplog._write_records``.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmpname = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=target.name + ".",
+        suffix=".tmp",
+    )
+    tmppath = Path(tmpname)
+    try:
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        tmppath.replace(target)
+    except Exception:
+        tmppath.unlink(missing_ok=True)
+        raise
