@@ -232,16 +232,33 @@ class ProfileService:
         live into a fresh profile snapshot.
 
         Edge cases (spec §3.6 "missing or malformed live"):
-          * Live missing → snapshot is ``{}``. Refusing here would block init
-            on a fresh machine before the user has launched the tool once.
+          * Live missing (true non-existence) → snapshot is ``{}``. Refusing
+            here would block init on a fresh machine before the user has
+            launched the tool once.
           * Live malformed JSON or non-object → ``StorageError`` before any
             mutation. Capturing garbage would silently propagate to the
             apply side of the next ``use()``.
+          * Live is a symlink (broken or otherwise) → ``StorageError``.
+            ``Path.exists()`` returns False for a broken symlink, so without
+            this guard a broken link would be indistinguishable from genuine
+            absence and we'd silently overwrite the source profile's last-
+            good snapshot with ``{}`` (abby r6). Even for a non-broken
+            symlink, capturing through the link and then applying back
+            atomic-renames the link into a regular file — the same shape
+            ``_plan_config_file_applies`` rejects on the apply side.
         """
         for cf in tool.config_files:
             live_path = self._resolver.expand(
                 cf.windows_path if IS_WINDOWS else cf.posix_path
             )
+            if live_path.is_symlink():
+                raise StorageError(
+                    f"refusing to capture ConfigFile through symlink at "
+                    f"{live_path}; a broken symlink would otherwise be read "
+                    f"as 'missing' and silently overwrite the snapshot with "
+                    f"{{}}. Resolve the symlink (or remove it so the "
+                    f"underlying path is read/writable) and re-run."
+                )
             if live_path.exists():
                 try:
                     live_data = json.loads(live_path.read_text(encoding="utf-8"))

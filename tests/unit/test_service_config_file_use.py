@@ -296,6 +296,41 @@ def test_use_captures_live_when_switching_to_already_active_profile(
     assert snap_data["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
 
 
+def test_use_capture_does_not_clobber_source_snapshot_on_broken_symlink(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """abby r6 (capture side): a broken symlink at live_path must not be
+    treated as "missing" during capture-before-apply. If it were, the
+    source profile's snapshot would be overwritten with {}, destroying the
+    user's last-good state.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"A": {"command": "x"}}}))
+    service.init(["claude"])
+    service.save("profA")
+    service.save("profB")
+    service.use("profA")  # active is now profA; profA snapshot has the data
+
+    snap_path = service._store.config_file_snapshot_path(
+        "profA", "claude", "claude.json"
+    )
+    snapshot_before = json.loads(snap_path.read_text())
+    assert snapshot_before == {"mcpServers": {"A": {"command": "x"}}}
+
+    # Replace live with a broken symlink, then try to switch profiles.
+    # Capture-before-apply would have read live; pre-r6, exists() == False
+    # would have made capture silently write {} into profA's snapshot.
+    live.unlink()
+    live.symlink_to(tmp_home / ".does-not-exist.json")
+
+    with pytest.raises(StorageError, match="symlink"):
+        service.use("profB")
+
+    # profA's snapshot must not have been touched — the original owned
+    # data is still there for a subsequent recovery.
+    assert json.loads(snap_path.read_text()) == snapshot_before
+
+
 def test_use_rejects_symlink_at_live_path(
     service: ProfileService, tmp_home: Path
 ) -> None:

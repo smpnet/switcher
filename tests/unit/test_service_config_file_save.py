@@ -134,6 +134,30 @@ def test_save_raises_when_live_is_not_a_json_object(
         service.save("workA")
 
 
+def test_save_rejects_broken_symlink_at_live_path(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """A broken symlink at ~/.claude.json must not be silently treated as
+    "missing" by capture — that would write an empty {} snapshot under a
+    name that promises owned data, and a later use() would apply {} onto
+    live and clobber the user's MCPs/oauthAccount.
+
+    abby r6: ``Path.exists()`` returns False for a broken symlink, so the
+    pre-r6 ``if live_path.exists()`` branch couldn't tell the two apart.
+    Capture must reject the symlink up front.
+    """
+    live = tmp_home / ".claude.json"
+    live.symlink_to(tmp_home / ".does-not-exist.json")
+    assert live.is_symlink()
+    assert not live.exists()
+
+    service.init(["claude"])
+    with pytest.raises(StorageError, match="symlink"):
+        service.save("workA")
+    # The rollback in save() must have removed the half-built profile.
+    assert not service._store.profile_dir("workA").exists()
+
+
 def test_save_rollback_removes_partial_profile_on_write_failure(
     service: ProfileService,
     tmp_home: Path,
