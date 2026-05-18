@@ -2722,7 +2722,16 @@ class ProfileService:
             # architectural cleanup path). Adding per-loop unwinding here
             # would duplicate op-log work without the journaling that
             # makes it crash-safe.
-            source_profile = active[tid]
+            # ``active[tid]`` is guaranteed populated for every ``tid`` in
+            # resolved by the target_ids filter at the top of use() (both
+            # the default path's ``profile.tools.keys() & managed`` and the
+            # --only path's explicit ``tid not in managed`` check). Use
+            # ``.get()`` defensively so a future refactor that loosens that
+            # filter doesn't silently turn an invariant violation into a
+            # raw KeyError on the rollback path (abby r8). ``None`` means
+            # "no prior profile known for this tool" — skip rollback, since
+            # there's no source profile to swap_link back to.
+            source_profile = active.get(tid)
             swapped: list[tuple[Path, Path]] = []
             try:
                 for i, dm in enumerate(tool.config_dirs):
@@ -2730,11 +2739,15 @@ class ProfileService:
                         self._store.profile_dir(profile_name) / dm.profile_subdir
                     )
                     live = self._resolver.tool_dir(tool, i)
-                    source_target = (
-                        self._store.profile_dir(source_profile) / dm.profile_subdir
-                    )
-                    swap_link(target, live)
-                    swapped.append((live, source_target))
+                    if source_profile is not None:
+                        source_target = (
+                            self._store.profile_dir(source_profile)
+                            / dm.profile_subdir
+                        )
+                        swap_link(target, live)
+                        swapped.append((live, source_target))
+                    else:
+                        swap_link(target, live)
                 # Symlink swap first, then file overlay — the dir-mapping
                 # flip is visible to the tool before ConfigFile state is
                 # reconciled. Tool validator caps config_files at 1, so
