@@ -322,13 +322,19 @@ def atomic_write_file(target: Path, content: bytes) -> None:
     rename swaps in a fresh inode and only mode bits are restored. Callers
     that need richer metadata preservation must layer it on top.
 
-    **Symlink targets:** rejected with ``IsADirectoryError`` (close
-    relative — "this is a link, not a regular file"). ``Path.replace``
-    would silently turn a symlink at ``target`` into a brand-new regular
-    file at the same path, breaking the redirection the user set up.
-    For switcher's v1 consumers this matches the spec's "file-level
-    symlinks are not viable" decision, but the helper raises instead
-    of destroying so the user sees the incompatibility.
+    **Symlink targets — best-effort rejection:** if ``target`` is a
+    symlink at call time, raise ``IsADirectoryError`` so the user sees
+    the incompatibility instead of having their redirection silently
+    replaced by a regular file. This is **best-effort**, not a hard
+    guarantee: there's a TOCTOU window between the up-front check and
+    the eventual ``Path.replace`` during which another process could
+    swap the target to a symlink. No POSIX primitive cleanly expresses
+    "atomic replace iff target is a regular file", and the realistic
+    threat for v1 consumers (``~/.claude.json``, switcher-private
+    snapshots) is the user statically configuring a symlink — not a
+    concurrent race. Closing the race tightly would require platform-
+    specific tricks (renameat2's flags on Linux, no Windows analogue)
+    that don't match the cross-platform contract this helper provides.
     """
     if target.is_symlink():
         raise IsADirectoryError(
