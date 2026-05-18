@@ -296,6 +296,60 @@ def test_use_captures_live_when_switching_to_already_active_profile(
     assert snap_data["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
 
 
+def test_use_skips_capture_when_symlink_diverged_from_active(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """abby r11: post-partial-commit drift must not corrupt the source
+    profile's snapshot on retry.
+
+    Scenario: a prior multi-tool use(profB) flushed claude's swap + write
+    but raised before set_active_state. On-disk active still says profA;
+    claude's symlink and live now hold profB content. Without divergence
+    detection, the retry's capture-before-apply would read live (profB
+    content) and overwrite profA's snapshot with it — silent cross-
+    profile data corruption.
+
+    The test manually constructs that post-partial-commit state (without
+    needing a second tool with config_files, which would otherwise be
+    needed to force the failure path) and asserts profA's snapshot is
+    not touched by the retry.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"src": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    live.write_text(json.dumps({"mcpServers": {"dst": {}}}))
+    service.save("profB")
+
+    # Restore live, switch onto profA so active = {claude: profA}.
+    live.write_text(json.dumps({"mcpServers": {"src": {}}}))
+    service.use("profA")
+
+    snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    profA_before = json.loads(snap.read_text())
+
+    # Simulate post-partial-commit drift: claude's symlink and live moved
+    # to profB content, on-disk active still says profA (set_active_state
+    # never fired in the imaginary prior failed use(profB)).
+    claude_dir = tmp_home / ".claude"
+    claude_dir.unlink()
+    claude_dir.symlink_to(
+        service._store.profile_dir("profB") / "claude",
+        target_is_directory=True,
+    )
+    live.write_text(json.dumps({"mcpServers": {"dst": {}}}))
+
+    # Retry. Capture for claude must detect the symlink/active divergence
+    # and refuse to overwrite profA's snapshot.
+    service.use("profB")
+
+    profA_after = json.loads(snap.read_text())
+    assert profA_after == profA_before
+    # The owned content must still be "src", NOT "dst" (live at retry time).
+    assert profA_after["mcpServers"] == {"src": {}}
+
+
 def test_use_raises_storage_error_on_non_utf8_snapshot(
     service: ProfileService, tmp_home: Path
 ) -> None:

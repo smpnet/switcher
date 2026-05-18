@@ -224,6 +224,37 @@ class ProfileService:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
 
+    def _symlink_matches_active_source(
+        self, tool: Tool, source_profile: str
+    ) -> bool:
+        """True iff every config_dirs symlink for ``tool`` resolves to
+        ``source_profile``'s expected subdir.
+
+        Used by ``use()`` to detect post-partial-commit drift before the
+        capture phase runs (abby r11). If a prior ``use()`` flushed the
+        per-tool symlink swap + ConfigFile write but raised before
+        ``set_active_state`` persisted, the on-disk active map still
+        reports the *source* profile while the filesystem has moved to
+        the *destination*. Capturing through live in that state would
+        read destination content into the source profile's snapshot,
+        silently corrupting it.
+
+        Conservative: any ``OSError`` (broken target, dangling link,
+        cross-FS resolve issue) is treated as divergence — same intent
+        as "if we can't prove alignment, don't risk overwriting source."
+        """
+        expected_dir = self._store.profile_dir(source_profile)
+        for i, dm in enumerate(tool.config_dirs):
+            live_dir = self._resolver.tool_dir(tool, i)
+            try:
+                target = live_dir.resolve(strict=True)
+                expected = (expected_dir / dm.profile_subdir).resolve(strict=True)
+            except OSError:
+                return False
+            if target != expected:
+                return False
+        return True
+
     def _capture_config_files(self, profile_name: str, tool: Tool) -> None:
         """Extract a tool's owned JSON subtrees from live and snapshot them.
 
@@ -2749,8 +2780,22 @@ class ProfileService:
         # the same call captures-then-no-ops on live, which is data-safe.
         for tid, tool in resolved:
             source = active.get(tid)
-            if source:
-                self._capture_config_files(source, tool)
+            if not source:
+                continue
+            # Skip capture when the tool's config_dirs symlinks don't
+            # match the source profile that on-disk active claims for it
+            # (abby r11). The mismatch fingerprints a partial-commit drift
+            # from a prior failed use(): live now holds destination
+            # content, so capturing into the source snapshot would
+            # silently overwrite the source's owned data with destination
+            # data. The plan + commit phases below reconcile live with
+            # the destination snapshot regardless, so skipping capture
+            # is safe — the only thing we lose is "preserve in-flight
+            # edits on the source profile," which is moot when there are
+            # no source-profile edits (the symlink has already moved).
+            if not self._symlink_matches_active_source(tool, source):
+                continue
+            self._capture_config_files(source, tool)
         # Pre-flight 3: plan every tool's ConfigFile applies. Read-only — no
         # filesystem mutation. Any malformed-JSON / non-object / walker-
         # rejection error raises StorageError here, before swap_link has
