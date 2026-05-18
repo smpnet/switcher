@@ -63,6 +63,18 @@ def test_parse_rejects_iter_as_leaf():
         parse_owned_path(".projects[]")
 
 
+def test_parse_rejects_consecutive_iter():
+    """``[][]`` violates the grammar (subpath after ``[]`` must be ``.KEY``)."""
+    with pytest.raises(InvalidOwnedPath, match="must be followed by"):
+        parse_owned_path(".a[][].b")
+
+
+def test_parse_rejects_iter_without_dot_continuation():
+    """``[]b`` (no dot after iter) violates the grammar."""
+    with pytest.raises(InvalidOwnedPath):
+        parse_owned_path(".a[]b")
+
+
 # ---------------------------------------------------------------------------
 # Extract
 # ---------------------------------------------------------------------------
@@ -248,6 +260,23 @@ def test_apply_rejects_iter_as_leaf_segment():
     snap = {"projects": {"/r/A": {"mcpServers": {}}}}
     with pytest.raises(InvalidOwnedPath, match="leaf"):
         apply_owned_paths(live, snap, (".projects[]",))
+
+
+def test_apply_raises_when_iter_target_is_list_in_live():
+    """Apply must fail loudly when live has a non-dict at an iter target,
+    matching extract's UnsupportedWalkTarget behavior. Silent no-op would
+    hide a malformed live config."""
+    live = {"projects": []}
+    snap: dict[str, object] = {}
+    with pytest.raises(UnsupportedWalkTarget):
+        apply_owned_paths(live, snap, (".projects[].mcpServers",))
+
+
+def test_apply_raises_when_iter_target_is_scalar_in_live():
+    live = {"projects": 1}
+    snap: dict[str, object] = {}
+    with pytest.raises(UnsupportedWalkTarget):
+        apply_owned_paths(live, snap, (".projects[].mcpServers",))
 
 
 def test_apply_iter_preserves_live_key_order():

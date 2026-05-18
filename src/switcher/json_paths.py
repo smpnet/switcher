@@ -91,6 +91,15 @@ def parse_owned_path(path: str) -> tuple[_Segment, ...]:
                 )
             segments.append(("iter",))
             i += 2
+            # Grammar (spec §3.4): subpath after '[]' is '.' KEY only.
+            # Consecutive iter (``.a[][]``) and unprefixed continuation
+            # (``.a[]b``) both have no v1 semantics — reject here so
+            # ConfigFile's parse-based validator catches them at load.
+            if i < len(path) and path[i] != ".":
+                raise InvalidOwnedPath(
+                    f"'[]' must be followed by '.' KEY (got {path[i]!r}) "
+                    f"in {path!r}; consecutive '[]' is not allowed"
+                )
         else:
             raise InvalidOwnedPath(
                 f"unexpected character {ch!r} at position {i} in {path!r}"
@@ -228,10 +237,14 @@ def _apply_segments(
         if key not in live_node:
             return
         if not isinstance(live_node[key], dict):
-            # Live has a scalar where the path expects descent; refuse to
-            # overwrite — deleting would silently destroy a machine-global
-            # value.
-            return
+            # If the next segment is ``iter``, fall through so the iter
+            # branch's ``UnsupportedWalkTarget`` fires — that matches
+            # extract's fail-fast behavior on the same shape. For a key
+            # next-segment, returning silently preserves the machine-
+            # global scalar (delete-on-absence shouldn't destroy a
+            # scalar value, per spec §3.4's empty-after-delete philosophy).
+            if not (rest and rest[0][0] == "iter"):
+                return
         _apply_segments(live_node[key], snap_child if snap_has else {}, rest)
         if created and not live_node[key]:
             # We created this container just to descend; recursion wrote
