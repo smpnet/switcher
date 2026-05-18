@@ -221,8 +221,10 @@ def _apply_segments(
                 live_node.pop(key, None)
             return
 
+        created = False
         if snap_has and key not in live_node:
             live_node[key] = {}
+            created = True
         if key not in live_node:
             return
         if not isinstance(live_node[key], dict):
@@ -231,6 +233,13 @@ def _apply_segments(
             # value.
             return
         _apply_segments(live_node[key], snap_child if snap_has else {}, rest)
+        if created and not live_node[key]:
+            # We created this container just to descend; recursion wrote
+            # nothing. Pruning keeps "machine never had this key" stable
+            # under restore. This is distinct from spec §3.4's
+            # "empty-after-delete preservation" rule — there the container
+            # already existed in live; here it didn't.
+            del live_node[key]
 
     elif head[0] == "iter":
         if not isinstance(live_node, dict):
@@ -239,9 +248,9 @@ def _apply_segments(
                 f"got {type(live_node).__name__}"
             )
         if not rest:
-            # Mirror _extract_into: `[]` as a leaf has no defined semantics
-            # in v1. Without this check, apply would silently no-op while
-            # extract on the same path raises — asymmetric fail-fast.
+            # Defense in depth — ``parse_owned_path`` rejects leaf ``[]``,
+            # so the only way to land here is a direct walker call with a
+            # hand-built segment tuple (test fixtures, future callers).
             raise InvalidOwnedPath(
                 "v1 grammar does not allow '[]' as a leaf segment"
             )
@@ -250,16 +259,17 @@ def _apply_segments(
         snap_keys = set(snap_node.keys()) if snap_is_dict else set()
         for k in live_keys | snap_keys:
             child_snap = snap_node[k] if snap_is_dict and k in snap_node else {}
+            created = False
             if k not in live_node:
-                # Snapshot-only key: only materialize the live entry if the
-                # snapshot subtree actually has owned data here. An empty
-                # ``{}`` child_snap is a placeholder produced by extract when
-                # the iter key existed but the owned leaf was absent at save
-                # time; restoring it should not create a ghost entry on a
-                # machine where the iter key never existed live.
-                if not (isinstance(child_snap, dict) and child_snap):
-                    continue
                 live_node[k] = {}
+                created = True
             if not isinstance(live_node[k], dict):
                 continue
             _apply_segments(live_node[k], child_snap, rest)
+            if created and not live_node[k]:
+                # Same rule as the key branch: a container we created
+                # solely to descend and that gained no content under
+                # recursion gets pruned, so a snapshot's iter placeholder
+                # (``{"/r/A": {}}``) doesn't materialize ghost entries on
+                # a machine that never had that iter key.
+                del live_node[k]
