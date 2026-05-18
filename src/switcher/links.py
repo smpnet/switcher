@@ -321,7 +321,22 @@ def atomic_write_file(target: Path, content: bytes) -> None:
     **Other metadata** (ACLs, xattrs, ownership) is not preserved — the
     rename swaps in a fresh inode and only mode bits are restored. Callers
     that need richer metadata preservation must layer it on top.
+
+    **Symlink targets:** rejected with ``IsADirectoryError`` (close
+    relative — "this is a link, not a regular file"). ``Path.replace``
+    would silently turn a symlink at ``target`` into a brand-new regular
+    file at the same path, breaking the redirection the user set up.
+    For switcher's v1 consumers this matches the spec's "file-level
+    symlinks are not viable" decision, but the helper raises instead
+    of destroying so the user sees the incompatibility.
     """
+    if target.is_symlink():
+        raise IsADirectoryError(
+            f"refusing to atomic-write through symlink at {target!r}; "
+            "atomic rename would replace the link with a regular file, "
+            "breaking the redirection. Resolve the symlink and write to "
+            "the underlying path directly, or remove the symlink."
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     # Capture pre-existing mode so the rename doesn't silently tighten
     # permissions when mkstemp's 0o600 default differs from the live file.

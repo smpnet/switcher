@@ -247,6 +247,18 @@ def _apply_segments(
                 live_node.pop(key, None)
             return
 
+        # Non-leaf descent: if snap has a value here it must be a dict.
+        # A scalar/list at this point is a malformed snapshot (corrupted
+        # on disk or hand-edited); treating it as "absence" would silently
+        # delete owned data downstream. Raise so the user sees corruption
+        # rather than data loss.
+        if snap_has and not isinstance(snap_child, dict):
+            raise UnsupportedWalkTarget(
+                f"snapshot at key {key!r} has type "
+                f"{type(snap_child).__name__}, expected JSON object for "
+                "non-leaf descent (snapshot is likely corrupted)"
+            )
+
         created = False
         if snap_has and key not in live_node:
             live_node[key] = {}
@@ -319,6 +331,16 @@ def _apply_segments(
                     ordered.append(k)
         for k in ordered:
             child_snap = snap_node[k] if snap_is_dict and k in snap_node else {}
+            # Non-leaf descent: snap entry at this iter key must be a dict
+            # if it's present. A scalar/list is malformed snapshot data
+            # (rest is non-empty here per the leaf-iter check above), and
+            # treating it as absence would silently delete owned data.
+            if snap_is_dict and k in snap_node and not isinstance(child_snap, dict):
+                raise UnsupportedWalkTarget(
+                    f"snapshot at iter key {k!r} has type "
+                    f"{type(child_snap).__name__}, expected JSON object "
+                    "(snapshot is likely corrupted)"
+                )
             created = False
             if k not in live_node:
                 live_node[k] = {}

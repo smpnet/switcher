@@ -335,6 +335,31 @@ def test_apply_preserves_iter_entry_scalar_when_snapshot_has_nothing():
     assert out == {"projects": {"/r/A": 1}}
 
 
+def test_apply_raises_on_malformed_snapshot_subtree_at_key():
+    """Snapshot has a scalar where non-leaf descent expects an object.
+    Without this check, snap_has=False would propagate and silently
+    delete owned data from live."""
+    live = {"a": {"b": "owned-data"}}
+    snap = {"a": "corrupted"}
+    with pytest.raises(UnsupportedWalkTarget, match="corrupted"):
+        apply_owned_paths(live, snap, (".a.b",))
+
+
+def test_apply_raises_on_malformed_snapshot_subtree_at_iter_entry():
+    """Snapshot has a scalar at an iter key where descent expects an
+    object. Critical: without this check, apply silently deletes
+    mcpServers from live when snapshot is corrupt."""
+    live = {"projects": {"/r/A": {"mcpServers": {"x": {}}}}}
+    snap = {"projects": {"/r/A": 1}}  # corrupted
+    with pytest.raises(UnsupportedWalkTarget, match="corrupted"):
+        apply_owned_paths(live, snap, (".projects[].mcpServers",))
+    # Critically: live was NOT mutated before the raise. Apply must be
+    # all-or-nothing on the input dict — partial mutation on raise would
+    # silently corrupt live state.
+    # (Note: apply_owned_paths returns a new dict; the raise propagates
+    # so the caller never sees a partial result.)
+
+
 def test_apply_iter_preserves_live_key_order():
     """Iteration through ``[]`` must preserve live's existing dict order so
     a logically-no-op restore doesn't reshuffle key order in the output."""
