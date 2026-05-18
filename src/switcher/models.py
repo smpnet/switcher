@@ -365,28 +365,43 @@ class Tool(BaseModel):
         # and produce order-dependent results. Two entries that share a
         # live path on either OS would extract from / apply to the same
         # file twice — silent clobbering. Reject both at load time.
+        #
+        # Comparison is case-insensitive (``str.casefold``). Default Windows
+        # filesystems (NTFS) and default macOS filesystems (APFS) are
+        # case-insensitive-but-preserving, so ``~/.claude.json`` and
+        # ``~/.Claude.json`` resolve to the same file. Raw string compare
+        # would silently accept them as distinct and re-introduce the
+        # clobber class. Linux case-sensitive ext4 may produce a rare
+        # false positive (two genuinely distinct paths flagged as
+        # duplicates), but the convention in tool configs is lowercase
+        # only, so the trade-off favors safety.
         seen_slots: set[tuple[str, str]] = set()
         seen_posix: set[str] = set()
         seen_windows: set[str] = set()
         for cf in self.config_files:
-            slot = (cf.profile_subdir, cf.profile_filename)
+            slot = (cf.profile_subdir.casefold(), cf.profile_filename.casefold())
             if slot in seen_slots:
                 raise ValueError(
                     f"duplicate config_file snapshot slot "
                     f"(profile_subdir={cf.profile_subdir!r}, "
-                    f"profile_filename={cf.profile_filename!r})"
+                    f"profile_filename={cf.profile_filename!r}); "
+                    "comparison is case-insensitive"
                 )
             seen_slots.add(slot)
-            if cf.posix_path in seen_posix:
+            posix_key = cf.posix_path.casefold()
+            if posix_key in seen_posix:
                 raise ValueError(
-                    f"duplicate config_file posix_path {cf.posix_path!r}"
+                    f"duplicate config_file posix_path {cf.posix_path!r}; "
+                    "comparison is case-insensitive"
                 )
-            seen_posix.add(cf.posix_path)
-            if cf.windows_path in seen_windows:
+            seen_posix.add(posix_key)
+            windows_key = cf.windows_path.casefold()
+            if windows_key in seen_windows:
                 raise ValueError(
-                    f"duplicate config_file windows_path {cf.windows_path!r}"
+                    f"duplicate config_file windows_path {cf.windows_path!r}; "
+                    "comparison is case-insensitive"
                 )
-            seen_windows.add(cf.windows_path)
+            seen_windows.add(windows_key)
         return self
 
 

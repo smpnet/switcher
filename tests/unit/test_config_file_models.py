@@ -247,3 +247,30 @@ def test_tool_rejects_duplicate_config_file_windows_path():
             config_dirs=(_claude_dir(),),
             config_files=(a, b),
         )
+
+
+def test_tool_rejects_case_variant_duplicate_windows_path():
+    """Default NTFS is case-insensitive. .claude.json and .Claude.json
+    resolve to the same file; raw string compare would let them through."""
+    a = _cf("~/.a.json", "%USERPROFILE%\\.claude.json", "a.json")
+    b = _cf("~/.b.json", "%USERPROFILE%\\.Claude.json", "b.json")
+    with pytest.raises(ValidationError, match="duplicate config_file windows_path"):
+        Tool(
+            id="claude",
+            name="Claude Code",
+            config_dirs=(_claude_dir(),),
+            config_files=(a, b),
+        )
+
+
+def test_tool_rejects_case_variant_duplicate_posix_path():
+    """Default APFS on macOS is case-insensitive too. Apply same fold."""
+    a = _cf("~/.claude.json", "%USERPROFILE%\\a.json", "a.json")
+    b = _cf("~/.Claude.json", "%USERPROFILE%\\b.json", "b.json")
+    with pytest.raises(ValidationError, match="duplicate config_file posix_path"):
+        Tool(
+            id="claude",
+            name="Claude Code",
+            config_dirs=(_claude_dir(),),
+            config_files=(a, b),
+        )
