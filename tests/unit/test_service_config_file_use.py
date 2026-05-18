@@ -296,14 +296,17 @@ def test_use_captures_live_when_switching_to_already_active_profile(
     assert snap_data["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
 
 
-def test_use_apply_is_atomic_within_tool(
+def test_use_parse_phase_failure_preserves_all_live_files(
     tmp_home: Path, tmp_state: Path
 ) -> None:
-    """A failure on cf2's parse must not leave cf1's live half-overwritten.
+    """A parse-time failure on cf2 must not leave cf1's live half-overwritten.
 
-    Plan-then-commit refactor: every ConfigFile parses to a planned write
-    before any write executes. A malformed cf2 snapshot raises before cf1's
-    plan is committed.
+    This test verifies the **plan/parse phase** atomicity contract only —
+    every ConfigFile parses to a planned write before any write executes,
+    so a malformed cf2 snapshot raises before any commit. **Commit-phase**
+    failures (write #2 fails after write #1 has been swapped into place) are
+    intentionally out of scope; see ``_apply_config_files`` docstring for
+    the op-log compensation path (plan Task 11).
     """
     cf1 = ConfigFile(
         posix_path="~/.claude.json",

@@ -269,26 +269,29 @@ class ProfileService:
     def _apply_config_files(self, profile_name: str, tool: Tool) -> None:
         """Overlay each ConfigFile's snapshot onto its live path.
 
-        Two-phase to make the per-tool overlay all-or-nothing:
+        Two-phase to make **the parsing/validation** all-or-nothing:
 
           1. **Plan**: for every ConfigFile, read and parse the snapshot and
              the current live file, compute the merged result, accumulate
              ``(live_path, bytes)`` pairs. Any malformed-JSON or non-object
-             error raises ``StorageError`` *before* the writes start, so a
-             bad cf2 cannot leave cf1's live half-overwritten.
+             error raises ``StorageError`` *before* any write happens, so a
+             bad cf2 cannot leave cf1's live half-overwritten by a parse-
+             time failure.
           2. **Commit**: atomic-write each planned pair.
+
+        **Commit-phase atomicity is NOT guaranteed.** The commit loop issues
+        N independent ``atomic_write_file`` calls; each one is individually
+        torn-write-safe, but a failure on write #2 leaves write #1 already
+        in place with no rollback. With v0.1.5's actual scope (one
+        ConfigFile per tool), this is degenerate — there's no #2. The
+        general multi-ConfigFile + multi-tool case is left to the op-log
+        compensation that lands in plan Task 11, which is the architectural
+        path for cross-step recovery (spec §2.7); adding a parallel
+        backup-and-restore mechanism here would duplicate that work.
 
         Snapshot-missing (legacy profile, pre-feature) is a warning, not an
         error — wiping live to ``{}`` would be the destructive default the
-        spec rejects. The warning gives the user a remediation path
-        (``switcher rescan --only X`` or ``switcher save``).
-
-        **Cross-tool atomicity is intentionally out of scope.** With multiple
-        tools each declaring config_files, a failure mid-loop can still leave
-        tool A's live mutated while tool B's is not — exactly symmetric to
-        the existing per-tool ``swap_link`` loop in ``use()`` (and to v0.1.5's
-        broader transaction model: the op-log handles cross-tool compensation
-        on the next ``switcher init --continue``, not the live code path).
+        spec rejects.
 
         The read of live happens immediately before the atomic rename — a
         concurrent Claude write between read and rename is at worst a
@@ -359,6 +362,9 @@ class ProfileService:
             )
 
         # Commit phase: only reached if every ConfigFile's plan succeeded.
+        # Each write is individually torn-write-safe (rename(2) on a temp);
+        # the loop as a whole is NOT — see docstring for the rationale and
+        # the deferred op-log compensation that closes this gap.
         for live_path, content in plans:
             atomic_write_file(live_path, content)
 
