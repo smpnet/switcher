@@ -266,6 +266,81 @@ class ProfileService:
                 json.dumps(snapshot, indent=2, sort_keys=True).encode("utf-8"),
             )
 
+    def _apply_config_files(self, profile_name: str, tool: Tool) -> None:
+        """Overlay each ConfigFile's snapshot onto its live path.
+
+        For each ConfigFile on ``tool``:
+          * Snapshot missing → warn + skip. Wiping live to ``{}`` would be
+            the destructive default the spec explicitly rejects; the warning
+            gives the user a remediation path (``switcher rescan --only X``).
+          * Snapshot malformed or non-object → ``StorageError`` before any
+            mutation. Applying garbage would corrupt live; the user can
+            re-snapshot via ``switcher save`` instead.
+          * Live missing → synthesize from snapshot's owned paths only,
+            atomic-write.
+          * Live malformed or non-object → ``StorageError`` before any
+            mutation; we won't blindly clobber a file we couldn't parse.
+          * Otherwise → apply owned subtrees and atomic-write back.
+
+        The read of live happens immediately before the atomic rename — a
+        concurrent Claude write between read and rename is at worst a
+        microsecond-wide race, and Claude does not touch owned paths during
+        routine session activity (spec §1).
+        """
+        for cf in tool.config_files:
+            live_path = self._resolver.expand(
+                cf.windows_path if IS_WINDOWS else cf.posix_path
+            )
+            snap_path = self._store.config_file_snapshot_path(
+                profile_name, cf.profile_subdir, cf.profile_filename
+            )
+
+            if not snap_path.exists():
+                # Stderr matches the project's existing warning convention
+                # (see `_warn_migration`). caplog won't pick this up; tests
+                # use `capsys`.
+                print(
+                    f"warning: config_file snapshot missing for {tool.id!r} at "
+                    f"{snap_path}; skipping apply. Run 'switcher rescan --only "
+                    f"{tool.id}' to repair, or 'switcher save' to capture "
+                    f"current live state.",
+                    file=sys.stderr,
+                )
+                continue
+
+            try:
+                snapshot = json.loads(snap_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as e:
+                raise StorageError(
+                    f"malformed snapshot JSON at {snap_path}: {e.msg} "
+                    f"(line {e.lineno})"
+                ) from e
+            if not isinstance(snapshot, dict):
+                raise StorageError(
+                    f"snapshot at {snap_path} is not a JSON object"
+                )
+
+            if live_path.exists():
+                try:
+                    live_data = json.loads(live_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as e:
+                    raise StorageError(
+                        f"malformed live JSON at {live_path}: {e.msg} "
+                        f"(line {e.lineno})"
+                    ) from e
+                if not isinstance(live_data, dict):
+                    raise StorageError(
+                        f"live file at {live_path} is not a JSON object"
+                    )
+            else:
+                live_data = {}
+
+            merged = apply_owned_paths(live_data, snapshot, cf.owned_json_paths)
+            atomic_write_file(
+                live_path,
+                json.dumps(merged, indent=2, sort_keys=True).encode("utf-8"),
+            )
+
     def _capture_tool(self, profile: str, tool: Tool) -> list[str]:
         """Move every live dir for `tool` into `profile`, then link back.
 
@@ -2545,6 +2620,9 @@ class ProfileService:
                 target = self._store.profile_dir(profile_name) / dm.profile_subdir
                 live = self._resolver.tool_dir(tool, i)
                 swap_link(target, live)
+            # Symlink swap first, then file overlay — so the dir-mapping flip
+            # is visible to the tool before ConfigFile state is reconciled.
+            self._apply_config_files(profile_name, tool)
             active[tid] = profile_name
         # Combined write that also flushes any derived migration entries.
         self._store.set_active_state(active, self._derive_cache_for_active(active))
