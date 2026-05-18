@@ -316,6 +316,25 @@ def test_apply_preserves_scalar_when_key_descent_blocked_and_snapshot_empty():
     assert out == {"a": 1}
 
 
+def test_apply_raises_when_iter_entry_blocks_descent_and_snapshot_has_data():
+    """Mirror the key-branch rule for per-entry iter descent: if snapshot
+    has owned data below an iter entry but live has a scalar/list there,
+    raise instead of silently dropping the owned data."""
+    live = {"projects": {"/r/A": 1}}
+    snap = {"projects": {"/r/A": {"mcpServers": {"x": {}}}}}
+    with pytest.raises(UnsupportedWalkTarget):
+        apply_owned_paths(live, snap, (".projects[].mcpServers",))
+
+
+def test_apply_preserves_iter_entry_scalar_when_snapshot_has_nothing():
+    """Delete-on-absence path through iter doesn't apply when the entry
+    is a scalar — preserve silently."""
+    live = {"projects": {"/r/A": 1}}
+    snap: dict[str, object] = {}
+    out = apply_owned_paths(live, snap, (".projects[].mcpServers",))
+    assert out == {"projects": {"/r/A": 1}}
+
+
 def test_apply_iter_preserves_live_key_order():
     """Iteration through ``[]`` must preserve live's existing dict order so
     a logically-no-op restore doesn't reshuffle key order in the output."""

@@ -324,6 +324,20 @@ def _apply_segments(
                 live_node[k] = {}
                 created = True
             if not isinstance(live_node[k], dict):
+                # Same rule as the key branch (r7/r8): descent blocked at
+                # this iter entry. If the snapshot has owned data here,
+                # raise — overwriting destroys machine-global; skipping
+                # silently loses owned data. If the snapshot has nothing
+                # to write (delete-on-absence or empty placeholder),
+                # preserve the scalar silently.
+                if isinstance(child_snap, dict) and child_snap:
+                    raise UnsupportedWalkTarget(
+                        f"iter entry {k!r} requires descent, but live has "
+                        f"a {type(live_node[k]).__name__} here; snapshot "
+                        "has owned data below this point — overwriting "
+                        "would destroy machine-global state, skipping "
+                        "would drop owned data"
+                    )
                 continue
             _apply_segments(live_node[k], child_snap, rest)
             if created and not live_node[k]:
