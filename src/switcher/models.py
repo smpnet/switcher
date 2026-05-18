@@ -404,6 +404,37 @@ class Tool(BaseModel):
             seen_windows.add(windows_key)
         return self
 
+    @model_validator(mode="after")
+    def _validate_at_most_one_config_file(self) -> Tool:
+        # v0.1.5 ships one ConfigFile per tool max. The use() commit phase
+        # writes the N planned applies in an unrolled loop with no rollback
+        # if write #k fails after write #1 has been swapped into place. With
+        # N <= 1 the loop is degenerate and safe; allowing N > 1 reaches a
+        # commit-time partial-mutation window that the op-log compensation
+        # (plan Task 11, spec §2.7) is the architectural answer to.
+        #
+        # When op-log compensation lands and use() gains rollback for the
+        # commit phase, this validator should be removed. Until then,
+        # multi-file support belongs behind that integration, not ahead of
+        # it. Users with multiple owned subtrees in a single file express
+        # that via multiple ``owned_json_paths`` on one ConfigFile, which
+        # the v0.1.5 walker already handles end-to-end.
+        #
+        # Runs *after* _validate_credential_dirs so a 2-CF input that's
+        # also internally inconsistent (e.g. duplicate snapshot slot)
+        # surfaces the more-specific "duplicate" error first — the dead-code
+        # duplicate-detection path is preserved for the post-op-log world
+        # where multi-file becomes legal.
+        if len(self.config_files) > 1:
+            raise ValueError(
+                f"tool {self.id!r}: multiple config_files entries are not "
+                "supported in v0.1.5 — multi-file commit atomicity awaits "
+                "op-log compensation (plan Task 11). Combine the owned "
+                "subtrees into a single config_files entry with multiple "
+                "owned_json_paths instead."
+            )
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Profile

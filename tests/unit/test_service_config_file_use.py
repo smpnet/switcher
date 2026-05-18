@@ -296,65 +296,32 @@ def test_use_captures_live_when_switching_to_already_active_profile(
     assert snap_data["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
 
 
-def test_use_parse_phase_failure_preserves_all_live_files(
-    tmp_home: Path, tmp_state: Path
+def test_use_aborts_before_swap_link_when_snapshot_malformed(
+    service: ProfileService, tmp_home: Path
 ) -> None:
-    """A parse-time failure on cf2 must not leave cf1's live half-overwritten.
-
-    This test verifies the **plan/parse phase** atomicity contract only —
-    every ConfigFile parses to a planned write before any write executes,
-    so a malformed cf2 snapshot raises before any commit. **Commit-phase**
-    failures (write #2 fails after write #1 has been swapped into place) are
-    intentionally out of scope; see ``_apply_config_files`` docstring for
-    the op-log compensation path (plan Task 11).
+    """Plan-then-mutate ordering: a malformed snapshot raises during the
+    pre-flight plan phase, before any swap_link or live write. The dir
+    symlink must remain pointing at the source profile (addresses abby r4
+    finding 1: parse failures used to half-apply the switch).
     """
-    cf1 = ConfigFile(
-        posix_path="~/.claude.json",
-        windows_path="%USERPROFILE%\\.claude.json",
-        profile_subdir="claude",
-        profile_filename="claude.json",
-        merge_strategy="json_subtree_merge",
-        owned_json_paths=(".mcpServers",),
-    )
-    cf2 = ConfigFile(
-        posix_path="~/.claude-extra.json",
-        windows_path="%USERPROFILE%\\.claude-extra.json",
-        profile_subdir="claude",
-        profile_filename="claude-extra.json",
-        merge_strategy="json_subtree_merge",
-        owned_json_paths=(".mcpServers",),
-    )
-    base = build_registry(Path("/nonexistent"))
-    enhanced: list[Tool] = []
-    for t in base:
-        if t.id == "claude":
-            enhanced.append(t.model_copy(update={"config_files": (cf1, cf2)}))
-        else:
-            enhanced.append(t)
-    store = FileProfileStore(tmp_state)
-    resolver = PathResolver(home=tmp_home)
-    service = ProfileService(store, resolver, tuple(enhanced))
-
-    live1 = tmp_home / ".claude.json"
-    live2 = tmp_home / ".claude-extra.json"
-    live1.write_text(json.dumps({"mcpServers": {"profA-1": {}}}))
-    live2.write_text(json.dumps({"mcpServers": {"profA-2": {}}}))
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"A": {}}}))
     service.init(["claude"])
     service.save("profA")
+    service.save("profB")
 
-    # Replace live1 with a sentinel that the test will look for. If cf2's
-    # plan failure ever lets cf1's write through, this sentinel is gone.
-    sentinel = {"mcpServers": {"unchanged": {"command": "preserved"}}}
-    live1.write_text(json.dumps(sentinel))
+    # use profA first to establish a clean baseline pointing at profA.
+    service.use("profA")
+    claude_dir = tmp_home / ".claude"
+    profA_subdir = service._store.profile_dir("profA") / "claude"
+    assert claude_dir.resolve() == profA_subdir.resolve()
 
-    # Corrupt profA's cf2 snapshot.
-    snap2 = service._store.config_file_snapshot_path(
-        "profA", "claude", "claude-extra.json"
-    )
-    snap2.write_text("not json {")
+    # Corrupt profB's snapshot, then attempt to switch to it.
+    snap_b = service._store.config_file_snapshot_path("profB", "claude", "claude.json")
+    snap_b.write_text("not json {")
 
     with pytest.raises(StorageError, match="malformed"):
-        service.use("profA")
+        service.use("profB")
 
-    # cf1's live must be untouched — plan phase aborts before any commit.
-    assert json.loads(live1.read_text()) == sentinel
+    # swap_link must NOT have fired — symlink still points at profA's subdir.
+    assert claude_dir.resolve() == profA_subdir.resolve()

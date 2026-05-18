@@ -266,37 +266,37 @@ class ProfileService:
                 json.dumps(snapshot, indent=2, sort_keys=True).encode("utf-8"),
             )
 
-    def _apply_config_files(self, profile_name: str, tool: Tool) -> None:
-        """Overlay each ConfigFile's snapshot onto its live path.
+    def _plan_config_file_applies(
+        self, profile_name: str, tool: Tool
+    ) -> list[tuple[Path, bytes]]:
+        """Read-only: validate and plan each ConfigFile's apply.
 
-        Two-phase to make **the parsing/validation** all-or-nothing:
+        Returns a list of ``(live_path, content_bytes)`` pairs the caller can
+        atomic-write to commit the apply. Pure reads + an in-memory walker;
+        does not touch the filesystem state on disk. Emits the snapshot-
+        missing warning during this phase (it's a non-fatal observation).
 
-          1. **Plan**: for every ConfigFile, read and parse the snapshot and
-             the current live file, compute the merged result, accumulate
-             ``(live_path, bytes)`` pairs. Any malformed-JSON or non-object
-             error raises ``StorageError`` *before* any write happens, so a
-             bad cf2 cannot leave cf1's live half-overwritten by a parse-
-             time failure.
-          2. **Commit**: atomic-write each planned pair.
+        Raises ``StorageError`` on any of:
+          * malformed snapshot JSON / non-object snapshot
+          * malformed live JSON / non-object live
+          * ``UnsupportedWalkTarget`` from the walker
+            (lets through; surfaces as ``ValueError`` chain to use() — but
+            we deliberately don't catch it: the path being unwalkable is a
+            config bug the user must fix, not a transient state).
 
-        **Commit-phase atomicity is NOT guaranteed.** The commit loop issues
-        N independent ``atomic_write_file`` calls; each one is individually
-        torn-write-safe, but a failure on write #2 leaves write #1 already
-        in place with no rollback. With v0.1.5's actual scope (one
-        ConfigFile per tool), this is degenerate — there's no #2. The
-        general multi-ConfigFile + multi-tool case is left to the op-log
-        compensation that lands in plan Task 11, which is the architectural
-        path for cross-step recovery (spec §2.7); adding a parallel
-        backup-and-restore mechanism here would duplicate that work.
+        Used by ``use()`` as a pre-flight ahead of any ``swap_link`` or
+        write, so a parse-time failure on any tool's ConfigFile aborts the
+        switch before the filesystem is mutated (abby r4 finding 1).
 
-        Snapshot-missing (legacy profile, pre-feature) is a warning, not an
-        error — wiping live to ``{}`` would be the destructive default the
-        spec rejects.
+        The Tool validator caps ``config_files`` at 1 in v0.1.5, so the
+        list this returns is 0 or 1 entries; the loop shape is kept general
+        for forward-compat with the op-log work that lifts the cap (plan
+        Task 11).
 
-        The read of live happens immediately before the atomic rename — a
-        concurrent Claude write between read and rename is at worst a
-        microsecond-wide race, and Claude does not touch owned paths during
-        routine session activity (spec §1).
+        The read of live happens immediately before the atomic rename in
+        the caller — a concurrent Claude write between read and rename is
+        at worst a microsecond-wide race, and Claude does not touch owned
+        paths during routine session activity (spec §1).
         """
         plans: list[tuple[Path, bytes]] = []
         for cf in tool.config_files:
@@ -310,8 +310,7 @@ class ProfileService:
             if not snap_path.exists():
                 # Stderr matches the project's existing warning convention
                 # (see `_warn_migration`). caplog won't pick this up; tests
-                # use `capsys`. Emitted during plan phase so the user sees
-                # it even if a later cf raises and aborts the commit phase.
+                # use `capsys`.
                 #
                 # No remediation hint: in v0.1.5 PR4 the snapshot is created
                 # by `save()`, and the next switch onto the source profile's
@@ -360,13 +359,7 @@ class ProfileService:
                     json.dumps(merged, indent=2, sort_keys=True).encode("utf-8"),
                 )
             )
-
-        # Commit phase: only reached if every ConfigFile's plan succeeded.
-        # Each write is individually torn-write-safe (rename(2) on a temp);
-        # the loop as a whole is NOT — see docstring for the rationale and
-        # the deferred op-log compensation that closes this gap.
-        for live_path, content in plans:
-            atomic_write_file(live_path, content)
+        return plans
 
     def _capture_tool(self, profile: str, tool: Tool) -> list[str]:
         """Move every live dir for `tool` into `profile`, then link back.
@@ -2642,13 +2635,17 @@ class ProfileService:
                         f"profile {profile_name!r} is missing "
                         f"{dm.profile_subdir!r} for tool {tid!r}"
                     )
-        # Capture phase: snapshot the *currently-active* live state into each
-        # tool's source profile before the switch overwrites it. Without this,
-        # any user edit to ~/.claude.json made while profA was active is lost
-        # on `use(profB)` — config_dirs propagate through the symlink, but
-        # ConfigFile live state is a real file the tool atomic-renames into.
-        # Runs ahead of any mutation so a malformed-live StorageError fires
-        # before any swap_link, leaving the filesystem unchanged.
+        # Capture phase first: snapshot the *currently-active* live state
+        # into each tool's source profile before anything else. This must
+        # precede the plan phase below — for `switcher use <active>`, source
+        # and destination are the same profile, so plan needs to read the
+        # *post-capture* snapshot (otherwise an in-flight live edit is
+        # planned-away with the pre-capture content).
+        #
+        # Capture only writes to source profile's snapshot, never to live —
+        # so a failure here leaves live untouched. Source-snapshot updates
+        # are idempotent on retry (re-capturing current live overwrites with
+        # the same content); partial-tool capture is benign.
         #
         # No ``source != profile_name`` guard: `switcher use <active>` is a
         # legitimate operation (reload-from-snapshot affordance), but with a
@@ -2659,14 +2656,32 @@ class ProfileService:
             source = active.get(tid)
             if source:
                 self._capture_config_files(source, tool)
+        # Pre-flight 3: plan every tool's ConfigFile applies. Read-only — no
+        # filesystem mutation. Any malformed-JSON / non-object / walker-
+        # rejection error raises StorageError here, before swap_link has
+        # flipped any symlinks. Closes the "half-applied switch on parse
+        # failure" gap abby r4 flagged.
+        #
+        # Per-tool plans are kept in a dict so the commit phase below can
+        # consume each tool's plan immediately after its swap_link loop —
+        # preserves the "links first, file overlay second" ordering inside
+        # a single tool while keeping all parses upfront across tools.
+        config_file_plans: dict[str, list[tuple[Path, bytes]]] = {
+            tid: self._plan_config_file_applies(profile_name, tool)
+            for tid, tool in resolved
+        }
         for tid, tool in resolved:
             for i, dm in enumerate(tool.config_dirs):
                 target = self._store.profile_dir(profile_name) / dm.profile_subdir
                 live = self._resolver.tool_dir(tool, i)
                 swap_link(target, live)
-            # Symlink swap first, then file overlay — so the dir-mapping flip
+            # Symlink swap first, then file overlay — the dir-mapping flip
             # is visible to the tool before ConfigFile state is reconciled.
-            self._apply_config_files(profile_name, tool)
+            # Tool validator caps config_files at 1, so this is at most one
+            # write; the swap+write+active sequence has no intermediate
+            # multi-write step that could leave the tool partially applied.
+            for live_path, content in config_file_plans[tid]:
+                atomic_write_file(live_path, content)
             active[tid] = profile_name
         # Combined write that also flushes any derived migration entries.
         self._store.set_active_state(active, self._derive_cache_for_active(active))

@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from switcher.models import (
+    ConfigFile,
     CredentialFile,
     DirMapping,
     Profile,
@@ -184,6 +185,71 @@ def test_tool_id_is_validated() -> None:
                 ),
             ),
         )
+
+
+def test_tool_rejects_multiple_config_files() -> None:
+    """v0.1.5 caps config_files at 1 per tool until op-log compensation
+    handles multi-file commit atomicity (plan Task 11). The two-file shape
+    must be rejected at load time, with a message that points users at the
+    single-CF / multiple-owned-paths workaround.
+    """
+    cf1 = {
+        "posix_path": "~/.claude.json",
+        "windows_path": "%USERPROFILE%\\.claude.json",
+        "profile_subdir": "claude",
+        "profile_filename": "claude.json",
+        "merge_strategy": "json_subtree_merge",
+        "owned_json_paths": [".mcpServers"],
+    }
+    cf2 = {
+        "posix_path": "~/.claude-extra.json",
+        "windows_path": "%USERPROFILE%\\.claude-extra.json",
+        "profile_subdir": "claude",
+        "profile_filename": "claude-extra.json",
+        "merge_strategy": "json_subtree_merge",
+        "owned_json_paths": [".extra"],
+    }
+    with pytest.raises(ValidationError, match="multiple config_files"):
+        Tool.model_validate(
+            {
+                "id": "claude",
+                "name": "Claude Code",
+                "config_dirs": [
+                    {
+                        "posix_path": "~/.claude",
+                        "windows_path": "%USERPROFILE%\\.claude",
+                        "profile_subdir": "claude",
+                    }
+                ],
+                "config_files": [cf1, cf2],
+            }
+        )
+
+
+def test_tool_accepts_single_config_file() -> None:
+    """Sanity-check the at-most-one validator: one entry must still pass."""
+    tool = Tool(
+        id="claude",
+        name="Claude Code",
+        config_dirs=(
+            DirMapping(
+                posix_path="~/.claude",
+                windows_path="%USERPROFILE%\\.claude",
+                profile_subdir="claude",
+            ),
+        ),
+        config_files=(
+            ConfigFile(
+                posix_path="~/.claude.json",
+                windows_path="%USERPROFILE%\\.claude.json",
+                profile_subdir="claude",
+                profile_filename="claude.json",
+                merge_strategy="json_subtree_merge",
+                owned_json_paths=(".mcpServers",),
+            ),
+        ),
+    )
+    assert len(tool.config_files) == 1
 
 
 def test_tool_credential_must_reference_known_config_dir() -> None:
