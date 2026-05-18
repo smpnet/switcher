@@ -200,3 +200,50 @@ def test_tool_rejects_config_files_with_unknown_subdir():
 def test_tool_defaults_config_files_to_empty_tuple():
     tool = Tool(id="claude", name="Claude Code", config_dirs=(_claude_dir(),))
     assert tool.config_files == ()
+
+
+def _cf(posix: str, windows: str, filename: str) -> ConfigFile:
+    return ConfigFile(
+        posix_path=posix,
+        windows_path=windows,
+        profile_subdir="claude",
+        profile_filename=filename,
+        merge_strategy="json_subtree_merge",
+        owned_json_paths=(".mcpServers",),
+    )
+
+
+def test_tool_rejects_duplicate_config_file_snapshot_slot():
+    a = _cf("~/.a.json", "%USERPROFILE%\\a.json", "same.json")
+    b = _cf("~/.b.json", "%USERPROFILE%\\b.json", "same.json")
+    with pytest.raises(ValidationError, match="duplicate config_file snapshot slot"):
+        Tool(
+            id="claude",
+            name="Claude Code",
+            config_dirs=(_claude_dir(),),
+            config_files=(a, b),
+        )
+
+
+def test_tool_rejects_duplicate_config_file_posix_path():
+    a = _cf("~/.same.json", "%USERPROFILE%\\a.json", "a.json")
+    b = _cf("~/.same.json", "%USERPROFILE%\\b.json", "b.json")
+    with pytest.raises(ValidationError, match="duplicate config_file posix_path"):
+        Tool(
+            id="claude",
+            name="Claude Code",
+            config_dirs=(_claude_dir(),),
+            config_files=(a, b),
+        )
+
+
+def test_tool_rejects_duplicate_config_file_windows_path():
+    a = _cf("~/.a.json", "%USERPROFILE%\\same.json", "a.json")
+    b = _cf("~/.b.json", "%USERPROFILE%\\same.json", "b.json")
+    with pytest.raises(ValidationError, match="duplicate config_file windows_path"):
+        Tool(
+            id="claude",
+            name="Claude Code",
+            config_dirs=(_claude_dir(),),
+            config_files=(a, b),
+        )

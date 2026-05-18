@@ -360,6 +360,33 @@ class Tool(BaseModel):
                     f"config_file references unknown config_dir {cf.profile_subdir!r}; "
                     f"expected one of {sorted(valid)}"
                 )
+        # Uniqueness across config_files. Two entries that share a snapshot
+        # slot (same profile_subdir + profile_filename) would race on write
+        # and produce order-dependent results. Two entries that share a
+        # live path on either OS would extract from / apply to the same
+        # file twice — silent clobbering. Reject both at load time.
+        seen_slots: set[tuple[str, str]] = set()
+        seen_posix: set[str] = set()
+        seen_windows: set[str] = set()
+        for cf in self.config_files:
+            slot = (cf.profile_subdir, cf.profile_filename)
+            if slot in seen_slots:
+                raise ValueError(
+                    f"duplicate config_file snapshot slot "
+                    f"(profile_subdir={cf.profile_subdir!r}, "
+                    f"profile_filename={cf.profile_filename!r})"
+                )
+            seen_slots.add(slot)
+            if cf.posix_path in seen_posix:
+                raise ValueError(
+                    f"duplicate config_file posix_path {cf.posix_path!r}"
+                )
+            seen_posix.add(cf.posix_path)
+            if cf.windows_path in seen_windows:
+                raise ValueError(
+                    f"duplicate config_file windows_path {cf.windows_path!r}"
+                )
+            seen_windows.add(cf.windows_path)
         return self
 
 
