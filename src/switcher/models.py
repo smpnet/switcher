@@ -247,11 +247,19 @@ class ConfigFile(BaseModel):
                 ) from e
             parsed.append(segments)
 
-        # Reject duplicates and prefix overlaps. Two distinct paths that
-        # aren't in a prefix relationship cannot share data under the v1
-        # grammar; a prefix relationship means the longer path writes into
-        # a subtree the shorter path already captured whole, producing
-        # order-sensitive extraction and silent clobbering at apply time.
+        # Reject duplicates and overlaps. A "prefix overlap" means the
+        # longer path writes into a subtree the shorter path already
+        # captured whole, producing order-sensitive extraction and silent
+        # clobbering at apply time.
+        #
+        # The overlap check treats ``iter`` as a wildcard that matches any
+        # key. ``.a[].b`` and ``.a.c`` both touch ``a["c"]["b"]`` whenever
+        # ``"c"`` is one of the iterated keys (abby r7) — the earlier
+        # strict-tuple-prefix check missed this because the segment tuples
+        # ``(key 'a', iter, key 'b')`` and ``(key 'a', key 'c')`` aren't
+        # literal prefixes of each other. Two paths overlap iff their
+        # first ``min(len, len)`` positions are pairwise compatible (same
+        # key, or at least one ``iter``).
         for i, a in enumerate(parsed):
             for j, b in enumerate(parsed):
                 if i == j:
@@ -261,13 +269,34 @@ class ConfigFile(BaseModel):
                         f"duplicate owned_json_paths entry "
                         f"{self.owned_json_paths[j]!r}"
                     )
-                # Strict prefix only — equal-length is duplicate handled above.
-                if len(a) < len(b) and b[: len(a)] == a:
+                if len(a) > len(b):
+                    # The pair will surface on the (j, i) iteration with
+                    # a shorter-or-equal; only check the longer side once.
+                    continue
+                if a == b:
+                    # Already reported above when i < j; the j < i half is
+                    # otherwise a no-op for equal tuples.
+                    continue
+                # len(a) <= len(b) and a != b: a is a candidate prefix.
+                # Check pairwise compatibility under iter-as-wildcard.
+                compatible = True
+                for k in range(len(a)):
+                    sa, sb = a[k], b[k]
+                    if sa[0] == "iter" or sb[0] == "iter":
+                        continue
+                    # Both segments are ("key", name).
+                    if sa[1] != sb[1]:
+                        compatible = False
+                        break
+                if compatible:
                     raise ValueError(
                         f"owned_json_paths entries overlap: "
-                        f"{self.owned_json_paths[i]!r} is a prefix of "
+                        f"{self.owned_json_paths[i]!r} is a "
+                        f"(wildcard-compatible) prefix of "
                         f"{self.owned_json_paths[j]!r}; one captures a "
-                        f"subtree the other writes into"
+                        f"subtree the other writes into. '[]' iter "
+                        f"matches any object key, so e.g. '.a[].b' "
+                        f"overlaps with '.a.c.b' (when 'c' is iterated)."
                     )
         return self
 

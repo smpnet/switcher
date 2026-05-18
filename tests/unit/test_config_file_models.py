@@ -161,6 +161,54 @@ def test_config_file_rejects_prefix_overlapping_owned_paths():
         )
 
 
+def test_config_file_rejects_wildcard_key_overlap():
+    """abby r7: `.a[].b` and `.a.c` overlap when 'c' is one of the iterated
+    keys — both touch ``a["c"]["b"]``. The pre-r7 strict-tuple-prefix check
+    accepted this pair because (key 'a', iter, key 'b') and (key 'a',
+    key 'c') aren't literal prefixes of each other, reintroducing the
+    order-sensitive clobber the validator exists to prevent.
+    """
+    with pytest.raises(ValidationError, match="overlap"):
+        ConfigFile(
+            posix_path="~/.x.json",
+            windows_path="%USERPROFILE%\\.x.json",
+            profile_subdir="claude",
+            profile_filename="x.json",
+            merge_strategy="json_subtree_merge",
+            owned_json_paths=(".a[].b", ".a.c"),
+        )
+
+
+def test_config_file_rejects_wildcard_then_equal_keys_overlap():
+    """`.a[].b` and `.a.c.b` overlap: iter matches 'c' at position 1, then
+    both reach the same `.b` leaf at position 2."""
+    with pytest.raises(ValidationError, match="overlap"):
+        ConfigFile(
+            posix_path="~/.x.json",
+            windows_path="%USERPROFILE%\\.x.json",
+            profile_subdir="claude",
+            profile_filename="x.json",
+            merge_strategy="json_subtree_merge",
+            owned_json_paths=(".a[].b", ".a.c.b"),
+        )
+
+
+def test_config_file_accepts_disjoint_iter_paths():
+    """Sanity-check: `.a[].b` and `.a[].c` are disjoint (different leaf keys
+    under the same iter), so the validator must NOT flag them as overlap.
+    Same for `.a[].b` vs `.x[].b` — different top-level keys.
+    """
+    cf = ConfigFile(
+        posix_path="~/.x.json",
+        windows_path="%USERPROFILE%\\.x.json",
+        profile_subdir="claude",
+        profile_filename="x.json",
+        merge_strategy="json_subtree_merge",
+        owned_json_paths=(".a[].b", ".a[].c", ".x[].b"),
+    )
+    assert len(cf.owned_json_paths) == 3
+
+
 def test_tool_accepts_config_files_referencing_an_existing_subdir():
     cf = ConfigFile(
         posix_path="~/.claude.json",
