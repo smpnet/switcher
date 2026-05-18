@@ -304,9 +304,19 @@ def atomic_write_file(target: Path, content: bytes) -> None:
       ``unlink(missing_ok=True)`` the tmp file so retries don't accumulate
       orphans.
 
-    Scope: torn-write prevention, not power-loss durability. No fsync on
-    the tmp file or parent directory — matches the explicit trade-off
+    **Scope:** torn-write prevention, not power-loss durability. No fsync
+    on the tmp file or parent directory — matches the explicit trade-off
     documented in ``oplog._write_records``.
+
+    **Metadata behavior:** the rename swaps in a brand-new inode created
+    by ``mkstemp``, so the prior target's mode bits / ACLs / xattrs are
+    not preserved. For the v1 consumer (``~/.claude.json``) this is
+    intentional and harmless: Claude Code itself uses write-tmp+rename
+    for its own writes, so the live file already cycles its inode and
+    default-umask permissions on every Claude write. Future callers that
+    need metadata preservation must layer that on top (read mode bits
+    before the rename, ``chmod`` after) — this helper deliberately stays
+    a thin atomic-replace primitive.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmpname = tempfile.mkstemp(

@@ -255,9 +255,20 @@ def _apply_segments(
                 "v1 grammar does not allow '[]' as a leaf segment"
             )
         snap_is_dict = isinstance(snap_node, dict)
-        live_keys = set(live_node.keys())
-        snap_keys = set(snap_node.keys()) if snap_is_dict else set()
-        for k in live_keys | snap_keys:
+        # Iterate live keys in their existing dict order first, then append
+        # snapshot-only keys in snapshot dict order. ``set | set`` would
+        # produce a hash-derived order, and although our serializer uses
+        # ``sort_keys=True`` so the on-disk file is stable regardless, the
+        # walker shouldn't bake in an assumption about the caller's
+        # serialization. Stable iteration here keeps walker output
+        # order-independent of set hashing.
+        ordered: list[str] = list(live_node.keys())
+        seen = set(ordered)
+        if snap_is_dict:
+            for k in snap_node.keys():
+                if k not in seen:
+                    ordered.append(k)
+        for k in ordered:
             child_snap = snap_node[k] if snap_is_dict and k in snap_node else {}
             created = False
             if k not in live_node:

@@ -250,6 +250,46 @@ def test_apply_rejects_iter_as_leaf_segment():
         apply_owned_paths(live, snap, (".projects[]",))
 
 
+def test_apply_iter_preserves_live_key_order():
+    """Iteration through ``[]`` must preserve live's existing dict order so
+    a logically-no-op restore doesn't reshuffle key order in the output."""
+    live = {
+        "projects": {
+            "/z-last": {"mcpServers": {"a": {}}},
+            "/a-first": {"mcpServers": {"b": {}}},
+            "/m-middle": {"mcpServers": {"c": {}}},
+        }
+    }
+    # Snapshot matches live exactly — apply should be a no-op shape-wise.
+    snap = {
+        "projects": {
+            "/m-middle": {"mcpServers": {"c": {}}},
+            "/z-last": {"mcpServers": {"a": {}}},
+            "/a-first": {"mcpServers": {"b": {}}},
+        }
+    }
+    out = apply_owned_paths(live, snap, (".projects[].mcpServers",))
+    # Live's original key order is preserved (z-last, a-first, m-middle),
+    # NOT the snapshot's order or a hash-derived set order.
+    assert list(out["projects"].keys()) == ["/z-last", "/a-first", "/m-middle"]
+
+
+def test_apply_iter_appends_snapshot_only_keys_in_snapshot_order():
+    """Snapshot-only keys (those not in live) get appended after live's
+    keys, in the order they appear in the snapshot dict."""
+    live = {"projects": {"/live-A": {"mcpServers": {"x": {}}}}}
+    snap = {
+        "projects": {
+            "/snap-only-Z": {"mcpServers": {"y": {}}},
+            "/live-A": {"mcpServers": {"x": {}}},
+            "/snap-only-A": {"mcpServers": {"z": {}}},
+        }
+    }
+    out = apply_owned_paths(live, snap, (".projects[].mcpServers",))
+    # Live key first, then snapshot-only in snapshot dict order.
+    assert list(out["projects"].keys()) == ["/live-A", "/snap-only-Z", "/snap-only-A"]
+
+
 def test_apply_multiple_owned_paths_composes():
     live = {
         "mcpServers": {"old": {}},
