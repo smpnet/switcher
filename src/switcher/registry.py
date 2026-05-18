@@ -44,6 +44,58 @@ def load_user_tools(registry_dir: Path) -> tuple[Tool, ...]:
     return tuple(_load_toml_resource(p) for p in sorted(registry_dir.glob("*.toml")))
 
 
+def _validate_config_files_unique_across_tools(tools: tuple[Tool, ...]) -> None:
+    """Reject cross-tool ConfigFile collisions.
+
+    Per-tool ``ConfigFile`` uniqueness (snapshot slot + posix/windows live
+    paths, all case-insensitive) is enforced by the Tool model validator,
+    but that only catches collisions *within* a single tool. Two distinct
+    tools could still claim the same snapshot slot or the same live config
+    file (abby r13). On ``save()`` / ``use()`` that would silently race the
+    two tools in registry order — the later writer wins, the earlier tool's
+    data is lost.
+
+    Comparison is case-insensitive (``str.casefold``) for the same reason
+    as the intra-tool check: default Windows (NTFS) and default macOS
+    (APFS) filesystems are case-insensitive-but-preserving.
+
+    With the v0.1.5 max-one-ConfigFile-per-tool cap, each tool contributes
+    at most one entry to each map; we don't need a same-tool guard.
+    """
+    seen_slot: dict[tuple[str, str], str] = {}
+    seen_posix: dict[str, str] = {}
+    seen_windows: dict[str, str] = {}
+    for t in tools:
+        for cf in t.config_files:
+            slot = (cf.profile_subdir.casefold(), cf.profile_filename.casefold())
+            if slot in seen_slot:
+                raise ValueError(
+                    f"cross-tool config_file collision: tools "
+                    f"{seen_slot[slot]!r} and {t.id!r} both claim snapshot "
+                    f"slot (profile_subdir={cf.profile_subdir!r}, "
+                    f"profile_filename={cf.profile_filename!r})"
+                )
+            seen_slot[slot] = t.id
+            posix_key = cf.posix_path.casefold()
+            if posix_key in seen_posix:
+                raise ValueError(
+                    f"cross-tool config_file collision: tools "
+                    f"{seen_posix[posix_key]!r} and {t.id!r} both claim "
+                    f"posix_path {cf.posix_path!r}; comparison is "
+                    f"case-insensitive"
+                )
+            seen_posix[posix_key] = t.id
+            windows_key = cf.windows_path.casefold()
+            if windows_key in seen_windows:
+                raise ValueError(
+                    f"cross-tool config_file collision: tools "
+                    f"{seen_windows[windows_key]!r} and {t.id!r} both claim "
+                    f"windows_path {cf.windows_path!r}; comparison is "
+                    f"case-insensitive"
+                )
+            seen_windows[windows_key] = t.id
+
+
 def build_registry(registry_dir: Path) -> tuple[Tool, ...]:
     """Merge builtins and user tools. User entries override builtins, with a
     stderr warning so the override is visible. A second user TOML colliding
@@ -53,6 +105,10 @@ def build_registry(registry_dir: Path) -> tuple[Tool, ...]:
     Order of checks matters: once a user file has claimed a slot, the next
     collision is user-vs-user even if the slot started as a builtin. Check
     `user_seen` first so the second user file gets the right attribution.
+
+    Cross-tool ConfigFile uniqueness is validated last, after the override
+    merge has converged, so the check sees the final tool set the rest of
+    the system operates on.
     """
     builtins = load_builtin_tools()
     builtin_ids = frozenset(t.id for t in builtins)
@@ -71,7 +127,9 @@ def build_registry(registry_dir: Path) -> tuple[Tool, ...]:
             )
         by_id[t.id] = t
         user_seen.add(t.id)
-    return tuple(by_id.values())
+    final = tuple(by_id.values())
+    _validate_config_files_unique_across_tools(final)
+    return final
 
 
 def find_tool(registry: tuple[Tool, ...], tool_id: str) -> Tool | None:
