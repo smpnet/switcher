@@ -3484,6 +3484,13 @@ class ProfileService:
 
         See spec §3 for full semantics. Dry-run bypasses non-TTY and skipped-tool
         guards (§3.1: "shows both phases without mutating or prompting").
+
+        ConfigFile invariant (spec §3.6): non-purge mode does NOT touch the
+        live config file (no symlink to break, unlike DirMapping) and
+        preserves per-profile ConfigFile snapshots alongside dir snapshots
+        — the asymmetric alternative is silent data loss. Purge mode's
+        ``shutil.rmtree(state_dir)`` carries snapshots away with the rest
+        of state.
         """
         self._require_initialized()
 
@@ -3608,6 +3615,13 @@ class ProfileService:
         _execute_uninstall_mapping). CORRUPT mappings always refuse
         regardless of --force; --force handles only the orphan-no-cache
         case (matches uninstall --force at service.py's pre-flight).
+
+        ConfigFile invariant: live config files are intentionally
+        untouched. There is no symlink to break (unlike
+        DirMapping/restore_real_dir), and writing the snapshot back
+        would destroy any drift the tool produced since the last
+        switch. Per-profile snapshots also stay on disk — same
+        preservation discipline as dir snapshots.
         """
         self._require_initialized()
         self._require_managed()
