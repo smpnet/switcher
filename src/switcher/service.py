@@ -269,24 +269,33 @@ class ProfileService:
     def _apply_config_files(self, profile_name: str, tool: Tool) -> None:
         """Overlay each ConfigFile's snapshot onto its live path.
 
-        For each ConfigFile on ``tool``:
-          * Snapshot missing → warn + skip. Wiping live to ``{}`` would be
-            the destructive default the spec explicitly rejects; the warning
-            gives the user a remediation path (``switcher rescan --only X``).
-          * Snapshot malformed or non-object → ``StorageError`` before any
-            mutation. Applying garbage would corrupt live; the user can
-            re-snapshot via ``switcher save`` instead.
-          * Live missing → synthesize from snapshot's owned paths only,
-            atomic-write.
-          * Live malformed or non-object → ``StorageError`` before any
-            mutation; we won't blindly clobber a file we couldn't parse.
-          * Otherwise → apply owned subtrees and atomic-write back.
+        Two-phase to make the per-tool overlay all-or-nothing:
+
+          1. **Plan**: for every ConfigFile, read and parse the snapshot and
+             the current live file, compute the merged result, accumulate
+             ``(live_path, bytes)`` pairs. Any malformed-JSON or non-object
+             error raises ``StorageError`` *before* the writes start, so a
+             bad cf2 cannot leave cf1's live half-overwritten.
+          2. **Commit**: atomic-write each planned pair.
+
+        Snapshot-missing (legacy profile, pre-feature) is a warning, not an
+        error — wiping live to ``{}`` would be the destructive default the
+        spec rejects. The warning gives the user a remediation path
+        (``switcher rescan --only X`` or ``switcher save``).
+
+        **Cross-tool atomicity is intentionally out of scope.** With multiple
+        tools each declaring config_files, a failure mid-loop can still leave
+        tool A's live mutated while tool B's is not — exactly symmetric to
+        the existing per-tool ``swap_link`` loop in ``use()`` (and to v0.1.5's
+        broader transaction model: the op-log handles cross-tool compensation
+        on the next ``switcher init --continue``, not the live code path).
 
         The read of live happens immediately before the atomic rename — a
         concurrent Claude write between read and rename is at worst a
         microsecond-wide race, and Claude does not touch owned paths during
         routine session activity (spec §1).
         """
+        plans: list[tuple[Path, bytes]] = []
         for cf in tool.config_files:
             live_path = self._resolver.expand(
                 cf.windows_path if IS_WINDOWS else cf.posix_path
@@ -298,7 +307,8 @@ class ProfileService:
             if not snap_path.exists():
                 # Stderr matches the project's existing warning convention
                 # (see `_warn_migration`). caplog won't pick this up; tests
-                # use `capsys`.
+                # use `capsys`. Emitted during plan phase so the user sees
+                # it even if a later cf raises and aborts the commit phase.
                 print(
                     f"warning: config_file snapshot missing for {tool.id!r} at "
                     f"{snap_path}; skipping apply. Run 'switcher rescan --only "
@@ -336,10 +346,16 @@ class ProfileService:
                 live_data = {}
 
             merged = apply_owned_paths(live_data, snapshot, cf.owned_json_paths)
-            atomic_write_file(
-                live_path,
-                json.dumps(merged, indent=2, sort_keys=True).encode("utf-8"),
+            plans.append(
+                (
+                    live_path,
+                    json.dumps(merged, indent=2, sort_keys=True).encode("utf-8"),
+                )
             )
+
+        # Commit phase: only reached if every ConfigFile's plan succeeded.
+        for live_path, content in plans:
+            atomic_write_file(live_path, content)
 
     def _capture_tool(self, profile: str, tool: Tool) -> list[str]:
         """Move every live dir for `tool` into `profile`, then link back.
@@ -2615,6 +2631,17 @@ class ProfileService:
                         f"profile {profile_name!r} is missing "
                         f"{dm.profile_subdir!r} for tool {tid!r}"
                     )
+        # Capture phase: snapshot the *currently-active* live state into each
+        # tool's source profile before the switch overwrites it. Without this,
+        # any user edit to ~/.claude.json made while profA was active is lost
+        # on `use(profB)` — config_dirs propagate through the symlink, but
+        # ConfigFile live state is a real file the tool atomic-renames into.
+        # Runs ahead of any mutation so a malformed-live StorageError fires
+        # before any swap_link, leaving the filesystem unchanged.
+        for tid, tool in resolved:
+            source = active.get(tid)
+            if source and source != profile_name:
+                self._capture_config_files(source, tool)
         for tid, tool in resolved:
             for i, dm in enumerate(tool.config_dirs):
                 target = self._store.profile_dir(profile_name) / dm.profile_subdir

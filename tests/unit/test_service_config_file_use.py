@@ -218,3 +218,103 @@ def test_use_raises_when_live_is_not_a_json_object(
     live.write_text(json.dumps(["array", "not", "object"]))
     with pytest.raises(StorageError, match="object"):
         service.use("profA")
+
+
+def test_use_captures_active_profile_live_before_apply(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """A user edit to live while profA is active must survive a round-trip
+    through use(profB) → use(profA).
+
+    Without capture-before-apply, ``use(profB)`` overwrites live with profB's
+    snapshot and the edit is lost. With it, the edit is first captured into
+    profA's snapshot, then the switch proceeds.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"A": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    # Manually rewrite live, then save profB.
+    live.write_text(json.dumps({"mcpServers": {"B": {}}}))
+    service.save("profB")
+
+    # Switch onto profA so the active map points at profA. After this,
+    # capture-before-apply will treat profA as the source on the next switch.
+    service.use("profA")
+    assert json.loads(live.read_text())["mcpServers"] == {"A": {}}
+
+    # User edit while profA is active.
+    live_data = json.loads(live.read_text())
+    live_data["mcpServers"]["user-added"] = {"command": "z"}
+    live.write_text(json.dumps(live_data))
+
+    # Switch away; the edit must be captured into profA's snapshot, not lost.
+    service.use("profB")
+    assert json.loads(live.read_text())["mcpServers"] == {"B": {}}
+
+    # Switch back; the user-added MCP must reappear.
+    service.use("profA")
+    out = json.loads(live.read_text())
+    assert out["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
+
+
+def test_use_apply_is_atomic_within_tool(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """A failure on cf2's parse must not leave cf1's live half-overwritten.
+
+    Plan-then-commit refactor: every ConfigFile parses to a planned write
+    before any write executes. A malformed cf2 snapshot raises before cf1's
+    plan is committed.
+    """
+    cf1 = ConfigFile(
+        posix_path="~/.claude.json",
+        windows_path="%USERPROFILE%\\.claude.json",
+        profile_subdir="claude",
+        profile_filename="claude.json",
+        merge_strategy="json_subtree_merge",
+        owned_json_paths=(".mcpServers",),
+    )
+    cf2 = ConfigFile(
+        posix_path="~/.claude-extra.json",
+        windows_path="%USERPROFILE%\\.claude-extra.json",
+        profile_subdir="claude",
+        profile_filename="claude-extra.json",
+        merge_strategy="json_subtree_merge",
+        owned_json_paths=(".mcpServers",),
+    )
+    base = build_registry(Path("/nonexistent"))
+    enhanced: list[Tool] = []
+    for t in base:
+        if t.id == "claude":
+            enhanced.append(t.model_copy(update={"config_files": (cf1, cf2)}))
+        else:
+            enhanced.append(t)
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, tuple(enhanced))
+
+    live1 = tmp_home / ".claude.json"
+    live2 = tmp_home / ".claude-extra.json"
+    live1.write_text(json.dumps({"mcpServers": {"profA-1": {}}}))
+    live2.write_text(json.dumps({"mcpServers": {"profA-2": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    # Replace live1 with a sentinel that the test will look for. If cf2's
+    # plan failure ever lets cf1's write through, this sentinel is gone.
+    sentinel = {"mcpServers": {"unchanged": {"command": "preserved"}}}
+    live1.write_text(json.dumps(sentinel))
+
+    # Corrupt profA's cf2 snapshot.
+    snap2 = service._store.config_file_snapshot_path(
+        "profA", "claude", "claude-extra.json"
+    )
+    snap2.write_text("not json {")
+
+    with pytest.raises(StorageError, match="malformed"):
+        service.use("profA")
+
+    # cf1's live must be untouched — plan phase aborts before any commit.
+    assert json.loads(live1.read_text()) == sentinel
