@@ -279,6 +279,24 @@ def test_apply_raises_when_iter_target_is_scalar_in_live():
         apply_owned_paths(live, snap, (".projects[].mcpServers",))
 
 
+def test_apply_raises_when_key_descent_blocked_and_snapshot_has_data():
+    """Snapshot has owned data below ``.a.b`` but live has a scalar at ``.a``.
+    Overwriting destroys machine-global; skipping drops owned data; raise."""
+    live = {"a": 1}
+    snap = {"a": {"b": 2}}
+    with pytest.raises(UnsupportedWalkTarget):
+        apply_owned_paths(live, snap, (".a.b",))
+
+
+def test_apply_preserves_scalar_when_key_descent_blocked_and_snapshot_empty():
+    """Snapshot has nothing at ``.a.b`` (delete-on-absence). Live has a scalar
+    at ``.a``. Path doesn't apply — preserve the scalar silently."""
+    live = {"a": 1}
+    snap: dict[str, object] = {}
+    out = apply_owned_paths(live, snap, (".a.b",))
+    assert out == {"a": 1}
+
+
 def test_apply_iter_preserves_live_key_order():
     """Iteration through ``[]`` must preserve live's existing dict order so
     a logically-no-op restore doesn't reshuffle key order in the output."""

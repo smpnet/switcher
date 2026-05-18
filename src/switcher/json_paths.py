@@ -237,13 +237,32 @@ def _apply_segments(
         if key not in live_node:
             return
         if not isinstance(live_node[key], dict):
-            # If the next segment is ``iter``, fall through so the iter
-            # branch's ``UnsupportedWalkTarget`` fires — that matches
-            # extract's fail-fast behavior on the same shape. For a key
-            # next-segment, returning silently preserves the machine-
-            # global scalar (delete-on-absence shouldn't destroy a
-            # scalar value, per spec §3.4's empty-after-delete philosophy).
-            if not (rest and rest[0][0] == "iter"):
+            # Live has a non-dict at a non-leaf descent point. Three sub-cases:
+            #
+            # - Next segment is ``iter``: fall through so the iter branch's
+            #   ``UnsupportedWalkTarget`` fires — iter on a non-dict is
+            #   structurally undefined regardless of snapshot state, and
+            #   matches extract's behavior.
+            #
+            # - Next segment is ``key`` and snapshot has data to write below:
+            #   raise. Overwriting would destroy a machine-global scalar;
+            #   skipping would silently drop owned data the snapshot was
+            #   trying to restore. Surface the mismatch to the user.
+            #
+            # - Next segment is ``key`` and snapshot has no data below
+            #   (delete-on-absence path): return silently. The path doesn't
+            #   apply to current live shape; preserving the scalar matches
+            #   spec §3.4's empty-after-delete philosophy.
+            if rest and rest[0][0] == "iter":
+                pass
+            elif snap_has:
+                raise UnsupportedWalkTarget(
+                    f"path requires descent through key {key!r}, but live has "
+                    f"a {type(live_node[key]).__name__} here; snapshot has owned "
+                    "data below this point — overwriting would destroy "
+                    "machine-global state, skipping would drop owned data"
+                )
+            else:
                 return
         _apply_segments(live_node[key], snap_child if snap_has else {}, rest)
         if created and not live_node[key]:
