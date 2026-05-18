@@ -134,6 +134,26 @@ def test_save_raises_when_live_is_not_a_json_object(
         service.save("workA")
 
 
+def test_save_raises_storage_error_on_non_utf8_live(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """A non-UTF-8 live file must surface as StorageError, not a raw
+    UnicodeDecodeError. abby r10: read_text(encoding='utf-8') raises
+    UnicodeDecodeError which we previously only caught alongside
+    JSONDecodeError, leaking the decode traceback past the service
+    boundary.
+    """
+    live = tmp_home / ".claude.json"
+    # 0xff is invalid as a UTF-8 start byte; this surfaces UnicodeDecodeError
+    # on read_text(encoding='utf-8') without ever reaching the JSON parser.
+    live.write_bytes(b"\xff\xfe\xfd")
+    service.init(["claude"])
+    with pytest.raises(StorageError, match="non-UTF-8"):
+        service.save("workA")
+    # Rollback inside save() must have removed the half-built profile.
+    assert not service._store.profile_dir("workA").exists()
+
+
 def test_save_raises_storage_error_when_live_has_non_object_at_iter(
     service: ProfileService, tmp_home: Path
 ) -> None:

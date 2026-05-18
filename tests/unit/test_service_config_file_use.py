@@ -296,6 +296,30 @@ def test_use_captures_live_when_switching_to_already_active_profile(
     assert snap_data["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
 
 
+def test_use_raises_storage_error_on_non_utf8_snapshot(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """A snapshot corrupted to non-UTF-8 bytes must surface as StorageError
+    during pre-flight, not a raw UnicodeDecodeError (abby r10). Snapshots
+    are switcher-written so we should only see this on external tampering;
+    the service contract should still hold.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    snap.write_bytes(b"\xff\xfe\xfd")
+
+    claude_dir = tmp_home / ".claude"
+    before = claude_dir.resolve()
+    with pytest.raises(StorageError, match="non-UTF-8"):
+        service.use("profA")
+    # Pre-flight raises before swap_link — symlink unchanged.
+    assert claude_dir.resolve() == before
+
+
 def test_use_raises_storage_error_when_snapshot_has_non_object_at_iter(
     service: ProfileService, tmp_home: Path
 ) -> None:

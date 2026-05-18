@@ -265,7 +265,17 @@ class ProfileService:
                 )
             if live_path.exists():
                 try:
-                    live_data = json.loads(live_path.read_text(encoding="utf-8"))
+                    live_text = live_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError as e:
+                    # Catch alongside JSONDecodeError below: bad encoding is
+                    # as realistic as bad JSON for user-controlled live files
+                    # and must surface as StorageError, not a raw decode
+                    # traceback (abby r10).
+                    raise StorageError(
+                        f"non-UTF-8 bytes at {live_path}: {e}"
+                    ) from e
+                try:
+                    live_data = json.loads(live_text)
                 except json.JSONDecodeError as e:
                     raise StorageError(
                         f"malformed JSON at {live_path}: {e.msg} (line {e.lineno})"
@@ -380,7 +390,17 @@ class ProfileService:
                 continue
 
             try:
-                snapshot = json.loads(snap_path.read_text(encoding="utf-8"))
+                snap_text = snap_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as e:
+                # Snapshots are switcher-written and therefore always UTF-8
+                # in our normal flow; this branch only fires on concurrent
+                # external corruption of the snapshot file. Re-raise as
+                # StorageError to keep the boundary consistent (abby r10).
+                raise StorageError(
+                    f"non-UTF-8 bytes at snapshot {snap_path}: {e}"
+                ) from e
+            try:
+                snapshot = json.loads(snap_text)
             except json.JSONDecodeError as e:
                 raise StorageError(
                     f"malformed snapshot JSON at {snap_path}: {e.msg} "
@@ -393,7 +413,13 @@ class ProfileService:
 
             if live_path.exists():
                 try:
-                    live_data = json.loads(live_path.read_text(encoding="utf-8"))
+                    live_text = live_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError as e:
+                    raise StorageError(
+                        f"non-UTF-8 bytes at {live_path}: {e}"
+                    ) from e
+                try:
+                    live_data = json.loads(live_text)
                 except json.JSONDecodeError as e:
                     raise StorageError(
                         f"malformed live JSON at {live_path}: {e.msg} "
