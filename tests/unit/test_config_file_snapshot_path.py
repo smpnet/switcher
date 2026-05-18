@@ -26,19 +26,22 @@ def test_snapshot_path_under_dot_switcher(tmp_path: Path) -> None:
 
 def test_snapshot_path_validates_profile_name(tmp_path: Path) -> None:
     store = FileProfileStore(tmp_path)
-    with pytest.raises(ValueError):
+    # validate_safe_name rejects path-separator-bearing inputs by raising
+    # ValueError; assert on the message so a future rename of the validator's
+    # error text doesn't silently break this test.
+    with pytest.raises(ValueError, match="invalid name"):
         store.config_file_snapshot_path("../escape", "claude", "claude.json")
 
 
 def test_snapshot_path_validates_subdir(tmp_path: Path) -> None:
     store = FileProfileStore(tmp_path)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="invalid name"):
         store.config_file_snapshot_path("workA", "../escape", "claude.json")
 
 
 def test_snapshot_path_validates_filename(tmp_path: Path) -> None:
     store = FileProfileStore(tmp_path)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="invalid name"):
         store.config_file_snapshot_path("workA", "claude", "../escape.json")
 
 
