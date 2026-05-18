@@ -224,6 +224,33 @@ class ProfileService:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
 
+    def _seed_config_files(self, src_profile: str, dst_profile: str, tool: Tool) -> None:
+        """Copy a tool's ConfigFile snapshots from src_profile into dst_profile.
+
+        Mirrors ``_seed_credentials``: a state-store data copy, not a live
+        capture. Without this, the first ``switcher use`` on a newly-created
+        profile would hit snapshot-missing for every ConfigFile-equipped
+        tool — warn-and-skip at best, silent live-data loss at worst if a
+        future caller drops the warn guard.
+
+        Silently skips a missing source snapshot — the source profile
+        pre-dates this feature and the user can repair via
+        ``switcher rescan --only <tool>`` (spec §3.6 migration path).
+        Without this skip, every create() from a legacy profile would
+        block on ``FileNotFoundError`` from ``shutil.copy2``.
+        """
+        for cf in tool.config_files:
+            src = self._store.config_file_snapshot_path(
+                src_profile, cf.profile_subdir, cf.profile_filename
+            )
+            dst = self._store.config_file_snapshot_path(
+                dst_profile, cf.profile_subdir, cf.profile_filename
+            )
+            if not src.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+
     def _symlink_matches_active_source(
         self, tool: Tool, source_profile: str
     ) -> bool:
@@ -3020,6 +3047,7 @@ class ProfileService:
                     # / credentials list unknown).
                     continue
                 self._seed_credentials(src_profile, name, tool)
+                self._seed_config_files(src_profile, name, tool)
         except Exception:
             shutil.rmtree(self._store.profile_dir(name), ignore_errors=True)
             raise
