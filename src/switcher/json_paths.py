@@ -238,6 +238,14 @@ def _apply_segments(
         for k in live_keys | snap_keys:
             child_snap = snap_node[k] if snap_is_dict and k in snap_node else {}
             if k not in live_node:
+                # Snapshot-only key: only materialize the live entry if the
+                # snapshot subtree actually has owned data here. An empty
+                # ``{}`` child_snap is a placeholder produced by extract when
+                # the iter key existed but the owned leaf was absent at save
+                # time; restoring it should not create a ghost entry on a
+                # machine where the iter key never existed live.
+                if not (isinstance(child_snap, dict) and child_snap):
+                    continue
                 live_node[k] = {}
             if not isinstance(live_node[k], dict):
                 continue

@@ -121,6 +121,32 @@ def test_config_file_rejects_unsupported_owned_path_token():
         )
 
 
+def test_config_file_rejects_duplicate_owned_json_paths():
+    with pytest.raises(ValidationError, match="duplicate owned_json_paths entry"):
+        ConfigFile(
+            posix_path="~/.claude.json",
+            windows_path="%USERPROFILE%\\.claude.json",
+            profile_subdir="claude",
+            profile_filename="claude.json",
+            merge_strategy="json_subtree_merge",
+            owned_json_paths=(".mcpServers", ".mcpServers"),
+        )
+
+
+def test_config_file_rejects_prefix_overlapping_owned_paths():
+    """`.projects` and `.projects[].mcpServers` overlap — the first captures
+    the whole subtree, the second writes into it. Order-sensitive at extract."""
+    with pytest.raises(ValidationError, match="overlap"):
+        ConfigFile(
+            posix_path="~/.claude.json",
+            windows_path="%USERPROFILE%\\.claude.json",
+            profile_subdir="claude",
+            profile_filename="claude.json",
+            merge_strategy="json_subtree_merge",
+            owned_json_paths=(".projects", ".projects[].mcpServers"),
+        )
+
+
 def test_tool_accepts_config_files_referencing_an_existing_subdir():
     cf = ConfigFile(
         posix_path="~/.claude.json",

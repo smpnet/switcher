@@ -237,13 +237,38 @@ class ConfigFile(BaseModel):
         # surfaces at registry load, not on the first ``use`` that touches it.
         from switcher.json_paths import InvalidOwnedPath, parse_owned_path
 
+        parsed: list[tuple[tuple[str, ...], ...]] = []
         for raw in self.owned_json_paths:
             try:
-                parse_owned_path(raw)
+                segments = parse_owned_path(raw)
             except InvalidOwnedPath as e:
                 raise ValueError(
                     f"invalid owned_json_paths entry {raw!r}: {e}"
                 ) from e
+            parsed.append(segments)
+
+        # Reject duplicates and prefix overlaps. Two distinct paths that
+        # aren't in a prefix relationship cannot share data under the v1
+        # grammar; a prefix relationship means the longer path writes into
+        # a subtree the shorter path already captured whole, producing
+        # order-sensitive extraction and silent clobbering at apply time.
+        for i, a in enumerate(parsed):
+            for j, b in enumerate(parsed):
+                if i == j:
+                    continue
+                if a == b and i < j:
+                    raise ValueError(
+                        f"duplicate owned_json_paths entry "
+                        f"{self.owned_json_paths[j]!r}"
+                    )
+                # Strict prefix only — equal-length is duplicate handled above.
+                if len(a) < len(b) and b[: len(a)] == a:
+                    raise ValueError(
+                        f"owned_json_paths entries overlap: "
+                        f"{self.owned_json_paths[i]!r} is a prefix of "
+                        f"{self.owned_json_paths[j]!r}; one captures a "
+                        f"subtree the other writes into"
+                    )
         return self
 
 

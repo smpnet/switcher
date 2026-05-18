@@ -199,6 +199,20 @@ def test_apply_iter_creates_projects_root_when_missing_in_live():
     assert out["projects"]["/r/A"] == {"mcpServers": {"new": {}}}
 
 
+def test_apply_iter_does_not_create_ghost_entry_for_empty_snapshot_placeholder():
+    """An iter-only snapshot placeholder (``{"/r/A": {}}``) must not
+    materialize a ghost project on a machine where ``/r/A`` never existed.
+
+    This is the shape extract produces when the iter found the project but
+    its owned leaf was absent at save time. Restoring shouldn't pollute
+    live with a project entry that has no owned data.
+    """
+    live: dict[str, object] = {}
+    snap = {"projects": {"/r/A": {}}}
+    out = apply_owned_paths(live, snap, (".projects[].mcpServers",))
+    assert out.get("projects", {}).get("/r/A") is None
+
+
 def test_apply_keeps_empty_project_object_after_delete():
     live = {"projects": {"/r/A": {"mcpServers": {"old": {}}}}}
     snap = {"projects": {"/r/A": {}}}
