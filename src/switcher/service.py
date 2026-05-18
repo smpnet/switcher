@@ -44,7 +44,11 @@ from switcher.errors import (
     UnknownProfileError,
     UnknownToolError,
 )
-from switcher.json_paths import apply_owned_paths, extract_owned_paths
+from switcher.json_paths import (
+    UnsupportedWalkTarget,
+    apply_owned_paths,
+    extract_owned_paths,
+)
 from switcher.links import (
     atomic_write_file,
     move_or_seed_dir,
@@ -271,7 +275,18 @@ class ProfileService:
                         f"expected JSON object at {live_path}, got "
                         f"{type(live_data).__name__}"
                     )
-                snapshot = extract_owned_paths(live_data, cf.owned_json_paths)
+                try:
+                    snapshot = extract_owned_paths(live_data, cf.owned_json_paths)
+                except UnsupportedWalkTarget as e:
+                    # e.g., live has {"projects": []} but owned path is
+                    # ``.projects[].mcpServers`` — iter expects a JSON object,
+                    # gets a list. This is live-data drift, not a registry
+                    # config bug, so surface it consistently with the other
+                    # live-validation errors above (abby r9).
+                    raise StorageError(
+                        f"owned path walks into a non-object value at "
+                        f"{live_path}: {e}"
+                    ) from e
             else:
                 snapshot = {}
 
@@ -296,10 +311,15 @@ class ProfileService:
         Raises ``StorageError`` on any of:
           * malformed snapshot JSON / non-object snapshot
           * malformed live JSON / non-object live
-          * ``UnsupportedWalkTarget`` from the walker
-            (lets through; surfaces as ``ValueError`` chain to use() — but
-            we deliberately don't catch it: the path being unwalkable is a
-            config bug the user must fix, not a transient state).
+          * symlink at live_path (atomic_write_file would refuse at commit
+            time, post-swap — see r5 fix)
+          * ``UnsupportedWalkTarget`` from the walker (live or snapshot has
+            a shape — typically a JSON array — under an ``iter`` segment).
+            Re-raised as ``StorageError`` with file context (abby r9). The
+            unwalkable shape is a live-data or snapshot-data issue, not a
+            registry config bug; surfacing it as ``StorageError`` keeps
+            the service-boundary error contract consistent with the
+            other live-validation errors above.
 
         Used by ``use()`` as a pre-flight ahead of any ``swap_link`` or
         write, so a parse-time failure on any tool's ConfigFile aborts the
@@ -386,7 +406,22 @@ class ProfileService:
             else:
                 live_data = {}
 
-            merged = apply_owned_paths(live_data, snapshot, cf.owned_json_paths)
+            try:
+                merged = apply_owned_paths(
+                    live_data, snapshot, cf.owned_json_paths
+                )
+            except UnsupportedWalkTarget as e:
+                # e.g., snapshot or live has {"projects": []} but the owned
+                # path is ``.projects[].mcpServers`` — iter expects a JSON
+                # object, gets a list. The walker can't tell us which side
+                # (live vs. snapshot) is the problem, so cite both in the
+                # message for actionability. Re-raise as StorageError to
+                # keep the service-boundary contract consistent with the
+                # other live/snapshot-validation errors above (abby r9).
+                raise StorageError(
+                    f"owned path walks into a non-object value when "
+                    f"applying snapshot {snap_path} onto {live_path}: {e}"
+                ) from e
             plans.append(
                 (
                     live_path,

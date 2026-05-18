@@ -296,6 +296,33 @@ def test_use_captures_live_when_switching_to_already_active_profile(
     assert snap_data["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
 
 
+def test_use_raises_storage_error_when_snapshot_has_non_object_at_iter(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """abby r9 (apply side): a snapshot shape like ``{"projects": []}``
+    under an owned path ``.projects[].mcpServers`` makes the walker raise
+    UnsupportedWalkTarget. Service must re-raise as StorageError so the
+    CLI's friendly error handling kicks in instead of a raw ValueError
+    traceback, and it must fire pre-flight (no swap_link).
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {}, "projects": {}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    # Corrupt profA's snapshot to have a non-object at an iter target.
+    snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    snap.write_text(json.dumps({"projects": [], "mcpServers": {}}))
+
+    # Track the symlink before to verify swap_link doesn't fire.
+    claude_dir = tmp_home / ".claude"
+    before = claude_dir.resolve()
+
+    with pytest.raises(StorageError, match="non-object"):
+        service.use("profA")
+    assert claude_dir.resolve() == before
+
+
 def test_use_capture_does_not_clobber_source_snapshot_on_broken_symlink(
     service: ProfileService, tmp_home: Path
 ) -> None:

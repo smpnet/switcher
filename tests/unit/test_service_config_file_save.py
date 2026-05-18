@@ -134,6 +134,24 @@ def test_save_raises_when_live_is_not_a_json_object(
         service.save("workA")
 
 
+def test_save_raises_storage_error_when_live_has_non_object_at_iter(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """Live shape like ``{"projects": []}`` under an owned path
+    ``.projects[].mcpServers`` makes the walker raise
+    ``UnsupportedWalkTarget`` (iter expects a JSON object). Service must
+    catch and re-raise as StorageError with file context, instead of
+    letting a raw ValueError escape — abby r9.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"projects": [], "mcpServers": {}}))
+    service.init(["claude"])
+    with pytest.raises(StorageError, match="non-object"):
+        service.save("workA")
+    # The half-built profile must be rolled back by save()'s try/except.
+    assert not service._store.profile_dir("workA").exists()
+
+
 def test_save_rejects_broken_symlink_at_live_path(
     service: ProfileService, tmp_home: Path
 ) -> None:
