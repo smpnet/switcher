@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from pydantic import (
     AliasChoices,
@@ -180,6 +180,57 @@ class CredentialFile(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# ConfigFile
+# ---------------------------------------------------------------------------
+
+
+class ConfigFile(BaseModel):
+    """One on-disk JSON config file managed via owned-path read-merge-write.
+
+    Unlike DirMapping (which the tool reaches via a symlink to a per-profile
+    directory), ConfigFile names a single file the tool writes to via atomic
+    rename(2). Switcher owns specific JSON subtrees inside it and reconciles
+    them on every switch by reading live, overlaying the profile's snapshot,
+    and atomically rewriting.
+
+    ``profile_subdir`` is a *grouping key* that ties this config file to the
+    same logical owner as a sibling DirMapping. The snapshot lives under
+    ``<profile>/.switcher/config_files/<profile_subdir>/<profile_filename>`` —
+    ``.switcher`` is a reserved subtree no DirMapping can collide with
+    (``validate_safe_name`` rejects leading dots), so the reservation is
+    structurally unforgeable.
+
+    ``owned_json_paths`` uses a narrow jq-ish grammar; see ``json_paths.py``
+    for the supported tokens (``.key``, ``[]`` over JSON objects, composition).
+    """
+
+    posix_path: str
+    windows_path: str
+    profile_subdir: str
+    profile_filename: str
+    merge_strategy: Literal["json_subtree_merge"]
+    owned_json_paths: tuple[str, ...]
+
+    @field_validator("profile_subdir")
+    @classmethod
+    def _validate_subdir(cls, v: str) -> str:
+        return validate_safe_name(v)
+
+    @field_validator("profile_filename")
+    @classmethod
+    def _validate_filename(cls, v: str) -> str:
+        return validate_safe_name(v)
+
+    @model_validator(mode="after")
+    def _validate_owned_paths_non_empty(self) -> ConfigFile:
+        if self.merge_strategy == "json_subtree_merge" and not self.owned_json_paths:
+            raise ValueError(
+                "owned_json_paths must be non-empty when merge_strategy is 'json_subtree_merge'"
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Tool
 # ---------------------------------------------------------------------------
 
@@ -196,6 +247,7 @@ class Tool(BaseModel):
     name: str
     config_dirs: tuple[DirMapping, ...]
     credentials: tuple[CredentialFile, ...] = ()
+    config_files: tuple[ConfigFile, ...] = ()
 
     @field_validator("id")
     @classmethod
@@ -258,6 +310,12 @@ class Tool(BaseModel):
             if c.config_dir not in valid:
                 raise ValueError(
                     f"credential references unknown config_dir {c.config_dir!r}; "
+                    f"expected one of {sorted(valid)}"
+                )
+        for cf in self.config_files:
+            if cf.profile_subdir not in valid:
+                raise ValueError(
+                    f"config_file references unknown config_dir {cf.profile_subdir!r}; "
                     f"expected one of {sorted(valid)}"
                 )
         return self
