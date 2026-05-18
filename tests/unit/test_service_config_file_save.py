@@ -116,9 +116,12 @@ def test_save_handles_missing_live_file(
 def test_save_raises_on_malformed_live_json(
     service: ProfileService, tmp_home: Path
 ) -> None:
+    # init captures a clean (missing-live → `{}`) snapshot; the bad state is
+    # introduced afterwards so the assertion targets save's branch of the
+    # shared _capture_config_files validation, not init's.
     live = tmp_home / ".claude.json"
-    live.write_text("not valid json {")
     service.init(["claude"])
+    live.write_text("not valid json {")
     with pytest.raises(StorageError, match="malformed"):
         service.save("workA")
 
@@ -128,8 +131,8 @@ def test_save_raises_when_live_is_not_a_json_object(
 ) -> None:
     """A JSON array or scalar at the live path is not a valid Claude config."""
     live = tmp_home / ".claude.json"
-    live.write_text(json.dumps(["not", "an", "object"]))
     service.init(["claude"])
+    live.write_text(json.dumps(["not", "an", "object"]))
     with pytest.raises(StorageError, match="object"):
         service.save("workA")
 
@@ -140,8 +143,8 @@ def test_save_raises_storage_error_when_live_path_is_a_directory(
     """abby r12: ``~/.claude.json`` being accidentally a directory must
     surface as StorageError, not a raw IsADirectoryError from read_text."""
     live = tmp_home / ".claude.json"
-    live.mkdir()
     service.init(["claude"])
+    live.mkdir()
     with pytest.raises(StorageError, match="directory"):
         service.save("workA")
     assert not service._store.profile_dir("workA").exists()
@@ -157,10 +160,10 @@ def test_save_raises_storage_error_on_non_utf8_live(
     boundary.
     """
     live = tmp_home / ".claude.json"
+    service.init(["claude"])
     # 0xff is invalid as a UTF-8 start byte; this surfaces UnicodeDecodeError
     # on read_text(encoding='utf-8') without ever reaching the JSON parser.
     live.write_bytes(b"\xff\xfe\xfd")
-    service.init(["claude"])
     with pytest.raises(StorageError, match="non-UTF-8"):
         service.save("workA")
     # Rollback inside save() must have removed the half-built profile.
@@ -177,8 +180,8 @@ def test_save_raises_storage_error_when_live_has_non_object_at_iter(
     letting a raw ValueError escape — abby r9.
     """
     live = tmp_home / ".claude.json"
-    live.write_text(json.dumps({"projects": [], "mcpServers": {}}))
     service.init(["claude"])
+    live.write_text(json.dumps({"projects": [], "mcpServers": {}}))
     with pytest.raises(StorageError, match="non-object"):
         service.save("workA")
     # The half-built profile must be rolled back by save()'s try/except.
@@ -198,11 +201,11 @@ def test_save_rejects_broken_symlink_at_live_path(
     Capture must reject the symlink up front.
     """
     live = tmp_home / ".claude.json"
+    service.init(["claude"])
     live.symlink_to(tmp_home / ".does-not-exist.json")
     assert live.is_symlink()
     assert not live.exists()
 
-    service.init(["claude"])
     with pytest.raises(StorageError, match="symlink"):
         service.save("workA")
     # The rollback in save() must have removed the half-built profile.

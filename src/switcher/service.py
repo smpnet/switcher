@@ -1320,6 +1320,14 @@ class ProfileService:
         live_paths_cache: dict[str, list[str]] = {}
         for tool in installed:
             live_paths_cache[tool.id] = self._capture_tool(current_name, tool)
+            # Mirror save()'s capture sequence so the initial profile owns
+            # the same data shape every later capture will produce — without
+            # this, the first `switcher use vanilla` would hit snapshot-
+            # missing on every tool that declares config_files. No-op for
+            # tools without config_files. Lives in the per-tool loop (not
+            # after) so a StorageError from the file capture is attributable
+            # to the same tool whose dir capture just succeeded.
+            self._capture_config_files(current_name, tool)
         self._store.create("vanilla", {t.id: True for t in installed})
         for tool in installed:
             self._seed_credentials(current_name, "vanilla", tool)
