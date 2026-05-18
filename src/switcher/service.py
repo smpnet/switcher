@@ -307,6 +307,23 @@ class ProfileService:
                 profile_name, cf.profile_subdir, cf.profile_filename
             )
 
+            # Symlink at live_path is fatal: atomic_write_file would refuse
+            # the write at commit time, *after* swap_link had already flipped
+            # config_dirs (abby r5 concrete case: a broken symlink at
+            # ~/.claude.json passes the `live_path.exists()` check as False,
+            # so we synthesize a plan; then the commit fails post-swap).
+            # Reject here to keep "any post-swap commit failure" out of the
+            # mutation phase. atomic_write_file's own check stays as
+            # defense-in-depth for the TOCTOU window between pre-flight and
+            # commit.
+            if live_path.is_symlink():
+                raise StorageError(
+                    f"refusing to apply ConfigFile through symlink at "
+                    f"{live_path}; atomic rename would replace the link "
+                    f"with a regular file. Resolve the symlink (or remove "
+                    f"it so the underlying path is writable) and re-run."
+                )
+
             if not snap_path.exists():
                 # Stderr matches the project's existing warning convention
                 # (see `_warn_migration`). caplog won't pick this up; tests
@@ -2671,17 +2688,47 @@ class ProfileService:
             for tid, tool in resolved
         }
         for tid, tool in resolved:
-            for i, dm in enumerate(tool.config_dirs):
-                target = self._store.profile_dir(profile_name) / dm.profile_subdir
-                live = self._resolver.tool_dir(tool, i)
-                swap_link(target, live)
-            # Symlink swap first, then file overlay — the dir-mapping flip
-            # is visible to the tool before ConfigFile state is reconciled.
-            # Tool validator caps config_files at 1, so this is at most one
-            # write; the swap+write+active sequence has no intermediate
-            # multi-write step that could leave the tool partially applied.
-            for live_path, content in config_file_plans[tid]:
-                atomic_write_file(live_path, content)
+            # Within-tool rollback: if any post-swap step (atomic_write_file)
+            # raises a runtime failure that pre-flight couldn't catch (disk
+            # full, EACCES, EROFS, an unexpected target shape), swap_link
+            # back to the source profile so the tool isn't left with
+            # config_dirs pointing at the destination but ConfigFile state
+            # still at the source. Best-effort: rollback exceptions are
+            # swallowed so the user sees the *original* failure that the
+            # commit was trying to recover from.
+            #
+            # Cross-tool rollback (undoing prior tools whose swap+write
+            # already succeeded) is intentionally out of scope — symmetric
+            # to the existing config_dirs swap_link loop, which has always
+            # accepted partial-multi-tool mutation as op-log territory
+            # (spec §2.7; the next `switcher init --continue` is the
+            # architectural cleanup path). Adding per-loop unwinding here
+            # would duplicate op-log work without the journaling that
+            # makes it crash-safe.
+            source_profile = active[tid]
+            swapped: list[tuple[Path, Path]] = []
+            try:
+                for i, dm in enumerate(tool.config_dirs):
+                    target = (
+                        self._store.profile_dir(profile_name) / dm.profile_subdir
+                    )
+                    live = self._resolver.tool_dir(tool, i)
+                    source_target = (
+                        self._store.profile_dir(source_profile) / dm.profile_subdir
+                    )
+                    swap_link(target, live)
+                    swapped.append((live, source_target))
+                # Symlink swap first, then file overlay — the dir-mapping
+                # flip is visible to the tool before ConfigFile state is
+                # reconciled. Tool validator caps config_files at 1, so
+                # this is at most one write per tool.
+                for live_path, content in config_file_plans[tid]:
+                    atomic_write_file(live_path, content)
+            except Exception:
+                for live, source_target in reversed(swapped):
+                    with contextlib.suppress(Exception):
+                        swap_link(source_target, live)
+                raise
             active[tid] = profile_name
         # Combined write that also flushes any derived migration entries.
         self._store.set_active_state(active, self._derive_cache_for_active(active))

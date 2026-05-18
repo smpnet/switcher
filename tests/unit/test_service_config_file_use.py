@@ -296,6 +296,96 @@ def test_use_captures_live_when_switching_to_already_active_profile(
     assert snap_data["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
 
 
+def test_use_rejects_symlink_at_live_path(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """A symlink at the ConfigFile live path is fatal during pre-flight.
+
+    atomic_write_file refuses to atomic-rename through a symlink (it would
+    silently replace the link with a regular file). If pre-flight didn't
+    catch this, swap_link would fire first and then the commit would fail
+    with the tool half-switched. abby r5 specifically called out the broken-
+    symlink case: ``live_path.exists()`` returns False for a broken
+    symlink, so the planner thinks live is missing and synthesizes a write
+    that atomic_write_file then rejects post-swap.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"A": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    # Capture the config_dirs symlink target before triggering the failure.
+    claude_dir = tmp_home / ".claude"
+    before = claude_dir.resolve()
+
+    # Replace the live file with a broken symlink (target doesn't exist).
+    # exists() returns False here, so the planner pre-r5 would synthesize a
+    # write and only fail at commit time, post-swap.
+    live.unlink()
+    live.symlink_to(tmp_home / ".does-not-exist.json")
+    assert live.is_symlink()
+    assert not live.exists()
+
+    with pytest.raises(StorageError, match="symlink"):
+        service.use("profA")
+
+    # The pre-flight failure must have fired before swap_link.
+    assert claude_dir.resolve() == before
+
+
+def test_use_rolls_back_swap_link_when_write_fails(
+    service: ProfileService,
+    tmp_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If atomic_write_file raises after swap_link succeeds, the swap must
+    be rolled back so the tool isn't left with config_dirs at the new
+    profile and ConfigFile state at the old. Covers the residual runtime
+    failure modes pre-flight can't predict (disk full, permissions, etc.).
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"A": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    service.save("profB")
+    service.use("profA")  # active is now profA; profA's config_dir is live
+
+    claude_dir = tmp_home / ".claude"
+    profA_subdir = service._store.profile_dir("profA") / "claude"
+    profB_subdir = service._store.profile_dir("profB") / "claude"
+    assert claude_dir.resolve() == profA_subdir.resolve()
+
+    # Patch atomic_write_file to fail at commit time. swap_link will have
+    # already run by then — rollback should swap claude_dir back to profA.
+    from switcher import service as service_mod
+
+    call_count = {"n": 0}
+
+    def real_atomic_write_file(target: Path, content: bytes) -> None:
+        from switcher import links as links_mod
+
+        links_mod.atomic_write_file(target, content)
+
+    def flaky(target: Path, content: bytes) -> None:
+        call_count["n"] += 1
+        # Capture phase writes to source profile's snapshot dir, NOT to
+        # ~/.claude.json. The post-swap_link apply write is the one we want
+        # to break. Use the target path to discriminate.
+        if target == live:
+            raise OSError("simulated commit-time write failure")
+        real_atomic_write_file(target, content)
+
+    monkeypatch.setattr(service_mod, "atomic_write_file", flaky)
+
+    with pytest.raises(OSError, match="simulated commit-time write failure"):
+        service.use("profB")
+
+    # config_dirs symlink must be rolled back to profA (the source).
+    assert claude_dir.resolve() == profA_subdir.resolve()
+    # And NOT pointing at profB (the destination of the failed switch).
+    assert claude_dir.resolve() != profB_subdir.resolve()
+
+
 def test_use_aborts_before_swap_link_when_snapshot_malformed(
     service: ProfileService, tmp_home: Path
 ) -> None:
