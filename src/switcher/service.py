@@ -294,6 +294,14 @@ class ProfileService:
                     f"{{}}. Resolve the symlink (or remove it so the "
                     f"underlying path is read/writable) and re-run."
                 )
+            if live_path.exists() and not live_path.is_file():
+                # Directory / FIFO / device at the configured live path —
+                # read_text() would raise IsADirectoryError or similar
+                # past the service boundary (abby r12). Reject explicitly.
+                kind = "directory" if live_path.is_dir() else "non-regular file"
+                raise StorageError(
+                    f"expected regular file at {live_path}, got {kind}"
+                )
             if live_path.exists():
                 try:
                     live_text = live_path.read_text(encoding="utf-8")
@@ -419,6 +427,14 @@ class ProfileService:
                     file=sys.stderr,
                 )
                 continue
+            if not snap_path.is_file():
+                # Directory / FIFO / device at the snapshot path. Switcher
+                # owns this subtree so the case shouldn't arise from normal
+                # use, but external tampering could create it (abby r12).
+                kind = "directory" if snap_path.is_dir() else "non-regular file"
+                raise StorageError(
+                    f"expected regular file at snapshot {snap_path}, got {kind}"
+                )
 
             try:
                 snap_text = snap_path.read_text(encoding="utf-8")
@@ -442,6 +458,14 @@ class ProfileService:
                     f"snapshot at {snap_path} is not a JSON object"
                 )
 
+            if live_path.exists() and not live_path.is_file():
+                # Mirrors the capture-side regular-file gate (abby r12):
+                # without this, read_text would raise IsADirectoryError or
+                # similar past the service boundary.
+                kind = "directory" if live_path.is_dir() else "non-regular file"
+                raise StorageError(
+                    f"expected regular file at {live_path}, got {kind}"
+                )
             if live_path.exists():
                 try:
                     live_text = live_path.read_text(encoding="utf-8")

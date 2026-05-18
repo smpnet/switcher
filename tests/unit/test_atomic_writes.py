@@ -86,12 +86,17 @@ def test_atomic_write_uses_mkstemp_default_for_new_target(tmp_path: Path):
 
 def test_atomic_write_rejects_symlink_target(tmp_path: Path):
     """Path.replace would silently destroy the symlink and leave a regular
-    file at target. Raise instead so the user sees the incompatibility."""
+    file at target. Raise instead so the user sees the incompatibility.
+
+    Asserts plain ``OSError`` rather than ``IsADirectoryError`` (a symlink
+    is not a directory; the latter would shadow path-shape errors from
+    ``Path.replace``).
+    """
     real = tmp_path / "real.json"
     real.write_bytes(b"REAL")
     link = tmp_path / "link.json"
     link.symlink_to(real)
-    with pytest.raises(IsADirectoryError, match="symlink"):
+    with pytest.raises(OSError, match="symlink"):
         atomic_write_file(link, b"NEW")
     # Symlink and target untouched
     assert link.is_symlink()

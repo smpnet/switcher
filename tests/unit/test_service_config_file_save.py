@@ -134,6 +134,19 @@ def test_save_raises_when_live_is_not_a_json_object(
         service.save("workA")
 
 
+def test_save_raises_storage_error_when_live_path_is_a_directory(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """abby r12: ``~/.claude.json`` being accidentally a directory must
+    surface as StorageError, not a raw IsADirectoryError from read_text."""
+    live = tmp_home / ".claude.json"
+    live.mkdir()
+    service.init(["claude"])
+    with pytest.raises(StorageError, match="directory"):
+        service.save("workA")
+    assert not service._store.profile_dir("workA").exists()
+
+
 def test_save_raises_storage_error_on_non_utf8_live(
     service: ProfileService, tmp_home: Path
 ) -> None:

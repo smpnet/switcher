@@ -350,6 +350,49 @@ def test_use_skips_capture_when_symlink_diverged_from_active(
     assert profA_after["mcpServers"] == {"src": {}}
 
 
+def test_use_raises_storage_error_when_snapshot_path_is_a_directory(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """abby r12 (snapshot side): if the snapshot path is a directory
+    (external tampering — switcher itself would never put one there),
+    surface as StorageError pre-flight rather than a raw IsADirectoryError
+    from read_text. Pre-flight must also fire before swap_link."""
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    snap.unlink()
+    snap.mkdir()
+
+    claude_dir = tmp_home / ".claude"
+    before = claude_dir.resolve()
+    with pytest.raises(StorageError, match="directory"):
+        service.use("profA")
+    assert claude_dir.resolve() == before
+
+
+def test_use_raises_storage_error_when_live_path_is_a_directory(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """abby r12 (live side, via use()'s capture pre-flight)."""
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    # Replace live with a directory between save() and use().
+    live.unlink()
+    live.mkdir()
+
+    claude_dir = tmp_home / ".claude"
+    before = claude_dir.resolve()
+    with pytest.raises(StorageError, match="directory"):
+        service.use("profA")
+    assert claude_dir.resolve() == before
+
+
 def test_use_raises_storage_error_on_non_utf8_snapshot(
     service: ProfileService, tmp_home: Path
 ) -> None:

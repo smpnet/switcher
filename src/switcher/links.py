@@ -323,9 +323,12 @@ def atomic_write_file(target: Path, content: bytes) -> None:
     that need richer metadata preservation must layer it on top.
 
     **Symlink targets — best-effort rejection:** if ``target`` is a
-    symlink at call time, raise ``IsADirectoryError`` so the user sees
-    the incompatibility instead of having their redirection silently
-    replaced by a regular file. This is **best-effort**, not a hard
+    symlink at call time, raise ``OSError`` so the user sees the
+    incompatibility instead of having their redirection silently
+    replaced by a regular file. (Previously raised ``IsADirectoryError``;
+    that subclass is semantically misleading — a symlink isn't a
+    directory — and shadowed other path-shape ``IsADirectoryError``s
+    from ``Path.replace``.) This is **best-effort**, not a hard
     guarantee: there's a TOCTOU window between the up-front check and
     the eventual ``Path.replace`` during which another process could
     swap the target to a symlink. No POSIX primitive cleanly expresses
@@ -337,7 +340,7 @@ def atomic_write_file(target: Path, content: bytes) -> None:
     that don't match the cross-platform contract this helper provides.
     """
     if target.is_symlink():
-        raise IsADirectoryError(
+        raise OSError(
             f"refusing to atomic-write through symlink at {target!r}; "
             "atomic rename would replace the link with a regular file, "
             "breaking the redirection. Resolve the symlink and write to "
