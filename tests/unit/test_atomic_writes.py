@@ -53,3 +53,32 @@ def test_atomic_write_target_is_a_regular_file(tmp_path: Path):
     atomic_write_file(target, b"{}")
     assert target.is_file()
     assert not target.is_symlink()
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("os"), "geteuid"),
+    reason="POSIX mode bits not meaningful on Windows",
+)
+def test_atomic_write_preserves_existing_mode(tmp_path: Path):
+    """Pre-existing target file's mode survives the rename, even though
+    mkstemp would otherwise default to 0o600."""
+    import os
+    target = tmp_path / "out.json"
+    target.write_bytes(b"OLD")
+    os.chmod(target, 0o644)
+    atomic_write_file(target, b"NEW")
+    mode = target.stat().st_mode & 0o777
+    assert mode == 0o644, f"expected 0o644, got {oct(mode)}"
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("os"), "geteuid"),
+    reason="POSIX mode bits not meaningful on Windows",
+)
+def test_atomic_write_uses_mkstemp_default_for_new_target(tmp_path: Path):
+    """For a new target (no prior file), mkstemp's default 0o600 is used.
+    Locks in the intentional default for sensitive snapshot files."""
+    target = tmp_path / "out.json"
+    atomic_write_file(target, b"NEW")
+    mode = target.stat().st_mode & 0o777
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"

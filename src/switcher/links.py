@@ -308,17 +308,30 @@ def atomic_write_file(target: Path, content: bytes) -> None:
     on the tmp file or parent directory — matches the explicit trade-off
     documented in ``oplog._write_records``.
 
-    **Metadata behavior:** the rename swaps in a brand-new inode created
-    by ``mkstemp``, so the prior target's mode bits / ACLs / xattrs are
-    not preserved. For the v1 consumer (``~/.claude.json``) this is
-    intentional and harmless: Claude Code itself uses write-tmp+rename
-    for its own writes, so the live file already cycles its inode and
-    default-umask permissions on every Claude write. Future callers that
-    need metadata preservation must layer that on top (read mode bits
-    before the rename, ``chmod`` after) — this helper deliberately stays
-    a thin atomic-replace primitive.
+    **Mode preservation (POSIX):** ``tempfile.mkstemp`` creates files at
+    mode 0o600 by default, so a naive tmp+rename would silently change
+    the permissions of any pre-existing target file (typically tightening
+    them, since 0o600 is more restrictive than typical umask defaults).
+    To keep this primitive transparent to callers, when the target exists
+    as a regular file we capture its mode pre-rename and apply it to the
+    tmp file via ``os.chmod`` before the swap. Best-effort: if the
+    capture or apply fails (rare, e.g. filesystems that reject chmod),
+    the rename still proceeds with mkstemp's default mode.
+
+    **Other metadata** (ACLs, xattrs, ownership) is not preserved — the
+    rename swaps in a fresh inode and only mode bits are restored. Callers
+    that need richer metadata preservation must layer it on top.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
+    # Capture pre-existing mode so the rename doesn't silently tighten
+    # permissions when mkstemp's 0o600 default differs from the live file.
+    prior_mode: int | None = None
+    if target.is_file() and not target.is_symlink():
+        try:
+            prior_mode = target.stat().st_mode & 0o777
+        except OSError:
+            prior_mode = None
+
     fd, tmpname = tempfile.mkstemp(
         dir=target.parent,
         prefix=target.name + ".",
@@ -335,6 +348,14 @@ def atomic_write_file(target: Path, content: bytes) -> None:
             except OSError:
                 pass
             raise
+        if prior_mode is not None:
+            try:
+                os.chmod(tmppath, prior_mode)
+            except OSError:
+                # Best-effort; the rename still proceeds with mkstemp's
+                # default mode. Filesystems that reject chmod (e.g. some
+                # Windows shares) shouldn't block the write.
+                pass
         tmppath.replace(target)
     except Exception:
         tmppath.unlink(missing_ok=True)
