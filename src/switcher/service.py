@@ -8,6 +8,7 @@ without reaching inside the service.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import sys
@@ -43,7 +44,14 @@ from switcher.errors import (
     UnknownProfileError,
     UnknownToolError,
 )
-from switcher.links import move_or_seed_dir, remove_link, restore_real_dir, swap_link
+from switcher.json_paths import apply_owned_paths, extract_owned_paths
+from switcher.links import (
+    atomic_write_file,
+    move_or_seed_dir,
+    remove_link,
+    restore_real_dir,
+    swap_link,
+)
 from switcher.models import Profile, Tool
 
 # Op-log record classes are namespace-private to oplog.py (the underscore marks
@@ -211,6 +219,52 @@ class ProfileService:
             if src.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
+
+    def _capture_config_files(self, profile_name: str, tool: Tool) -> None:
+        """Extract a tool's owned JSON subtrees from live and snapshot them.
+
+        For each ConfigFile on ``tool``: read the live JSON, project the
+        ``owned_json_paths`` subtrees via the walker, and atomic-write the
+        result under the profile's reserved ``.switcher/config_files/...``
+        path. No-op if the tool has no ``config_files``.
+
+        Used by ``save()`` and (later) ``init()`` — both capture from current
+        live into a fresh profile snapshot.
+
+        Edge cases (spec §3.6 "missing or malformed live"):
+          * Live missing → snapshot is ``{}``. Refusing here would block init
+            on a fresh machine before the user has launched the tool once.
+          * Live malformed JSON or non-object → ``StorageError`` before any
+            mutation. Capturing garbage would silently propagate to the
+            apply side of the next ``use()``.
+        """
+        for cf in tool.config_files:
+            live_path = self._resolver.expand(
+                cf.windows_path if IS_WINDOWS else cf.posix_path
+            )
+            if live_path.exists():
+                try:
+                    live_data = json.loads(live_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as e:
+                    raise StorageError(
+                        f"malformed JSON at {live_path}: {e.msg} (line {e.lineno})"
+                    ) from e
+                if not isinstance(live_data, dict):
+                    raise StorageError(
+                        f"expected JSON object at {live_path}, got "
+                        f"{type(live_data).__name__}"
+                    )
+                snapshot = extract_owned_paths(live_data, cf.owned_json_paths)
+            else:
+                snapshot = {}
+
+            snap_path = self._store.config_file_snapshot_path(
+                profile_name, cf.profile_subdir, cf.profile_filename
+            )
+            atomic_write_file(
+                snap_path,
+                json.dumps(snapshot, indent=2, sort_keys=True).encode("utf-8"),
+            )
 
     def _capture_tool(self, profile: str, tool: Tool) -> list[str]:
         """Move every live dir for `tool` into `profile`, then link back.
@@ -2567,6 +2621,7 @@ class ProfileService:
                     # under the active profile, not the link itself.
                     src = live.resolve() if live.is_symlink() else live
                     shutil.copytree(src, target, dirs_exist_ok=True)
+                self._capture_config_files(name, tool)
         except Exception:
             # No-debris discipline: copytree can fail mid-snapshot for
             # runtime reasons that pre-flight can't catch (transient I/O,
