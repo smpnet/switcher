@@ -146,6 +146,10 @@ def test_use_warns_and_skips_when_snapshot_missing(
     err = capsys.readouterr().err
     assert "snapshot" in err.lower()
     assert "claude" in err
+    # Warning must not prescribe an unimplemented remediation. Init/rescan
+    # integration ships in a later PR; until then, telling users to run
+    # `switcher rescan` here would be misleading.
+    assert "rescan" not in err.lower()
 
 
 def test_use_synthesizes_live_when_missing(
@@ -257,6 +261,39 @@ def test_use_captures_active_profile_live_before_apply(
     service.use("profA")
     out = json.loads(live.read_text())
     assert out["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
+
+
+def test_use_captures_live_when_switching_to_already_active_profile(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """`switcher use <active>` is a legitimate reload-from-snapshot affordance,
+    but must not silently discard in-flight live edits.
+
+    Without capture-on-self-use the apply would overwrite live with the
+    last-saved snapshot — data loss. With it, the call captures-then-no-ops
+    on live (the freshly-captured snapshot is what gets applied back).
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"A": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    service.use("profA")  # active is now profA
+
+    # User edit while profA is active, without an explicit save.
+    live_data = json.loads(live.read_text())
+    live_data["mcpServers"]["user-added"] = {"command": "z"}
+    live.write_text(json.dumps(live_data))
+
+    # Re-using the same profile must preserve the in-flight edit.
+    service.use("profA")
+    out = json.loads(live.read_text())
+    assert out["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
+
+    # The capture must also have updated profA's snapshot so a subsequent
+    # switch-away-and-back round-trip works.
+    snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    snap_data = json.loads(snap.read_text())
+    assert snap_data["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
 
 
 def test_use_apply_is_atomic_within_tool(

@@ -309,11 +309,16 @@ class ProfileService:
                 # (see `_warn_migration`). caplog won't pick this up; tests
                 # use `capsys`. Emitted during plan phase so the user sees
                 # it even if a later cf raises and aborts the commit phase.
+                #
+                # No remediation hint: in v0.1.5 PR4 the snapshot is created
+                # by `save()`, and the next switch onto the source profile's
+                # capture phase also creates one. The plan's init/rescan
+                # integration (later PRs) closes the legacy-profile case.
+                # Promising a specific command here would mis-direct users
+                # while those paths are still being landed.
                 print(
                     f"warning: config_file snapshot missing for {tool.id!r} at "
-                    f"{snap_path}; skipping apply. Run 'switcher rescan --only "
-                    f"{tool.id}' to repair, or 'switcher save' to capture "
-                    f"current live state.",
+                    f"{snap_path}; skipping apply to preserve current live state.",
                     file=sys.stderr,
                 )
                 continue
@@ -2638,9 +2643,15 @@ class ProfileService:
         # ConfigFile live state is a real file the tool atomic-renames into.
         # Runs ahead of any mutation so a malformed-live StorageError fires
         # before any swap_link, leaving the filesystem unchanged.
+        #
+        # No ``source != profile_name`` guard: `switcher use <active>` is a
+        # legitimate operation (reload-from-snapshot affordance), but with a
+        # guard the apply would overwrite live with the last-saved snapshot
+        # and silently discard any in-flight edits. With capture-then-apply,
+        # the same call captures-then-no-ops on live, which is data-safe.
         for tid, tool in resolved:
             source = active.get(tid)
-            if source and source != profile_name:
+            if source:
                 self._capture_config_files(source, tool)
         for tid, tool in resolved:
             for i, dm in enumerate(tool.config_dirs):
