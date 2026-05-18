@@ -229,6 +229,23 @@ class ConfigFile(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_owned_paths_parse(self) -> ConfigFile:
+        # Local import: ``json_paths`` is pure logic with no model deps, but
+        # importing at module scope would tighten the import graph for no
+        # benefit. Parse-fail-loud at config-load time so a typo'd path
+        # surfaces at registry load, not on the first ``use`` that touches it.
+        from switcher.json_paths import InvalidOwnedPath, parse_owned_path
+
+        for raw in self.owned_json_paths:
+            try:
+                parse_owned_path(raw)
+            except InvalidOwnedPath as e:
+                raise ValueError(
+                    f"invalid owned_json_paths entry {raw!r}: {e}"
+                ) from e
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Tool

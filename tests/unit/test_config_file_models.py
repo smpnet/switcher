@@ -70,6 +70,57 @@ def test_config_file_rejects_unsafe_profile_subdir():
         )
 
 
+def test_config_file_rejects_windows_reserved_profile_filename():
+    """validate_safe_name rejects Windows-reserved stems (e.g. CON.txt)."""
+    with pytest.raises(ValidationError, match="reserved"):
+        ConfigFile(
+            posix_path="~/.claude.json",
+            windows_path="%USERPROFILE%\\.claude.json",
+            profile_subdir="claude",
+            profile_filename="CON.txt",
+            merge_strategy="json_subtree_merge",
+            owned_json_paths=(".mcpServers",),
+        )
+
+
+def test_config_file_rejects_trailing_dot_profile_filename():
+    """validate_safe_name rejects names ending with a dot (Windows-illegal)."""
+    with pytest.raises(ValidationError, match="must not end with a dot"):
+        ConfigFile(
+            posix_path="~/.claude.json",
+            windows_path="%USERPROFILE%\\.claude.json",
+            profile_subdir="claude",
+            profile_filename="claude.json.",
+            merge_strategy="json_subtree_merge",
+            owned_json_paths=(".mcpServers",),
+        )
+
+
+def test_config_file_rejects_invalid_owned_json_paths_entry():
+    """Parse-fail-loud at model-load time, not later at switch time."""
+    with pytest.raises(ValidationError, match="invalid owned_json_paths entry"):
+        ConfigFile(
+            posix_path="~/.claude.json",
+            windows_path="%USERPROFILE%\\.claude.json",
+            profile_subdir="claude",
+            profile_filename="claude.json",
+            merge_strategy="json_subtree_merge",
+            owned_json_paths=("mcpServers",),  # missing leading dot
+        )
+
+
+def test_config_file_rejects_unsupported_owned_path_token():
+    with pytest.raises(ValidationError, match="invalid owned_json_paths entry"):
+        ConfigFile(
+            posix_path="~/.claude.json",
+            windows_path="%USERPROFILE%\\.claude.json",
+            profile_subdir="claude",
+            profile_filename="claude.json",
+            merge_strategy="json_subtree_merge",
+            owned_json_paths=(".foo[?(@.bar)]",),  # filter predicate
+        )
+
+
 def test_tool_accepts_config_files_referencing_an_existing_subdir():
     cf = ConfigFile(
         posix_path="~/.claude.json",

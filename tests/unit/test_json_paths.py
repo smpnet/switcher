@@ -208,6 +208,14 @@ def test_apply_keeps_empty_project_object_after_delete():
     assert out["projects"]["/r/A"] == {}
 
 
+def test_apply_rejects_iter_as_leaf_segment():
+    """Mirror extract: ``[]`` as a leaf has no defined semantics in v1."""
+    live = {"projects": {"/r/A": {"mcpServers": {}}}}
+    snap = {"projects": {"/r/A": {"mcpServers": {}}}}
+    with pytest.raises(InvalidOwnedPath, match="leaf"):
+        apply_owned_paths(live, snap, (".projects[]",))
+
+
 def test_apply_multiple_owned_paths_composes():
     live = {
         "mcpServers": {"old": {}},

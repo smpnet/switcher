@@ -25,7 +25,12 @@ import copy
 import re
 from typing import Any
 
-_KEY_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
+# Object keys in v1 grammar: alphanumerics, underscore, hyphen. No dot —
+# `.` is always a segment separator in ``parse_owned_path``, so allowing it
+# inside the key class would document a grammar feature the parser can
+# never produce. Keys containing dots are explicitly out of scope for v1
+# (spec §3.4: "key names with dots/special chars: not in scope for v1").
+_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class InvalidOwnedPath(ValueError):
@@ -46,8 +51,8 @@ def parse_owned_path(path: str) -> tuple[_Segment, ...]:
     Grammar (per spec §3.4)::
 
         path  := ('.' KEY | '[]')+
-        KEY   := matches ``[A-Za-z0-9_-][A-Za-z0-9._-]*`` (same shape as
-                 ``validate_safe_name``)
+        KEY   := matches ``[A-Za-z0-9_-]+`` (no dots — ``.`` is always a
+                 segment separator; keys with dots are out of scope for v1)
     """
     if not path or not path.startswith("."):
         raise InvalidOwnedPath(f"owned path must start with '.': {path!r}")
@@ -219,6 +224,13 @@ def _apply_segments(
             raise UnsupportedWalkTarget(
                 "v1 '[]' only iterates JSON objects (string-keyed); "
                 f"got {type(live_node).__name__}"
+            )
+        if not rest:
+            # Mirror _extract_into: `[]` as a leaf has no defined semantics
+            # in v1. Without this check, apply would silently no-op while
+            # extract on the same path raises — asymmetric fail-fast.
+            raise InvalidOwnedPath(
+                "v1 grammar does not allow '[]' as a leaf segment"
             )
         snap_is_dict = isinstance(snap_node, dict)
         live_keys = set(live_node.keys())
