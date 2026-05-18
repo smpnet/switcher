@@ -122,6 +122,25 @@ def test_extract_rejects_array_iter():
         extract_owned_paths(live, (".projects[].mcpServers",))
 
 
+def test_extract_skips_non_dict_descent_target():
+    """Round-trip stability: extract on ``.a.b`` against ``{"a": 1}`` must
+    NOT produce ``{"a": {}}``. The placeholder would lie about
+    descendability and apply on the unchanged live would raise."""
+    live = {"a": 1}
+    snap = extract_owned_paths(live, (".a.b",))
+    assert snap == {}
+
+
+def test_extract_apply_round_trip_stable_on_blocked_key_descent():
+    """The motivating regression: extract followed by apply on the same
+    unchanged live must be a no-op even when the descent path doesn't fit
+    live's shape."""
+    live = {"a": 1}
+    snap = extract_owned_paths(live, (".a.b",))
+    out = apply_owned_paths(live, snap, (".a.b",))
+    assert out == live
+
+
 def test_extract_handles_multiple_owned_paths():
     live = {
         "mcpServers": {"a": {}},

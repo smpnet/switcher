@@ -151,10 +151,27 @@ def _extract_into(
         if not rest:
             snap_node[key] = copy.deepcopy(live_node[key])
             return
+        # Non-leaf descent: live[key] must be a dict for the path to apply.
+        # Eagerly creating ``snap_node[key] = {}`` here would manufacture a
+        # placeholder that lies about descendability — apply on the unchanged
+        # live would later see ``snap_has=True`` at this path with a non-dict
+        # live value and raise ``UnsupportedWalkTarget`` (the symmetric fix
+        # in apply's r7). Skipping the setdefault keeps extract/apply
+        # round-trip stable on malformed live state.
+        #
+        # If the next segment is ``iter``, fall through so the iter branch's
+        # ``UnsupportedWalkTarget`` fires on the non-dict — matches apply's
+        # iter-fail-fast behavior and preserves the test that exercises
+        # ``{"projects": []}`` shapes.
+        if not isinstance(live_node[key], dict) and not (
+            rest and rest[0][0] == "iter"
+        ):
+            return
         snap_child = snap_node.setdefault(key, {})
         if not isinstance(snap_child, dict):
             # An earlier owned-path produced a non-dict here. Owned paths
-            # shouldn't normally collide; if they do, the later path wins.
+            # shouldn't normally collide (ConfigFile validates non-overlap);
+            # if they do, the later path wins.
             snap_child = {}
             snap_node[key] = snap_child
         _extract_into(live_node[key], rest, snap_child)
