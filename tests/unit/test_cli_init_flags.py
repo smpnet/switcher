@@ -146,7 +146,7 @@ def test_init_returns_init_report(tmp_home: Path, tmp_state: Path) -> None:
     report = deps.service.init()
     assert isinstance(report, InitReport)
     assert report.profile_name.endswith("-current")
-    assert set(report.captured) == {"claude", "copilot"}
+    assert set(report.captured) == {"claude", "codex", "copilot"}
     assert report.requested_but_not_installed == []
     assert report.skipped_via_skip_flag == []
     assert report.skipped_via_interactive == []
@@ -189,28 +189,28 @@ def test_init_interactive_default_yes_captures_all(
 ) -> None:
     """Empty input lines accept the default-Y; all tools captured."""
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["init", "--interactive"], input="\n\n")
+    result = runner.invoke(app, ["init", "--interactive"], input="\n\n\n")
     assert result.exit_code == 0, _combined(result)
     from switcher.cli import get_deps
 
     active = get_deps().store.get_active()
-    assert "claude" in active and "copilot" in active
+    assert "claude" in active and "codex" in active and "copilot" in active
 
 
 def test_init_interactive_all_no_raises_nothing_to_initialize(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["init", "--interactive"], input="n\nn\n")
+    result = runner.invoke(app, ["init", "--interactive"], input="n\nn\nn\n")
     assert result.exit_code != 0
     out = _combined(result).lower()
     assert "nothing to initialize" in out or "every detected tool was skipped" in out
 
 
 def test_init_skip_excludes_every_registered_tool_errors(tmp_home: Path, tmp_state: Path) -> None:
-    """abby review: --skip claude,copilot leaves the target set empty; the
+    """abby review: --skip claude,codex,copilot leaves the target set empty; the
     error must reflect 'skipped everything', not 'requested not installed'."""
-    result = runner.invoke(app, ["init", "--skip", "claude,copilot"])
+    result = runner.invoke(app, ["init", "--skip", "claude,codex,copilot"])
     assert result.exit_code != 0
     out = _combined(result).lower()
     assert "every registered tool" in out or "excluded every" in out
@@ -221,12 +221,17 @@ def test_init_skip_excludes_every_registered_tool_errors(tmp_home: Path, tmp_sta
 def test_init_interactive_some_no_surfaces_skipped(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Y for claude, N for copilot: report shows skipped_via_interactive."""
+    """Y for claude and codex, N for copilot: report shows skipped_via_interactive.
+
+    Prompt order is registry order (alphabetical-by-filename): claude → codex →
+    copilot. Three answers: `\\n` (default-Y claude), `\\n` (default-Y codex),
+    `n\\n` (decline copilot).
+    """
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["init", "--interactive"], input="\nn\n")
+    result = runner.invoke(app, ["init", "--interactive"], input="\n\nn\n")
     assert result.exit_code == 0, _combined(result)
     out = _combined(result)
-    assert "Captured: claude" in out
+    assert "Captured: claude, codex" in out
     assert "Skipped (via interactive): copilot" in out
     assert "switcher rescan --only copilot" in out
 

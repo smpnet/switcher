@@ -124,6 +124,8 @@ def test_status_on_empty_active_map(tmp_home: Path, tmp_state: Path) -> None:
     assert init_result.exit_code == 0, _combined(init_result)
     unmanage_claude = runner.invoke(app, ["unmanage", "claude"])
     assert unmanage_claude.exit_code == 0, _combined(unmanage_claude)
+    unmanage_codex = runner.invoke(app, ["unmanage", "codex"])
+    assert unmanage_codex.exit_code == 0, _combined(unmanage_codex)
     unmanage_copilot = runner.invoke(app, ["unmanage", "copilot"])
     assert unmanage_copilot.exit_code == 0, _combined(unmanage_copilot)
     result = runner.invoke(app, ["status"])

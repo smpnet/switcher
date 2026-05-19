@@ -54,21 +54,27 @@ def test_rescan_all_and_only_mutually_exclusive(tmp_home: Path, tmp_state: Path)
 def test_rescan_tty_prompt_accepts_all(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """init-only-copilot leaves claude AND codex unmanaged; rescan prompts for
+    each in registry order (alphabetical-by-filename: claude → codex). Two
+    default-Y answers capture both."""
     _setup_init_only_copilot()
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["rescan"], input="\n")  # default-Y for claude
+    result = runner.invoke(app, ["rescan"], input="\n\n")
     assert result.exit_code == 0, result.output
-    assert "claude" in get_deps().store.get_active()
+    active = get_deps().store.get_active()
+    assert "claude" in active and "codex" in active
 
 
 def test_rescan_tty_prompt_rejects_all(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Two `n` answers reject both unmanaged tools."""
     _setup_init_only_copilot()
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["rescan"], input="n\n")
+    result = runner.invoke(app, ["rescan"], input="n\nn\n")
     assert result.exit_code == 0, result.output
-    assert "claude" not in get_deps().store.get_active()
+    active = get_deps().store.get_active()
+    assert "claude" not in active and "codex" not in active
 
 
 def test_rescan_non_tty_warns_and_captures_all(
@@ -205,10 +211,12 @@ def test_rescan_into_tty_prompt_path(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """--into P with no --only/--all on TTY: prompt the user, then capture
-    accepted tools into P."""
+    accepted tools into P. Two unmanaged tools (claude + codex) → two answers."""
     _setup_init_only_copilot()
     _setup_create("shared")
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["rescan", "--into", "shared"], input="\n")
+    result = runner.invoke(app, ["rescan", "--into", "shared"], input="\n\n")
     assert result.exit_code == 0, result.output
-    assert get_deps().store.get_active().get("claude") == "shared"
+    active = get_deps().store.get_active()
+    assert active.get("claude") == "shared"
+    assert active.get("codex") == "shared"
