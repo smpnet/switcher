@@ -194,7 +194,7 @@ def test_init_interactive_default_yes_captures_all(
     from switcher.cli import get_deps
 
     active = get_deps().store.get_active()
-    assert "claude" in active and "codex" in active and "copilot" in active
+    assert set(active.keys()) == {"claude", "codex", "copilot"}
 
 
 def test_init_interactive_all_no_raises_nothing_to_initialize(

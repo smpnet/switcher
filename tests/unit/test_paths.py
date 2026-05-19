@@ -7,6 +7,7 @@ import pytest
 
 from switcher.models import DirMapping, Tool
 from switcher.paths import IS_WINDOWS, PathResolver
+from switcher.registry import find_tool, load_builtin_tools
 
 
 @pytest.fixture
@@ -226,8 +227,6 @@ def test_codex_builtin_env_override_resolves_to_custom_path(
     — the generic env-override mechanism is covered above with a synthetic
     tool, but a typo in codex.toml (wrong field name, wrong var name)
     would slip past the generic tests."""
-    from switcher.registry import find_tool, load_builtin_tools
-
     custom = tmp_path / "custom-codex"
     monkeypatch.setenv("CODEX_HOME", str(custom))
     codex = find_tool(load_builtin_tools(), "codex")

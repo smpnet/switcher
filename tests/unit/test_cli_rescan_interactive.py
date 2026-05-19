@@ -62,7 +62,8 @@ def test_rescan_tty_prompt_accepts_all(
     result = runner.invoke(app, ["rescan"], input="\n\n")
     assert result.exit_code == 0, result.output
     active = get_deps().store.get_active()
-    assert "claude" in active and "codex" in active
+    assert "claude" in active
+    assert "codex" in active
 
 
 def test_rescan_tty_prompt_rejects_all(
@@ -74,7 +75,8 @@ def test_rescan_tty_prompt_rejects_all(
     result = runner.invoke(app, ["rescan"], input="n\nn\n")
     assert result.exit_code == 0, result.output
     active = get_deps().store.get_active()
-    assert "claude" not in active and "codex" not in active
+    assert "claude" not in active
+    assert "codex" not in active
 
 
 def test_rescan_non_tty_warns_and_captures_all(

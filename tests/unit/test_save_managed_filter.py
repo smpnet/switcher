@@ -86,10 +86,7 @@ def test_save_when_no_managed_tools_are_installed_raises(
     every registered builtin's live path gets removed — adding a new
     builtin must not require updating this test.
     """
-    import os
-
     from switcher.links import remove_link
-    from switcher.paths import IS_WINDOWS
 
     service = service_with_both_tools
     # Remove every live link init() installed. detect_installed() now
@@ -97,7 +94,7 @@ def test_save_when_no_managed_tools_are_installed_raises(
     for paths in service.get_active_live_paths().values():
         for raw_path in paths:
             live = Path(raw_path)
-            if live.is_symlink() or (IS_WINDOWS and os.path.isjunction(live)):
+            if service._resolver.is_link(live):
                 remove_link(live)
     assert service._store.get_active(), "active map should still be populated"
     with pytest.raises(NoToolsManagedError):
