@@ -151,6 +151,85 @@ class _MappingIntent(BaseModel):
     original_kind: Literal["missing", "real-dir"]
 
 
+class _ConfigFileMappingIntent(BaseModel):
+    """Per-ConfigFile original state for an init/rescan op — seed metadata
+    for the snapshot side of compensation. Parallel to ``_MappingIntent``
+    for DirMappings; used by ``_InitOp`` and ``_RescanOp``. ``use`` and
+    ``save`` are NOT journaled per spec §3.7.
+
+    Unlike ``_MappingIntent``, there is no ``original_kind`` /
+    ``pre_op_snapshot_existed`` field. init/rescan always start with a
+    fresh profile dir (rescan ``--into`` is required by §3.8 to refuse a
+    target with a pre-existing snapshot at the same path), so the
+    snapshot file can never pre-exist when the intent is written. The
+    only state the journal needs is "did we write it yet?", a single bit
+    the classifier reads directly from the filesystem.
+
+    Snapshot path is structurally guaranteed to live under
+    ``<profile_dir>/.switcher/config_files/<profile_subdir>/<profile_filename>``;
+    there is no stored snapshot path to corrupt because every consumer
+    derives the path from these fields via
+    ``FileProfileStore.config_file_snapshot_path``. SafeName on
+    profile_subdir and profile_filename rejects journal-path-traversal
+    attempts before the classifier ever touches the disk.
+
+    ``live_path`` is a canonical absolute path — the writer expands
+    raw ConfigFile paths through ``PathResolver.expand()`` AND runs
+    ``os.path.normpath`` (or ``Path.resolve``) before persisting, so
+    anything that isn't a normalized absolute string here is corruption.
+    AbsolutePath rejects ``..`` segments, so a non-canonicalized
+    expansion would fail validation at intent-write time rather than
+    silently slipping into the journal.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    tool_id: SafeName
+    profile_subdir: SafeName
+    profile_filename: SafeName
+    live_path: AbsolutePath
+
+
+def _check_config_file_mappings_against_target_ids(
+    op_name: str,
+    target_ids: list[str],
+    mappings: list[_ConfigFileMappingIntent],
+) -> None:
+    """Shared cross-field validator for config_file_mappings.
+
+    Two invariants — parallel to the dir-mapping validator above:
+
+    1. Every ``mapping.tool_id`` must appear in ``target_ids``. A
+       mapping for a tool that isn't in the targeted set is a corrupt
+       journal entry; recovery would not know whether to treat it as
+       part of this op or as drift.
+
+    2. ``(tool_id, profile_subdir, profile_filename)`` is unique across
+       mappings. The triple identifies a single ConfigFile snapshot
+       within the targeted profile; duplicates in the journal would
+       let recovery double-extract and silently clobber the first
+       write with the second on a different live read.
+
+    NOT enforced: that every tool in ``target_ids`` has at least one
+    entry. Tools without config_files legitimately contribute zero
+    entries — symmetric to ``_check_mappings_against_target_ids``'s
+    treatment of registry-only tools.
+    """
+    target_set = set(target_ids)
+    seen: set[tuple[str, str, str]] = set()
+    for m in mappings:
+        if m.tool_id not in target_set:
+            raise ValueError(
+                f"{op_name}: config_file_mappings entry references "
+                f"tool_id={m.tool_id!r} not in target_ids={sorted(target_set)!r}"
+            )
+        key = (m.tool_id, m.profile_subdir, m.profile_filename)
+        if key in seen:
+            raise ValueError(
+                f"{op_name}: duplicate config_file_mappings entry for {key!r}"
+            )
+        seen.add(key)
+
+
 class _BaseOp(BaseModel):
     """Shared shape for every op record.
 
@@ -274,6 +353,10 @@ class _InitOp(_BaseOp):
     target_ids: list[SafeName]
     profile_name: SafeName
     mappings: list[_MappingIntent]
+    # Default-empty preserves wire-format compatibility: journals
+    # written before this feature shipped will continue to parse and
+    # round-trip exactly, with no config_file_mappings work to do.
+    config_file_mappings: list[_ConfigFileMappingIntent] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_target_ids_unique(self) -> Self:
@@ -283,6 +366,13 @@ class _InitOp(_BaseOp):
     @model_validator(mode="after")
     def _check_mappings_consistency(self) -> Self:
         _check_mappings_against_target_ids("_InitOp", self.target_ids, self.mappings)
+        return self
+
+    @model_validator(mode="after")
+    def _check_config_file_mappings_consistency(self) -> Self:
+        _check_config_file_mappings_against_target_ids(
+            "_InitOp", self.target_ids, self.config_file_mappings
+        )
         return self
 
 
@@ -330,6 +420,9 @@ class _RescanOp(_BaseOp):
     into_mode: StrictBool
     previous_tools: dict[SafeName, dict[SafeName, StrictBool]] | None = None
     mappings: list[_MappingIntent]
+    # Default-empty preserves wire-format compatibility with journals
+    # written before this feature shipped — see ``_InitOp``.
+    config_file_mappings: list[_ConfigFileMappingIntent] = Field(default_factory=list)
     rescan_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
     @model_validator(mode="after")
@@ -392,6 +485,13 @@ class _RescanOp(_BaseOp):
     @model_validator(mode="after")
     def _check_mappings_consistency(self) -> Self:
         _check_mappings_against_target_ids("_RescanOp", self.target_ids, self.mappings)
+        return self
+
+    @model_validator(mode="after")
+    def _check_config_file_mappings_consistency(self) -> Self:
+        _check_config_file_mappings_against_target_ids(
+            "_RescanOp", self.target_ids, self.config_file_mappings
+        )
         return self
 
 
