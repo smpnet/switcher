@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from switcher.errors import NoToolsManagedError
+from switcher.links import remove_link
 from switcher.paths import PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
@@ -86,8 +87,6 @@ def test_save_when_no_managed_tools_are_installed_raises(
     every registered builtin's live path gets removed — adding a new
     builtin must not require updating this test.
     """
-    from switcher.links import remove_link
-
     service = service_with_both_tools
     # Remove every live link init() installed. detect_installed() now
     # returns [], so the managed-filter intersection is empty.
