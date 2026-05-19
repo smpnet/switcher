@@ -43,8 +43,10 @@ CLAUDE_CONFIG_FILE = ConfigFile(
 
 
 @pytest.fixture
-def registry() -> tuple[Tool, ...]:
-    base = build_registry(Path("/nonexistent"))
+def registry(tmp_path: Path) -> tuple[Tool, ...]:
+    # Guaranteed-missing directory under ``tmp_path`` keeps the fixture
+    # hermetic and platform-independent (CR pass-PR-4 minor).
+    base = build_registry(tmp_path / "missing-registry-dir")
     out: list[Tool] = []
     for t in base:
         if t.id == "claude":
@@ -446,6 +448,63 @@ def test_use_captures_into_destination_when_active_is_stale_behind_symlinks(
     prof_a_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
     prof_a_data = json.loads(prof_a_snap.read_text())
     assert prof_a_data["mcpServers"] == {"src": {}}
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_use_refuses_when_one_link_dangles_but_another_resolves_elsewhere(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """CR pass-PR-4 major: the safe "all dangling → skip capture"
+    fallback in the use() capture loop must require EVERY managed
+    live dir to be dangling. A multi-dir tool with one dangling link
+    AND another link pointing at a third profile is still ambiguous
+    — the resolves-elsewhere half could carry user data, and skipping
+    capture would let apply silently overwrite it.
+
+    Exercised with a two-dir copilot override (the project's standard
+    pattern for multi-dir tools in tests) so the helper has more than
+    one ``config_dirs`` entry to scan.
+    """
+    from switcher.paths import PathResolver
+    from switcher.registry import build_registry
+    from switcher.service import ProfileService
+    from switcher.store import FileProfileStore
+    from tests.integration.conftest import install_two_dir_copilot_override
+
+    install_two_dir_copilot_override(tmp_state)
+    base = build_registry(tmp_state / "registry.d")
+    svc = ProfileService(
+        FileProfileStore(tmp_state),
+        PathResolver(home=tmp_home),
+        base,
+    )
+    svc.init()
+    svc.save("profA")
+    svc.save("profB")
+    svc.save("profC")
+    svc.use("profA")  # active = profA
+
+    # Drop copilot-auth's symlink so it dangles (no live data behind it).
+    auth_link = tmp_home / ".config" / "github-copilot"
+    if auth_link.is_symlink():
+        auth_link.unlink()
+    auth_link.symlink_to(tmp_home / "missing-target", target_is_directory=True)
+
+    # Point copilot-config at profC (third profile, not source or destination).
+    config_link = tmp_home / ".copilot"
+    import shutil
+
+    if config_link.is_symlink():
+        config_link.unlink()
+    elif config_link.is_dir():
+        shutil.rmtree(config_link)
+    config_link.symlink_to(
+        svc._store.profile_dir("profC") / "copilot-config",
+        target_is_directory=True,
+    )
+
+    with pytest.raises(StorageError, match="match neither"):
+        svc.use("profB")
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")

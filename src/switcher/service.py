@@ -305,31 +305,46 @@ class ProfileService:
             # tmp-then-rename helper every other snapshot write uses.
             atomic_write_file(dst, src_text.encode("utf-8"))
 
-    def _any_live_dir_dangling(self, tool: Tool) -> bool:
-        """True iff any of ``tool``'s config_dirs live paths is a link
-        that doesn't resolve (dangling symlink / broken Windows
-        junction).
+    def _all_live_dirs_dangling(self, tool: Tool) -> bool:
+        """True iff EVERY one of ``tool``'s config_dirs live paths is a
+        dangling link (symlink / Windows junction that doesn't resolve).
 
-        Used by ``use()``'s capture-loop divergence dispatch to
-        distinguish two failure modes for "live links match neither
-        source nor destination":
+        Used by ``use()``'s capture-loop divergence dispatch to identify
+        the "safe to skip capture" fallback when live links match
+        neither source nor destination:
 
-          - Dangling: typical post-failed-rename recovery (store.rename
-            moved the target dir, swap_link failed to retarget). No
-            live data behind the dangling link to capture or destroy,
-            so capture-skip is safe and the apply phase below cleans
-            up by re-pointing the links at the destination.
-          - Resolves elsewhere: genuinely ambiguous third-profile or
-            externally-mutated state. Refuse rather than overwrite.
+          - All dangling: typical post-failed-rename recovery
+            (store.rename moved the target dir, swap_link failed to
+            retarget). No live data behind any dangling link to
+            capture or destroy, so capture-skip is safe and the apply
+            phase below cleans up by re-pointing the links at the
+            destination.
+          - Mixed dangling + resolves-elsewhere: a multi-dir tool with
+            one dangling link AND another link pointing at a third
+            profile / external dir is STILL ambiguous — the
+            resolves-elsewhere half could be carrying user data. The
+            "any-dangling" predicate would let this case slip through
+            into capture-skip and the apply phase would silently
+            overwrite that other half. Require ALL dirs to be dangling
+            (CR pass-PR-4 major).
+          - No links at all (e.g. only-non-link paths): would not be
+            the recovery shape we're protecting; return False so the
+            ambiguous-state refusal fires.
         """
+        saw_link = False
         for i in range(len(tool.config_dirs)):
             live_dir = self._resolver.tool_dir(tool, i)
-            if self._resolver.is_link(live_dir):
-                try:
-                    live_dir.resolve(strict=True)
-                except OSError:
-                    return True
-        return False
+            if not self._resolver.is_link(live_dir):
+                return False
+            saw_link = True
+            try:
+                live_dir.resolve(strict=True)
+            except OSError:
+                continue
+            # Link that resolves successfully → not dangling, so the
+            # tool's set isn't uniformly dangling.
+            return False
+        return saw_link
 
     def _symlink_matches_active_source(self, tool: Tool, source_profile: str) -> bool:
         """True iff every config_dirs symlink for ``tool`` resolves to
@@ -2046,7 +2061,38 @@ class ProfileService:
         # MCPs, no oauth account, no per-project state), so no
         # owned_json_paths walker is needed — only the (subdir,
         # filename) location, which the journal carries.
+        #
+        # Two-pass classification + dispatch mirrors the dated-current
+        # vanilla-snapshot replay above:
+        #   1. AMBIGUOUS preflight — refuse on any non-regular-file
+        #      shape (symlink, directory, malformed JSON) BEFORE any
+        #      write runs. Without this gate, ``init --continue`` would
+        #      already have replayed dir mappings + reseeded credentials
+        #      before silently clobbering corrupt vanilla state on the
+        #      atomic_write_file line below, leaving recovery half-
+        #      applied with the journal still open (CR pass-PR-4 major).
+        #   2. Mutation pass — write ``{}`` only for UNTOUCHED entries.
+        #      COMPLETE skips (idempotent re-write would no-op anyway,
+        #      but skipping makes the audit trail clearer).
+        vanilla_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
         for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, vanilla_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init continue: 'vanilla' config_file "
+                    f"snapshot for tool {cf_entry.tool_id!r} at "
+                    f"{vanilla_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
+                    f"on-disk state is ambiguous; manual recovery required."
+                )
+            vanilla_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ] = state
+        for cf_entry in record.config_file_mappings:
+            state = vanilla_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
+            if state is ConfigFileDiskState.COMPLETE:
+                continue
             snap_path = self._store.config_file_snapshot_path(
                 "vanilla", cf_entry.profile_subdir, cf_entry.profile_filename
             )
@@ -3315,26 +3361,31 @@ class ProfileService:
             #     the apply is a no-op write of the bytes we just
             #     captured and the user's edits survive.
             #
-            # (3) At least one config_dir live path is a DANGLING link
-            #     (resolves to nothing — typical post-failed-rename
-            #     recovery shape where ``store.rename`` moved the dir
-            #     but ``swap_link`` failed to retarget). There's no
-            #     live data behind a dangling link to either capture or
+            # (3) ALL of the tool's config_dir live paths are dangling
+            #     links — typical post-failed-rename recovery shape
+            #     (``store.rename`` moved the target dir but
+            #     ``swap_link`` failed to retarget). No live data
+            #     behind any dangling link to either capture or
             #     overwrite, so skip capture and let the apply +
-            #     swap_link below complete the recovery cleanly.
+            #     swap_link below complete the recovery cleanly. The
+            #     "ALL" requirement matters for multi-dir tools: a
+            #     mixed state where one dir dangles and another
+            #     resolves to a third profile would still be
+            #     ambiguous (CR pass-PR-4) — case 4 catches it.
             #
             # (4) Links resolve to neither source nor destination AND
-            #     aren't dangling — they point at a third profile or
-            #     an external directory. Genuinely ambiguous drift;
-            #     refuse loudly rather than silently overwrite that
-            #     third profile's data with destination bytes.
+            #     aren't uniformly dangling — they point at a third
+            #     profile, an external directory, or a mix of dangling
+            #     plus elsewhere. Genuinely ambiguous drift; refuse
+            #     loudly rather than silently overwrite that other
+            #     state with destination bytes.
             if self._symlink_matches_active_source(tool, source):
                 self._capture_config_files(source, tool)
                 continue
             if self._symlink_matches_active_source(tool, profile_name):
                 self._capture_config_files(profile_name, tool)
                 continue
-            if self._any_live_dir_dangling(tool):
+            if self._all_live_dirs_dangling(tool):
                 continue
             raise StorageError(
                 f"live config_dirs for {tid!r} match neither active source "

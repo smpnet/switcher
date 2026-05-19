@@ -390,6 +390,47 @@ def test_continue_uses_journaled_owned_paths_not_registry(tmp_home: Path, tmp_st
     assert "oauthAccount" not in extracted
 
 
+def test_continue_refuses_when_vanilla_snapshot_path_is_ambiguous(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """CR pass-PR-4 major: ``init --continue``'s vanilla-snapshot
+    rewrite loop must preflight each entry with
+    ``classify_config_file_mapping`` and refuse on AMBIGUOUS shape.
+    Without the gate, the loop would blindly atomic_write_file over a
+    symlink / directory at the vanilla snapshot path, AFTER replaying
+    dir mappings and reseeding credentials — leaving recovery
+    half-applied with the journal still open.
+
+    Sets up a clean post-init state, removes the vanilla snapshot
+    (so the short-circuit doesn't fire), plants an AMBIGUOUS shape
+    (directory) at the vanilla snapshot path, and asserts continue
+    raises OpLogCorruptError BEFORE the rewrite would clobber it.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {}}))
+    service.init(["claude"])
+    active_source = service._store.get_active()["claude"]
+    vanilla_snap = service._store.config_file_snapshot_path("vanilla", "claude", "claude.json")
+    vanilla_snap.unlink()
+    # AMBIGUOUS shape: a directory at the snapshot path.
+    vanilla_snap.mkdir(parents=True)
+
+    record = _make_init_record(
+        active_source,
+        target_ids=["claude"],
+        mappings=[_claude_mapping(tmp_home)],
+        config_file_mappings=[_claude_cf_mapping(tmp_home)],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    with pytest.raises(OpLogCorruptError, match=r"vanilla.*ambiguous"):
+        service.init(continue_=True)
+
+    # The directory was NOT clobbered by the rewrite — the refusal
+    # fired before any vanilla-side mutation.
+    assert vanilla_snap.is_dir()
+
+
 def test_continue_short_circuit_requires_config_file_snapshots_complete(
     service: ProfileService, tmp_home: Path, tmp_state: Path
 ) -> None:
