@@ -15,6 +15,10 @@ pytest = ">=8"
 pytest-cov = "*"
 freezegun = "*"
 build = "*"
+# Used only by the CI `coverage` job to gate PR diffs against coverage.xml;
+# local devs don't run it. Kept in the single env (no `ci` env split) to
+# match this project's flat env convention.
+diff-cover = "*"
 
 [tasks]
 test = "pytest tests/unit"

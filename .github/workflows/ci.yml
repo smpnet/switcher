@@ -67,6 +67,57 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/run-pixi-ci
 
+  # Coverage gate. ubuntu-only by design -- coverage measurement is
+  # OS-independent for a pure-Python package, so running it across the
+  # three-OS matrix would just triple runner time without adding signal.
+  # The matrix `test` job above is what enforces cross-OS behavior; this
+  # job's contract is narrower: "the suite hits enough lines/branches,
+  # and new code in this PR is tested."
+  coverage:
+    name: Coverage (pytest + diff-cover)
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          # diff-cover compares against origin/<base_ref> to compute the
+          # patch coverage delta; a shallow checkout would miss the base
+          # history. fetch-depth: 0 also keeps hatch-vcs version derivation
+          # working, matching every other job in this file.
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-pixi-pinned
+      - name: pytest with coverage
+        # Threshold: 85% -- ~5 points below the 90% baseline measured on
+        # main (855 tests, 2026-05-19). The cushion absorbs legitimate
+        # refactors that delete well-covered lines without flapping the
+        # gate; the real "no untested new code" enforcement lives in
+        # the diff-cover step below. Branch coverage is enabled so logic
+        # with un-tested forks counts against the total.
+        shell: bash
+        run: |
+          pixi run -- pytest \
+            --cov=switcher \
+            --cov-branch \
+            --cov-report=term \
+            --cov-report=xml \
+            --cov-fail-under=85
+      - name: Patch coverage (diff-cover)
+        # Gates new / changed executable lines in the PR diff at 90%.
+        # coverage.py's "executable line" rule excludes docstrings,
+        # comments, and import-only lines, so doc-only PRs don't trip
+        # false failures. *cli.py is excluded because argparse plumbing
+        # is awkward to unit-test and dilutes the signal -- mirrors
+        # the same exclude used in the sibling brainiac project.
+        # Only runs on pull_request events; push events have no
+        # meaningful base diff to compare against.
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          pixi run -- diff-cover coverage.xml \
+            --compare-branch=origin/${{ github.base_ref }} \
+            --exclude '*cli.py' \
+            --fail-under=90
+
   # Linux-only wheel + sdist build. The package is pure-Python (no compiled
   # extensions), so the artifact is identical regardless of build OS -- running
   # it across the three-OS test matrix was redundant. This job runs once and
