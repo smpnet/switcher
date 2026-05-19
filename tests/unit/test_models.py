@@ -156,6 +156,20 @@ def test_canonicalize_posix_tilde_backslash_folds_to_forward_slash() -> None:
     assert canonicalize_path_for_uniqueness("~\\.claude.json", windows=False) == canonical
 
 
+def test_canonicalize_posix_backslash_in_path_body_is_not_a_separator() -> None:
+    """Hermes pass-PR-5 blocker: only the leading ``~\\`` is equivalent
+    to ``~/``. ``PathResolver.expand`` strips that prefix and passes the
+    remainder to ``Path()`` unchanged, so on POSIX a literal backslash
+    inside the path body is a regular filename character — two such
+    paths must NOT collide in the validator. Pre-fix, a global
+    ``path.replace("\\\\", "/")`` collapsed them and could falsely
+    reject valid registry entries as duplicate ``config_file`` paths.
+    """
+    with_backslash = canonicalize_path_for_uniqueness("/tmp/foo\\bar.json", windows=False)
+    with_slash = canonicalize_path_for_uniqueness("/tmp/foo/bar.json", windows=False)
+    assert with_backslash != with_slash
+
+
 @pytest.mark.parametrize(
     "unrelated",
     [

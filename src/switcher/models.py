@@ -174,25 +174,25 @@ def canonicalize_path_for_uniqueness(path: str, *, windows: bool) -> str:
     home-relative case Hermes flagged.
     """
     # Tilde at the start. Match ``PathResolver.expand``'s shape exactly:
-    # ``~`` alone, ``~/``, and ``~\\`` (the latter so a Windows-shaped
-    # tilde path canonicalizes against the same sentinel).
+    # ``~`` alone, ``~/...``, and ``~\\...`` (the latter so a
+    # Windows-shaped tilde path canonicalizes against the same sentinel).
+    # The runtime only treats the LEADING separator after ``~`` as
+    # equivalent across spellings — it strips the ``~\\`` or ``~/``
+    # prefix and passes the remainder to ``Path()`` unchanged, so
+    # ``~/foo\\bar`` and ``~/foo/bar`` resolve to DIFFERENT files on
+    # POSIX. Only normalize that single leading separator; a global
+    # backslash-to-slash fold would collide unrelated POSIX paths
+    # whose names legitimately contain ``\\`` (Hermes pass-PR-5 blocker).
     if path == "~":
         path = _HOME_SENTINEL
-    elif path.startswith(("~/", "~\\")):
+    elif path.startswith("~/"):
         path = _HOME_SENTINEL + path[1:]
+    elif path.startswith("~\\"):
+        path = _HOME_SENTINEL + "/" + path[2:]
     if windows:
         path = _WIN_USERPROFILE_RE.sub(_HOME_SENTINEL, path)
         return ntpath.normpath(path).casefold()
     path = _POSIX_HOME_RE.sub(_HOME_SENTINEL, path)
-    # POSIX runtime expansion (``PathResolver.expand``) accepts BOTH
-    # ``~/`` and ``~\\`` prefixes and treats them as the same path, but
-    # ``posixpath.normpath`` treats backslashes as ordinary characters
-    # — without this fold, ``~/.claude.json`` and ``~\\.claude.json``
-    # produce different keys here even though they resolve to the same
-    # live file at runtime (Hermes pass-PR-4 blocker 2). Replace
-    # backslashes with forward slashes BEFORE normpath so the two
-    # spellings canonicalize identically.
-    path = path.replace("\\", "/")
     return posixpath.normpath(path).casefold()
 
 
