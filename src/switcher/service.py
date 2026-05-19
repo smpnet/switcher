@@ -3252,6 +3252,22 @@ class ProfileService:
         for tid, tool in resolved:
             for dm in tool.config_dirs:
                 target = self._store.profile_dir(profile_name) / dm.profile_subdir
+                # Reject link-shaped targets BEFORE the existence check:
+                # ``Path.is_dir()`` follows symlinks and Windows junctions,
+                # so a profile subdir replaced with a link to an external
+                # directory would pass the existence guard and
+                # ``swap_link(target, live)`` would then point ``live`` at
+                # the foreign location, effectively repointing the
+                # tool's config dir outside the state store. Mirror the
+                # link-shape refusal the recovery + classifier paths
+                # already apply to reserved state (Hermes pass-PR-4).
+                if self._resolver.is_link(target):
+                    raise PathNotADirectoryError(
+                        f"profile {profile_name!r} subdir {dm.profile_subdir!r} "
+                        f"for tool {tid!r} is a symlink or junction, not a "
+                        f"real directory; refusing to switch through a link "
+                        f"that could point outside the state store"
+                    )
                 if not target.is_dir():
                     raise PathNotADirectoryError(
                         f"profile {profile_name!r} is missing "
@@ -4137,14 +4153,41 @@ class ProfileService:
             existing_subdirs = sorted(
                 sub for sub in expected_subdirs if (profile_dir / sub).is_dir()
             )
-            if existing_subdirs:
+            # Same protection applied to ConfigFile snapshots under
+            # ``.switcher/config_files/<subdir>/``. Pre-fix, the orphan-
+            # force path only checked owned config_dir subtrees; an
+            # orphan tool with a stranded snapshot (e.g., post-init
+            # vanilla snapshot whose registry entry was later removed)
+            # would still be silently purgeable by a later
+            # ``uninstall --purge``. Treat snapshot subdirs as owned
+            # state too (Hermes + CR pass-PR-4 blocker). Subdirs share
+            # the same identifier between config_dirs and config_files
+            # (Tool validator enforces ``cf.profile_subdir in
+            # config_dirs subdirs``), so the historical-subdir union
+            # already bounds both sides.
+            config_file_root = profile_dir / ".switcher" / "config_files"
+            existing_config_file_subdirs = sorted(
+                sub for sub in expected_subdirs if (config_file_root / sub).is_dir()
+            )
+            if existing_subdirs or existing_config_file_subdirs:
+                owned_locations: list[str] = []
+                if existing_subdirs:
+                    owned_locations.append(
+                        f"config_dir subdir(s) {existing_subdirs} under {profile_name!r}"
+                    )
+                if existing_config_file_subdirs:
+                    owned_locations.append(
+                        f"ConfigFile snapshot subdir(s) "
+                        f"{existing_config_file_subdirs} under "
+                        f"{profile_name!r}/.switcher/config_files"
+                    )
                 raise UninstallPreflightError(
                     f"orphan tool {tool_id!r} still has profile data on disk "
-                    f"(subdir(s) {existing_subdirs} under {profile_name!r}). "
-                    f"Refusing to drop from active map — that data would be "
-                    f"silently lost on a later `switcher uninstall --purge`. "
-                    f"Restore the registry TOML and re-run, or delete the "
-                    f"subdir(s) manually first."
+                    f"({'; '.join(owned_locations)}). Refusing to drop from "
+                    f"active map — that data would be silently lost on a "
+                    f"later `switcher uninstall --purge`. Restore the "
+                    f"registry TOML and re-run, or delete the owned data "
+                    f"manually first."
                 )
             skipped_orphan = True
 

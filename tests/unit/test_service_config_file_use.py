@@ -481,6 +481,47 @@ def test_use_refuses_when_symlinks_match_neither_source_nor_destination(
         service.use("profB")
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_use_refuses_when_profile_subdir_is_symlinked(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """Hermes pass-PR-4 blocker 1: ``use()``'s preflight only checked
+    ``target.is_dir()``, which follows symlinks. A profile subdir
+    replaced with a link to an external directory would pass the
+    existence guard and ``swap_link(target, live)`` would then point
+    the live config dir at the foreign location — repointing the
+    tool's data outside the state store.
+
+    The fix rejects link-shaped reserved-state paths at the preflight,
+    mirroring the same refusal the recovery + classifier paths already
+    apply.
+    """
+    from switcher.errors import PathNotADirectoryError
+
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    # Replace profA/claude with a symlink to an external directory.
+    target = service._store.profile_dir("profA") / "claude"
+    foreign = tmp_home / "foreign-dir"
+    foreign.mkdir()
+    (foreign / "evil.json").write_text("{}")
+    import shutil
+
+    shutil.rmtree(target)
+    target.symlink_to(foreign, target_is_directory=True)
+
+    with pytest.raises(PathNotADirectoryError, match="symlink or junction"):
+        service.use("profA")
+
+    # The live config dir was NOT repointed at the foreign location —
+    # use() refused before any swap_link ran.
+    claude_link = tmp_home / ".claude"
+    assert claude_link.resolve() != foreign.resolve()
+
+
 def test_use_raises_storage_error_when_snapshot_path_is_a_directory(
     service: ProfileService, tmp_home: Path
 ) -> None:

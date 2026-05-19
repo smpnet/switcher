@@ -44,8 +44,10 @@ CLAUDE_CONFIG_FILE = ConfigFile(
 
 
 @pytest.fixture
-def registry() -> tuple[Tool, ...]:
-    base = build_registry(Path("/nonexistent"))
+def registry(tmp_path: Path) -> tuple[Tool, ...]:
+    # Guaranteed-missing directory under ``tmp_path`` keeps the fixture
+    # hermetic and platform-independent (CR pass-PR-3 minor).
+    base = build_registry(tmp_path / "missing-registry-dir")
     out: list[Tool] = []
     for t in base:
         if t.id == "claude":

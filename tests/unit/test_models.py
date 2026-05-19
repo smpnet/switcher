@@ -143,6 +143,39 @@ def test_canonicalize_distinct_paths_produce_distinct_keys() -> None:
     assert a != b
 
 
+def test_canonicalize_posix_tilde_backslash_folds_to_forward_slash() -> None:
+    """Hermes pass-PR-4 blocker 2: POSIX runtime expansion accepts both
+    ``~/`` AND ``~\\`` prefixes (paths.py:48 — ``expanded.startswith(("~/",
+    "~\\\\"))``), so the two spellings resolve to the same live file.
+    ``posixpath.normpath`` doesn't fold backslashes though, so without
+    an explicit normalization step the validator key for ``~\\.claude.json``
+    would differ from ``~/.claude.json`` — two tools using different
+    separator spellings would slip past as distinct.
+    """
+    canonical = canonicalize_path_for_uniqueness("~/.claude.json", windows=False)
+    assert canonicalize_path_for_uniqueness("~\\.claude.json", windows=False) == canonical
+
+
+@pytest.mark.parametrize(
+    "unrelated",
+    [
+        "$HOME_BACKUP/.cfg",
+        "${HOME_DIR}/.cfg",
+        "$HOMEBREW_PREFIX/.cfg",
+    ],
+)
+def test_canonicalize_posix_home_regex_does_not_overmatch(unrelated: str) -> None:
+    """Hermes pass-PR-4 blocker 3: ``$HOME_BACKUP`` and ``${HOME_DIR}``
+    are NOT the user's home — they're unrelated env vars whose names
+    happen to start with ``HOME``. Pre-fix, the regex matched the
+    ``$HOME`` prefix and collapsed semantically distinct paths to the
+    same canonical key, causing false-positive collision rejections.
+    """
+    home = canonicalize_path_for_uniqueness("$HOME/.cfg", windows=False)
+    unrelated_key = canonicalize_path_for_uniqueness(unrelated, windows=False)
+    assert unrelated_key != home
+
+
 def test_canonicalize_does_not_consult_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
     """Validator-side canonicalization must be deterministic across hosts.
     Setting ``$HOME`` to something exotic at test time must NOT change

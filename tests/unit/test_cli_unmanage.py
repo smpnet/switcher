@@ -188,6 +188,51 @@ def test_unmanage_force_refuses_when_orphan_has_owned_subdir_in_profile(
     assert "copilot" in orphan._store.get_active()
 
 
+def test_unmanage_force_refuses_when_orphan_has_config_file_snapshot(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes + CR pass-PR-4 blocker: ``unmanage --force`` on orphan-no-
+    cache pre-fix only inspected owned ``<profile>/<subdir>`` dirs. If
+    those were already gone but a ConfigFile snapshot survived under
+    ``<profile>/.switcher/config_files/<subdir>/``, the force-skip
+    silently dropped the tool from ``active`` and a later
+    ``uninstall --purge`` would ``rmtree()`` the state dir without the
+    skipped-tool guard ever firing — exactly the same silent-data-loss
+    class the existing owned-subdir refusal closes for config_dirs.
+
+    The fix extends the orphan refusal to snapshot subdirs too. This
+    test exercises the snapshot-only branch (owned dir removed) so a
+    regression on either side surfaces independently.
+    """
+    import pytest as _pytest
+
+    from switcher.errors import UninstallPreflightError
+
+    _full, orphan, profile_name = _orphan_copilot_service(tmp_state, tmp_home)
+    profile_dir = orphan._store.profile_dir(profile_name)
+    # Remove the owned config_dir subdir so the dir-side refusal doesn't
+    # fire — we want the snapshot-side check to be the gate under test.
+    shutil.rmtree(profile_dir / "copilot-config")
+    # Drop the live symlink so derive-on-read doesn't repopulate cache
+    # (orphan-no-cache precondition).
+    copilot_link = tmp_home / ".copilot"
+    if copilot_link.is_symlink():
+        copilot_link.unlink()
+    elif copilot_link.is_dir():
+        shutil.rmtree(copilot_link)
+    # Plant a ConfigFile snapshot at the canonical reserved path.
+    # The historical subdir union (_expected_subdirs_for) includes
+    # copilot-config, so the new check will see this subdir as owned.
+    snap_dir = profile_dir / ".switcher" / "config_files" / "copilot-config"
+    snap_dir.mkdir(parents=True)
+    (snap_dir / "settings.json").write_text('{"mcpServers": {}}')
+
+    with _pytest.raises(UninstallPreflightError, match="ConfigFile snapshot"):
+        orphan.unmanage("copilot", force=True)
+    # active map unchanged — the refusal preserves the purge guard.
+    assert "copilot" in orphan._store.get_active()
+
+
 def test_unmanage_force_succeeds_when_orphan_has_no_on_disk_presence(
     tmp_home: Path, tmp_state: Path
 ) -> None:

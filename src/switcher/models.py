@@ -146,22 +146,25 @@ def validate_absolute_path(value: str) -> str:
 # case-insensitive-but-preserving semantics (Hermes pass-PR-4 blocker).
 _HOME_SENTINEL = "\x00switcher-home\x00"
 # Windows ``%VAR%`` lookup is case-insensitive at runtime, mirror that here.
-# POSIX ``$HOME`` / ``${HOME}`` is case-sensitive but the variable name
-# itself is universally upper-case in practice.
 _WIN_USERPROFILE_RE = re.compile(r"%USERPROFILE%", re.IGNORECASE)
-_POSIX_HOME_RE = re.compile(r"\$\{?HOME\}?")
+# POSIX env-var match: ``$HOME`` followed by a non-word char (or end of
+# string) OR the explicit ``${HOME}`` brace form. Without the boundary,
+# the pattern would match the ``$HOME`` prefix of unrelated variables
+# like ``$HOME_BACKUP`` / ``${HOME_DIR}`` and collapse semantically
+# distinct paths to the same canonical key — a false-positive collision
+# that would reject valid configs (Hermes pass-PR-4 blocker 3).
+_POSIX_HOME_RE = re.compile(r"\$(?:HOME(?!\w)|\{HOME\})")
 
 
 def canonicalize_path_for_uniqueness(path: str, *, windows: bool) -> str:
     """Produce a canonical key for cross-tool path uniqueness compare.
 
-    Catches all four equivalent spellings of a home-relative path that
-    runtime ``PathResolver.expand`` collapses to the same file:
+    Catches every spelling of a home-relative path that runtime
+    ``PathResolver.expand`` collapses to the same file:
 
-    - ``~/.claude.json``
-    - ``~``
-    - POSIX: ``$HOME/.claude.json`` and ``${HOME}/.claude.json``
-    - Windows: ``%USERPROFILE%\\.claude.json`` (any case)
+    - ``~`` / ``~/...`` / ``~\\...`` (runtime accepts both separators)
+    - POSIX: ``$HOME/...`` and ``${HOME}/...``
+    - Windows: ``%USERPROFILE%\\...`` (any case)
 
     Does NOT consult ``os.environ`` — the registry validator must be
     deterministic and produce the same key regardless of which host runs
@@ -181,6 +184,15 @@ def canonicalize_path_for_uniqueness(path: str, *, windows: bool) -> str:
         path = _WIN_USERPROFILE_RE.sub(_HOME_SENTINEL, path)
         return ntpath.normpath(path).casefold()
     path = _POSIX_HOME_RE.sub(_HOME_SENTINEL, path)
+    # POSIX runtime expansion (``PathResolver.expand``) accepts BOTH
+    # ``~/`` and ``~\\`` prefixes and treats them as the same path, but
+    # ``posixpath.normpath`` treats backslashes as ordinary characters
+    # — without this fold, ``~/.claude.json`` and ``~\\.claude.json``
+    # produce different keys here even though they resolve to the same
+    # live file at runtime (Hermes pass-PR-4 blocker 2). Replace
+    # backslashes with forward slashes BEFORE normpath so the two
+    # spellings canonicalize identically.
+    path = path.replace("\\", "/")
     return posixpath.normpath(path).casefold()
 
 
