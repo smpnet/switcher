@@ -66,14 +66,15 @@ switcher init
 
 What just happened on disk:
 
-1. `~/.claude` (and `~/.copilot`, if installed) moved into
-   `<state_dir>/profiles/<today>-current/`.
+1. Each detected tool's live config dir (e.g. `~/.claude`, `~/.copilot`) was
+   moved into `<state_dir>/profiles/<today>-current/`.
 2. Symlinks at the original paths now point into that profile.
 3. A second `vanilla` profile was created carrying just your credential files
    (auth tokens, API keys) — your starting-from-scratch baseline.
-4. The "active" map records both tools as currently using `<today>-current`.
+4. The "active" map records each detected tool as currently using
+   `<today>-current`.
 
-Confirm it:
+Confirm it — for example, with both Claude and Copilot installed:
 
 ```bash
 switcher status
@@ -84,6 +85,9 @@ switcher list
 # * 2026-05-15-current
 #   vanilla
 ```
+
+If only one tool was installed when you ran `init`, only that tool appears in
+`status`; the rest is the same.
 
 You can keep working with Claude as usual — the symlink is invisible to the
 tool. `~/.claude/settings.json` is still the file Claude reads; it just

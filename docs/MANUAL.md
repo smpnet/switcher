@@ -157,16 +157,20 @@ before running any of the steps.
    points at right now — and it may differ across tools (e.g. Claude on
    `vanilla`, Copilot on `experiment`). Restoring from the wrong profile
    silently discards newer changes:
+
    ```bash
    switcher status      # capture this output — it tells you which
                         # profile to restore from for each tool
    ```
+
    Then back up the whole state tree (not just `profiles/`) so user-added
    registry entries and the active map come along:
+
    ```bash
    # macOS example — adjust the source path per the per-OS table below
    cp -R "$HOME/Library/Application Support/switcher" ~/switcher-state-backup
    ```
+
    > **🔒 The backup contains credentials.** Per the seed-not-share model,
    > every profile in `<state_dir>/profiles/` carries its own copy of every
    > tool's credential files (OAuth tokens, API keys, etc.). Treat
@@ -195,12 +199,14 @@ before running any of the steps.
    rm ~/.claude
    cp -R ~/switcher-state-backup/profiles/<active-profile>/claude ~/.claude
    ```
+
    ```powershell
    # Windows — junctions: use `rmdir` from cmd, or Remove-Item from PowerShell.
    # `rm`/`del` will fail or behave unexpectedly on a junction.
    cmd /c rmdir "$env:USERPROFILE\.claude"
    Copy-Item -Recurse "$env:USERPROFILE\switcher-state-backup\profiles\<active-profile>\claude" "$env:USERPROFILE\.claude"
    ```
+
    Repeat for every tool listed in `switcher status` — each may need a
    different `<active-profile>` source.
 
@@ -451,7 +457,7 @@ the same ref, run `pipx upgrade switcher` — but note that pinned tags
 with the new ref:
 
 ```bash
-pipx install --force git+ssh://git@github.com/smpnet/switcher.git@v0.1.6
+pipx install --force git+ssh://git@github.com/smpnet/switcher.git@<tag-or-commit>
 ```
 
 While the repo is private, both upgrade and reinstall still need the same
