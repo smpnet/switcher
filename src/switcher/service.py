@@ -3899,6 +3899,21 @@ class ProfileService:
                         raise RescanCaptureError(
                             f"profile {into!r} already has {dm.profile_subdir!r} (would overwrite)"
                         )
+                # Same defensive rule for ConfigFile snapshots: a target
+                # profile that already has a snapshot at the canonical
+                # path is mid-state from a different switcher operation
+                # (an older save / a partial uninstall) — overwriting it
+                # would silently destroy the previously-captured MCP /
+                # oauth subtree (spec §3.8).
+                for cf in tool.config_files:
+                    snap = self._store.config_file_snapshot_path(
+                        into, cf.profile_subdir, cf.profile_filename
+                    )
+                    if snap.exists():
+                        raise RescanCaptureError(
+                            f"profile {into!r} already has a config_file "
+                            f"snapshot at {snap} (would overwrite)"
+                        )
             targets = {tool.id: into for tool in candidates}
         else:
             today = now().strftime("%Y-%m-%d")
@@ -4118,6 +4133,36 @@ class ProfileService:
                     else:
                         with contextlib.suppress(Exception):
                             move_or_seed_dir(tgt, live)
+            raise
+
+        # Mirror init's capture sequence: the rescan profile must own the
+        # same data shape every later capture will produce, or the first
+        # `switcher use <rescan-profile>` would hit snapshot-missing on
+        # every ConfigFile-equipped tool — warn-and-skip at best, silent
+        # apply of `{}` over user MCPs at worst (the snapshot-missing
+        # branch in _plan_config_file_applies). No-op for tools without
+        # config_files.
+        #
+        # Placement is post-dir-loop and post-metadata-update so a
+        # snapshot-capture failure (StorageError on malformed live JSON,
+        # symlink at live_path, etc.) doesn't strand a half-built
+        # snapshot in the partial profile dir. The inner except cleans
+        # the snapshot debris explicitly; the outer rescan() rollback
+        # (_rollback_partial_rescan) handles the dir + metadata side.
+        try:
+            self._capture_config_files(target, tool)
+        except Exception:
+            # Unlink any partial snapshot debris. For fresh-mode the
+            # outer rmtree of target_dir would catch this too, but
+            # --into mode leaves target_dir alone — the dir-rollback
+            # only touches per-tool subdirs, so an orphan snapshot
+            # under .switcher/config_files/ would survive without
+            # this explicit cleanup. Belt-and-suspenders for fresh
+            # mode; load-bearing for --into.
+            for cf in tool.config_files:
+                self._store.config_file_snapshot_path(
+                    target, cf.profile_subdir, cf.profile_filename
+                ).unlink(missing_ok=True)
             raise
 
         # Capture succeeded — commit the metadata update for --into. If this
