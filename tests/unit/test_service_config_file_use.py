@@ -396,6 +396,91 @@ def test_use_skips_capture_when_symlink_diverged_from_active(
     assert prof_a_after["mcpServers"] == {"src": {}}
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_use_captures_into_destination_when_active_is_stale_behind_symlinks(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """CR pass-PR-3 major: when a prior use() flipped symlinks to the
+    destination but never committed set_active_state, the active map
+    is stale and the user's subsequent in-flight edits to live ARE
+    edits to the destination profile's data. A retry of use(destination)
+    must capture those edits into the destination's snapshot, not skip
+    capture and let the apply overwrite them.
+
+    Pre-fix the capture loop's "active doesn't match symlinks → skip"
+    branch silently dropped the edits.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"src": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    live.write_text(json.dumps({"mcpServers": {"profB-baseline": {}}}))
+    service.save("profB")
+
+    # Restore live and switch to profA so active = {claude: profA}.
+    live.write_text(json.dumps({"mcpServers": {"src": {}}}))
+    service.use("profA")
+
+    # Simulate partial-commit drift: symlinks moved to profB, set_active
+    # didn't fire. Then the user made an in-flight edit to live.
+    claude_dir = tmp_home / ".claude"
+    claude_dir.unlink()
+    claude_dir.symlink_to(
+        service._store.profile_dir("profB") / "claude",
+        target_is_directory=True,
+    )
+    live.write_text(json.dumps({"mcpServers": {"profB-baseline": {}, "new-edit-while-stale": {}}}))
+
+    # Retry. Capture must route into profB (where symlinks actually point)
+    # so the new edit survives the apply phase.
+    service.use("profB")
+
+    prof_b_snap = service._store.config_file_snapshot_path("profB", "claude", "claude.json")
+    prof_b_data = json.loads(prof_b_snap.read_text())
+    assert "new-edit-while-stale" in prof_b_data["mcpServers"], (
+        "in-flight edits to live (while active was stale-behind-symlinks) "
+        "must be captured into the destination profile's snapshot, not lost"
+    )
+    # profA's snapshot must NOT have absorbed profB content.
+    prof_a_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    prof_a_data = json.loads(prof_a_snap.read_text())
+    assert prof_a_data["mcpServers"] == {"src": {}}
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_use_refuses_when_symlinks_match_neither_source_nor_destination(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """CR pass-PR-3 major: if the live config_dirs symlinks match
+    neither the active-map source nor the destination we're switching
+    to, the drift is genuinely ambiguous. Refuse loudly rather than
+    silently overwrite live with the destination snapshot — that
+    would drop whatever data is currently in live (a third profile,
+    a hand-edited symlink target, etc.).
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"a": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    live.write_text(json.dumps({"mcpServers": {"b": {}}}))
+    service.save("profB")
+    live.write_text(json.dumps({"mcpServers": {"c": {}}}))
+    service.save("profC")
+    service.use("profA")  # active = profA
+
+    # Point symlinks at profC (neither source profA nor destination profB).
+    claude_dir = tmp_home / ".claude"
+    claude_dir.unlink()
+    claude_dir.symlink_to(
+        service._store.profile_dir("profC") / "claude",
+        target_is_directory=True,
+    )
+
+    with pytest.raises(StorageError, match="match neither"):
+        service.use("profB")
+
+
 def test_use_raises_storage_error_when_snapshot_path_is_a_directory(
     service: ProfileService, tmp_home: Path
 ) -> None:

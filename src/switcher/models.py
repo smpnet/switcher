@@ -133,6 +133,58 @@ def validate_absolute_path(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cross-tool path uniqueness canonicalization
+# ---------------------------------------------------------------------------
+#
+# Validator-side mirror of ``PathResolver.expand`` for collision detection.
+# Runtime expansion (paths.py) consults ``os.environ`` and the configured
+# home; the validator runs at registry-build time, has no PathResolver,
+# and MUST be deterministic across hosts. Substitute the common "user
+# home" spellings against a sentinel so any spelling that resolves to the
+# user's home at runtime maps to a single key here. Then ``normpath``
+# folds ``..`` segments and ``casefold`` matches default NTFS/APFS
+# case-insensitive-but-preserving semantics (Hermes pass-PR-4 blocker).
+_HOME_SENTINEL = "\x00switcher-home\x00"
+# Windows ``%VAR%`` lookup is case-insensitive at runtime, mirror that here.
+# POSIX ``$HOME`` / ``${HOME}`` is case-sensitive but the variable name
+# itself is universally upper-case in practice.
+_WIN_USERPROFILE_RE = re.compile(r"%USERPROFILE%", re.IGNORECASE)
+_POSIX_HOME_RE = re.compile(r"\$\{?HOME\}?")
+
+
+def canonicalize_path_for_uniqueness(path: str, *, windows: bool) -> str:
+    """Produce a canonical key for cross-tool path uniqueness compare.
+
+    Catches all four equivalent spellings of a home-relative path that
+    runtime ``PathResolver.expand`` collapses to the same file:
+
+    - ``~/.claude.json``
+    - ``~``
+    - POSIX: ``$HOME/.claude.json`` and ``${HOME}/.claude.json``
+    - Windows: ``%USERPROFILE%\\.claude.json`` (any case)
+
+    Does NOT consult ``os.environ`` — the registry validator must be
+    deterministic and produce the same key regardless of which host runs
+    the build. Other env-var references (e.g., ``$XDG_CONFIG_HOME``) are
+    left as-is; two tools spelling the same path through a non-home env
+    var would still slip past, but that's a much narrower class than the
+    home-relative case Hermes flagged.
+    """
+    # Tilde at the start. Match ``PathResolver.expand``'s shape exactly:
+    # ``~`` alone, ``~/``, and ``~\\`` (the latter so a Windows-shaped
+    # tilde path canonicalizes against the same sentinel).
+    if path == "~":
+        path = _HOME_SENTINEL
+    elif path.startswith(("~/", "~\\")):
+        path = _HOME_SENTINEL + path[1:]
+    if windows:
+        path = _WIN_USERPROFILE_RE.sub(_HOME_SENTINEL, path)
+        return ntpath.normpath(path).casefold()
+    path = _POSIX_HOME_RE.sub(_HOME_SENTINEL, path)
+    return posixpath.normpath(path).casefold()
+
+
+# ---------------------------------------------------------------------------
 # DirMapping
 # ---------------------------------------------------------------------------
 
@@ -394,18 +446,19 @@ class Tool(BaseModel):
         # live path on either OS would extract from / apply to the same
         # file twice — silent clobbering. Reject both at load time.
         #
-        # Comparison is case-insensitive (``str.casefold``) AND
-        # path-normalized via ``posixpath.normpath`` / ``ntpath.normpath``.
-        # The runtime path goes through ``PathResolver.expand`` +
-        # ``os.path.normpath``, so ``~/.claude.json`` and
-        # ``~/.config/../.claude.json`` canonicalize to the same live file
-        # — the validator must catch that equivalence here too, or
-        # two semantically-identical-but-syntactically-different entries
-        # silently re-introduce the clobber class (Hermes pass-PR-3).
-        # Default Windows (NTFS) and macOS (APFS) filesystems are
-        # case-insensitive-but-preserving; Linux ext4 may flag a rare
-        # genuinely-distinct-pair as duplicate, but tool-config
-        # convention is lowercase only, so the trade-off favors safety.
+        # Comparison runs each path through
+        # ``canonicalize_path_for_uniqueness`` (case-insensitive,
+        # path-normalized, AND home-spelling-folded) so all four runtime-
+        # equivalent spellings produce the same key: ``~/.claude.json``,
+        # ``$HOME/.claude.json``, ``${HOME}/.claude.json``, and
+        # ``%USERPROFILE%\\.claude.json`` all collapse to one sentinel-
+        # prefixed normpath. The runtime path goes through
+        # ``PathResolver.expand`` + ``os.path.normpath`` and resolves
+        # those four spellings to the same live file; the validator
+        # must catch that equivalence too, or two
+        # semantically-identical-but-syntactically-different entries
+        # silently re-introduce the clobber class (Hermes pass-PR-3 +
+        # pass-PR-4).
         seen_slots: set[tuple[str, str]] = set()
         seen_posix: set[str] = set()
         seen_windows: set[str] = set()
@@ -419,20 +472,20 @@ class Tool(BaseModel):
                     "comparison is case-insensitive"
                 )
             seen_slots.add(slot)
-            posix_key = posixpath.normpath(cf.posix_path).casefold()
+            posix_key = canonicalize_path_for_uniqueness(cf.posix_path, windows=False)
             if posix_key in seen_posix:
                 raise ValueError(
-                    f"duplicate config_file posix_path {cf.posix_path!r} "
-                    f"(canonicalized to {posix_key!r}); comparison is "
-                    "case-insensitive and path-normalized"
+                    f"duplicate config_file posix_path {cf.posix_path!r}; "
+                    "comparison is case-insensitive, path-normalized, "
+                    "and home-spelling-folded"
                 )
             seen_posix.add(posix_key)
-            windows_key = ntpath.normpath(cf.windows_path).casefold()
+            windows_key = canonicalize_path_for_uniqueness(cf.windows_path, windows=True)
             if windows_key in seen_windows:
                 raise ValueError(
-                    f"duplicate config_file windows_path {cf.windows_path!r} "
-                    f"(canonicalized to {windows_key!r}); comparison is "
-                    "case-insensitive and path-normalized"
+                    f"duplicate config_file windows_path {cf.windows_path!r}; "
+                    "comparison is case-insensitive, path-normalized, "
+                    "and home-spelling-folded"
                 )
             seen_windows.add(windows_key)
         return self

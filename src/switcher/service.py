@@ -294,8 +294,42 @@ class ProfileService:
                 ) from e
             if not isinstance(src_data, dict):
                 raise StorageError(f"snapshot at {src} is not a JSON object")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            # Write the already-validated bytes via atomic_write_file
+            # instead of re-reading ``src`` through ``shutil.copy2``.
+            # ``copy2`` would reopen the source file AFTER the
+            # symlink/shape/JSON checks above; a concurrent external
+            # rewrite of ``src`` between the validation read and the
+            # copy could let unvalidated bytes through. Reusing
+            # ``src_text`` closes that TOCTOU window (CR pass-PR-3
+            # minor) and routes the write through the same
+            # tmp-then-rename helper every other snapshot write uses.
+            atomic_write_file(dst, src_text.encode("utf-8"))
+
+    def _any_live_dir_dangling(self, tool: Tool) -> bool:
+        """True iff any of ``tool``'s config_dirs live paths is a link
+        that doesn't resolve (dangling symlink / broken Windows
+        junction).
+
+        Used by ``use()``'s capture-loop divergence dispatch to
+        distinguish two failure modes for "live links match neither
+        source nor destination":
+
+          - Dangling: typical post-failed-rename recovery (store.rename
+            moved the target dir, swap_link failed to retarget). No
+            live data behind the dangling link to capture or destroy,
+            so capture-skip is safe and the apply phase below cleans
+            up by re-pointing the links at the destination.
+          - Resolves elsewhere: genuinely ambiguous third-profile or
+            externally-mutated state. Refuse rather than overwrite.
+        """
+        for i in range(len(tool.config_dirs)):
+            live_dir = self._resolver.tool_dir(tool, i)
+            if self._resolver.is_link(live_dir):
+                try:
+                    live_dir.resolve(strict=True)
+                except OSError:
+                    return True
+        return False
 
     def _symlink_matches_active_source(self, tool: Tool, source_profile: str) -> bool:
         """True iff every config_dirs symlink for ``tool`` resolves to
@@ -3244,20 +3278,53 @@ class ProfileService:
             source = active.get(tid)
             if not source:
                 continue
-            # Skip capture when the tool's config_dirs symlinks don't
-            # match the source profile that on-disk active claims for it
-            # (abby r11). The mismatch fingerprints a partial-commit drift
-            # from a prior failed use(): live now holds destination
-            # content, so capturing into the source snapshot would
-            # silently overwrite the source's owned data with destination
-            # data. The plan + commit phases below reconcile live with
-            # the destination snapshot regardless, so skipping capture
-            # is safe — the only thing we lose is "preserve in-flight
-            # edits on the source profile," which is moot when there are
-            # no source-profile edits (the symlink has already moved).
-            if not self._symlink_matches_active_source(tool, source):
+            # Four-way dispatch on where the live config_dirs symlinks
+            # actually point (CR pass-PR-3 major + dangling-symlink
+            # carve-out for failed-rename recovery):
+            #
+            # (1) Links match the active-map source → normal pre-switch
+            #     capture into source's snapshot. Preserves in-flight
+            #     edits the user made while ``source`` was the active
+            #     profile.
+            #
+            # (2) Links match the DESTINATION profile we're switching to.
+            #     This is the stale-active drift case from abby r11 —
+            #     a prior use() flipped symlinks to ``profile_name`` but
+            #     never committed ``set_active_state``. Pre-fix the
+            #     branch silently skipped capture; that drops any
+            #     in-flight edits the user made while ``profile_name``
+            #     was effectively active on disk, because the apply
+            #     phase below would overwrite live with profile_name's
+            #     pre-edit snapshot. Capture into ``profile_name`` so
+            #     the apply is a no-op write of the bytes we just
+            #     captured and the user's edits survive.
+            #
+            # (3) At least one config_dir live path is a DANGLING link
+            #     (resolves to nothing — typical post-failed-rename
+            #     recovery shape where ``store.rename`` moved the dir
+            #     but ``swap_link`` failed to retarget). There's no
+            #     live data behind a dangling link to either capture or
+            #     overwrite, so skip capture and let the apply +
+            #     swap_link below complete the recovery cleanly.
+            #
+            # (4) Links resolve to neither source nor destination AND
+            #     aren't dangling — they point at a third profile or
+            #     an external directory. Genuinely ambiguous drift;
+            #     refuse loudly rather than silently overwrite that
+            #     third profile's data with destination bytes.
+            if self._symlink_matches_active_source(tool, source):
+                self._capture_config_files(source, tool)
                 continue
-            self._capture_config_files(source, tool)
+            if self._symlink_matches_active_source(tool, profile_name):
+                self._capture_config_files(profile_name, tool)
+                continue
+            if self._any_live_dir_dangling(tool):
+                continue
+            raise StorageError(
+                f"live config_dirs for {tid!r} match neither active source "
+                f"{source!r} nor destination {profile_name!r}; refusing to "
+                f"overwrite ConfigFile state blindly. Manual recovery required."
+            )
         # Pre-flight 3: plan every tool's ConfigFile applies. Read-only — no
         # filesystem mutation. Any malformed-JSON / non-object / walker-
         # rejection error raises StorageError here, before swap_link has

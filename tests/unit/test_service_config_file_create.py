@@ -15,10 +15,8 @@ creating the profile.
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -108,22 +106,32 @@ def test_create_rollback_removes_partial_profile_on_seed_failure(
     tmp_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Failure during ConfigFile snapshot seeding must roll back the
+    partial profile dir so retry isn't blocked by ProfileExistsError.
+
+    The seed step uses ``atomic_write_file`` for ConfigFile snapshots
+    (CR pass-PR-3: writes the already-validated bytes through the
+    project's atomic helper instead of re-reading via shutil.copy2).
+    Patch that helper to force the failure at the snapshot-write site.
+    """
     live = tmp_home / ".claude.json"
     live.write_text(json.dumps({"mcpServers": {"a": {}}}))
     service.init(["claude"])
     service.save("profA")
 
-    real_copy2 = shutil.copy2
+    from switcher import service as service_mod
 
-    def failing_copy(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
-        # Fail only when copying the ConfigFile snapshot. Credential copies
-        # for the same profile pass through real_copy2 so we exercise the
-        # rollback specifically at the new _seed_config_files step.
-        if str(src).endswith("claude.json"):
+    real_atomic = service_mod.atomic_write_file
+
+    def failing_atomic(target: Path, content: bytes) -> None:
+        # Fail only when writing the ConfigFile snapshot; credential
+        # copies (which still use shutil.copy2) and any unrelated
+        # atomic writes pass through.
+        if str(target).endswith("claude.json"):
             raise OSError("simulated seed failure")
-        return real_copy2(src, dst, *args, **kwargs)
+        real_atomic(target, content)
 
-    monkeypatch.setattr(shutil, "copy2", failing_copy)
+    monkeypatch.setattr(service_mod, "atomic_write_file", failing_atomic)
     with pytest.raises(OSError, match="simulated seed failure"):
         service.create("profB")
     assert not service._store.profile_dir("profB").exists()

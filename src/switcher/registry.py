@@ -4,8 +4,6 @@ builtins (with a stderr warning)."""
 
 from __future__ import annotations
 
-import ntpath
-import posixpath
 import sys
 import tomllib
 from importlib.resources import files
@@ -13,7 +11,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path
 
 from switcher.errors import StorageError
-from switcher.models import Tool
+from switcher.models import Tool, canonicalize_path_for_uniqueness
 
 
 def _load_toml_resource(resource: Traversable | Path) -> Tool:
@@ -57,20 +55,26 @@ def _validate_config_files_unique_across_tools(tools: tuple[Tool, ...]) -> None:
     ``use()`` that would silently race the two tools in registry order
     — the later writer wins, the earlier tool's data is lost.
 
-    Comparison runs each path through the platform-appropriate
-    ``normpath`` first so ``~/.claude.json`` and
-    ``~/.config/../.claude.json`` (which canonicalize to the same live
-    file via ``PathResolver.expand`` + ``os.path.normpath`` at runtime)
-    are flagged as duplicates here too. Raw-string compare alone would
-    let semantically-identical-but-syntactically-different entries pass
-    and reopen the cross-tool clobber class these validators close
-    (Hermes pass-PR-3 blocker).
+    Comparison routes each path through
+    ``canonicalize_path_for_uniqueness`` (case-insensitive,
+    path-normalized, AND home-spelling-folded). Any of the four
+    runtime-equivalent spellings of a home-relative path —
+    ``~/.claude.json``, ``$HOME/.claude.json``,
+    ``${HOME}/.claude.json``, ``%USERPROFILE%\\.claude.json`` —
+    produces the same key, mirroring how ``PathResolver.expand`` +
+    ``os.path.normpath`` collapses them at runtime. Raw-string
+    compare with normpath-only would still let
+    ``~/.claude.json`` vs ``$HOME/.claude.json`` slip through and
+    re-open the cross-tool clobber class these validators close
+    (Hermes pass-PR-3 + pass-PR-4 blockers).
 
-    Casefold matches the runtime behavior on default Windows (NTFS) and
-    default macOS (APFS) filesystems — case-insensitive-but-preserving.
+    Casefold matches the runtime behavior on default Windows (NTFS)
+    and default macOS (APFS) filesystems —
+    case-insensitive-but-preserving.
 
-    With the v0.1.5 max-one-ConfigFile-per-tool cap, each tool contributes
-    at most one entry to each map; we don't need a same-tool guard.
+    With the v0.1.5 max-one-ConfigFile-per-tool cap, each tool
+    contributes at most one entry to each map; we don't need a
+    same-tool guard.
     """
     seen_slot: dict[tuple[str, str], str] = {}
     seen_posix: dict[str, str] = {}
@@ -86,24 +90,24 @@ def _validate_config_files_unique_across_tools(tools: tuple[Tool, ...]) -> None:
                     f"profile_filename={cf.profile_filename!r})"
                 )
             seen_slot[slot] = t.id
-            posix_key = posixpath.normpath(cf.posix_path).casefold()
+            posix_key = canonicalize_path_for_uniqueness(cf.posix_path, windows=False)
             if posix_key in seen_posix:
                 raise ValueError(
                     f"cross-tool config_file collision: tools "
                     f"{seen_posix[posix_key]!r} and {t.id!r} both claim "
-                    f"posix_path {cf.posix_path!r} (canonicalized to "
-                    f"{posix_key!r}); comparison is case-insensitive and "
-                    f"path-normalized"
+                    f"posix_path {cf.posix_path!r}; comparison is "
+                    f"case-insensitive, path-normalized, and "
+                    f"home-spelling-folded"
                 )
             seen_posix[posix_key] = t.id
-            windows_key = ntpath.normpath(cf.windows_path).casefold()
+            windows_key = canonicalize_path_for_uniqueness(cf.windows_path, windows=True)
             if windows_key in seen_windows:
                 raise ValueError(
                     f"cross-tool config_file collision: tools "
                     f"{seen_windows[windows_key]!r} and {t.id!r} both claim "
-                    f"windows_path {cf.windows_path!r} (canonicalized to "
-                    f"{windows_key!r}); comparison is case-insensitive and "
-                    f"path-normalized"
+                    f"windows_path {cf.windows_path!r}; comparison is "
+                    f"case-insensitive, path-normalized, and "
+                    f"home-spelling-folded"
                 )
             seen_windows[windows_key] = t.id
 

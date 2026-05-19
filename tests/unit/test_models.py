@@ -11,6 +11,7 @@ from switcher.models import (
     DirMapping,
     Profile,
     Tool,
+    canonicalize_path_for_uniqueness,
     validate_credential_path,
     validate_safe_name,
 )
@@ -92,6 +93,66 @@ def test_credential_path_accepts_relative(p: str) -> None:
 def test_credential_path_rejects_unsafe(p: str) -> None:
     with pytest.raises(ValueError):
         validate_credential_path(p)
+
+
+# ---------------- canonicalize_path_for_uniqueness ----------------
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "~/.claude.json",
+        "$HOME/.claude.json",
+        "${HOME}/.claude.json",
+        "~/.config/../.claude.json",
+        "~/foo/../.claude.json",
+    ],
+)
+def test_canonicalize_posix_home_spellings_collide(spelling: str) -> None:
+    """Every spelling that runtime ``PathResolver.expand`` collapses to
+    ``<home>/.claude.json`` must produce the same canonical key.
+    Hermes pass-PR-4: validator-side uniqueness has to mirror runtime
+    home-equivalence or two tools can silently co-manage the same file.
+    """
+    canonical = canonicalize_path_for_uniqueness("~/.claude.json", windows=False)
+    assert canonicalize_path_for_uniqueness(spelling, windows=False) == canonical
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "~\\.claude.json",
+        "%USERPROFILE%\\.claude.json",
+        "%userprofile%\\.claude.json",
+        "%UserProfile%\\.claude.json",
+        "%USERPROFILE%\\foo\\..\\.claude.json",
+    ],
+)
+def test_canonicalize_windows_home_spellings_collide(spelling: str) -> None:
+    """Mirror of the POSIX case for Windows. ``%VAR%`` env-var lookup is
+    case-insensitive at runtime so the regex match is too."""
+    canonical = canonicalize_path_for_uniqueness("~\\.claude.json", windows=True)
+    assert canonicalize_path_for_uniqueness(spelling, windows=True) == canonical
+
+
+def test_canonicalize_distinct_paths_produce_distinct_keys() -> None:
+    """Sanity check: two genuinely different paths under home produce
+    different canonical keys."""
+    a = canonicalize_path_for_uniqueness("~/.foo.json", windows=False)
+    b = canonicalize_path_for_uniqueness("~/.bar.json", windows=False)
+    assert a != b
+
+
+def test_canonicalize_does_not_consult_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Validator-side canonicalization must be deterministic across hosts.
+    Setting ``$HOME`` to something exotic at test time must NOT change
+    the canonical key — the helper substitutes against a sentinel, not
+    the host's actual home."""
+    monkeypatch.setenv("HOME", "/some/strange/home")
+    before = canonicalize_path_for_uniqueness("$HOME/.x.json", windows=False)
+    monkeypatch.setenv("HOME", "/different/home")
+    after = canonicalize_path_for_uniqueness("$HOME/.x.json", windows=False)
+    assert before == after
 
 
 # ---------------- DirMapping ----------------

@@ -289,6 +289,95 @@ def test_build_registry_cross_tool_collision_is_case_insensitive(
         build_registry(rd)
 
 
+def test_build_registry_rejects_home_dollar_spelling_collision(tmp_path: Path) -> None:
+    """Hermes pass-PR-4 blocker: two tools spelling the same home-relative
+    path as ``~/.shared.json`` and ``$HOME/.shared.json`` must be flagged
+    as duplicates. Runtime ``PathResolver.expand`` collapses both to the
+    same live file; the validator has to mirror that or the cross-tool
+    clobber class slips back in through a different spelling.
+    """
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="~/.shared.json",
+        windows="%USERPROFILE%\\\\.a.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="$HOME/.shared.json",  # equivalent spelling of ~/.shared.json
+        windows="%USERPROFILE%\\\\.b.json",
+        filename="b.json",
+    )
+    with pytest.raises(ValueError, match="posix_path"):
+        build_registry(rd)
+
+
+def test_build_registry_rejects_userprofile_tilde_spelling_collision_windows(
+    tmp_path: Path,
+) -> None:
+    """Mirror of the POSIX case for Windows: ``%USERPROFILE%\\.shared.json``
+    and ``~\\.shared.json`` resolve to the same live file at runtime.
+    """
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="~/.a.json",
+        windows="%USERPROFILE%\\\\.shared.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="~/.b.json",
+        windows="~\\\\.shared.json",  # equivalent spelling of %USERPROFILE%\.shared.json
+        filename="b.json",
+    )
+    with pytest.raises(ValueError, match="windows_path"):
+        build_registry(rd)
+
+
+def test_build_registry_rejects_curly_brace_home_spelling_collision(
+    tmp_path: Path,
+) -> None:
+    """``$HOME/.x.json`` and ``${HOME}/.x.json`` are POSIX-equivalent."""
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="$HOME/.shared.json",
+        windows="%USERPROFILE%\\\\.a.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="${HOME}/.shared.json",
+        windows="%USERPROFILE%\\\\.b.json",
+        filename="b.json",
+    )
+    with pytest.raises(ValueError, match="posix_path"):
+        build_registry(rd)
+
+
 def test_build_registry_accepts_disjoint_config_files(tmp_path: Path) -> None:
     """Sanity-check the cross-tool uniqueness validator doesn't false-
     positive on tools whose ConfigFiles touch disjoint paths."""
