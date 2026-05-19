@@ -390,6 +390,59 @@ def test_continue_uses_journaled_owned_paths_not_registry(tmp_home: Path, tmp_st
     assert "oauthAccount" not in extracted
 
 
+def test_continue_short_circuit_requires_config_file_snapshots_complete(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """CR pass-PR-2 major: _check_init_already_completed must verify
+    every ``config_file_mappings`` entry classifies COMPLETE on both
+    the dated-current AND vanilla profiles. Without this, a crash AFTER
+    the active-map write but BEFORE a snapshot landed would let
+    --continue short-circuit, mark_completed, and leave the next
+    ``switcher use vanilla`` (or use of the dated profile) hitting
+    snapshot-missing warn-and-skip — silently defeating the isolation
+    contract.
+
+    Setup: simulate a clean post-init state EXCEPT the vanilla
+    snapshot is missing. Without the new check, the short-circuit
+    would fire and clear the journal. With it, --continue falls
+    through to compensation which re-creates the vanilla snapshot.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"x": {}}}))
+    service.init(["claude"])
+    # Sanity: post-init state should currently short-circuit.
+    active_source = service._store.get_active()["claude"]
+    current_snap = service._store.config_file_snapshot_path(active_source, "claude", "claude.json")
+    vanilla_snap = service._store.config_file_snapshot_path("vanilla", "claude", "claude.json")
+    assert current_snap.exists()
+    assert vanilla_snap.exists()
+
+    # Construct an in-flight init record that would otherwise short-
+    # circuit (all dir mappings COMPLETE, active+cache match), but
+    # remove the vanilla snapshot so the new config_file check fails.
+    vanilla_snap.unlink()
+
+    record = _make_init_record(
+        active_source,
+        target_ids=["claude"],
+        mappings=[_claude_mapping(tmp_home)],
+        config_file_mappings=[_claude_cf_mapping(tmp_home)],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(continue_=True)
+
+    # The compensation path re-created vanilla's snapshot rather than
+    # short-circuiting.
+    assert vanilla_snap.exists(), (
+        "_check_init_already_completed must NOT short-circuit while the "
+        "vanilla ConfigFile snapshot is missing — that would silently "
+        "skip the vanilla recovery step"
+    )
+    # Compensation always writes ``{}`` to vanilla.
+    assert json.loads(vanilla_snap.read_text()) == {}
+
+
 def test_continue_writes_vanilla_snapshot_from_journal_when_registry_drops_config_files(
     tmp_home: Path, tmp_state: Path
 ) -> None:

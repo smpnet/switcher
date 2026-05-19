@@ -297,3 +297,62 @@ def test_abort_unlinks_complete_snapshot_fresh_mode(
     # Live read-only by rescan capture, so abort leaves it alone.
     assert not profile_dir.exists()
     assert live.read_text() == live_before
+
+
+def test_continue_short_circuit_requires_config_file_snapshots_complete(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """CR pass-PR-2 major: ``_check_rescan_already_completed`` must
+    verify every ``config_file_mappings`` entry classifies COMPLETE
+    on the tool's target profile. A crash AFTER ``set_active_state``
+    but BEFORE the snapshot landed would otherwise short-circuit and
+    leave the rescan profile missing its ConfigFile snapshot —
+    silently degrading the next ``use`` into warn-and-skip.
+    """
+    _prepare_init_state(service, tmp_home)
+
+    (tmp_home / ".claude").mkdir()
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"recovered": {}}}))
+
+    profile_name = "rescan-profile"
+    store = FileProfileStore(tmp_state)
+    store.create(
+        profile_name,
+        {"claude": True},
+        journal_id=_TEST_RESCAN_ID,
+    )
+    profile_dir = store.profile_dir(profile_name)
+    _stage_completed_rescan_dir_mapping(tmp_home, profile_dir)
+    # Simulate "active+cache committed BEFORE snapshot landed":
+    # post-init state for everything except the missing snapshot.
+    store.set_active_state(
+        {"claude": profile_name, "copilot": store.get_active()["copilot"]},
+        {
+            "claude": [str(tmp_home / ".claude")],
+            "copilot": store.get_active_live_paths_raw()["copilot"],
+        },
+    )
+
+    record = _make_rescan_record(
+        target_profile=profile_name,
+        into_mode=False,
+        previous_tools=None,
+        mappings=[_claude_dir_mapping(tmp_home)],
+        config_file_mappings=[_claude_cf_mapping(tmp_home)],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    # Without the new check, this would short-circuit and skip the
+    # snapshot write. With the check, --continue falls through to
+    # compensation which re-extracts the snapshot from the journaled
+    # live_path.
+    service.rescan(continue_=True)
+
+    snap = store.config_file_snapshot_path(profile_name, "claude", "claude.json")
+    assert snap.exists(), (
+        "_check_rescan_already_completed must NOT short-circuit while the "
+        "ConfigFile snapshot is missing — that would leave the rescan "
+        "profile half-built"
+    )
+    assert json.loads(snap.read_text()) == {"mcpServers": {"recovered": {}}}

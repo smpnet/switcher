@@ -16,16 +16,20 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from switcher.errors import StorageError
 from switcher.models import ConfigFile, Tool
 from switcher.paths import PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
+
+IS_WINDOWS = sys.platform == "win32"
 
 CLAUDE_CONFIG_FILE = ConfigFile(
     posix_path="~/.claude.json",
@@ -121,5 +125,66 @@ def test_create_rollback_removes_partial_profile_on_seed_failure(
 
     monkeypatch.setattr(shutil, "copy2", failing_copy)
     with pytest.raises(OSError, match="simulated seed failure"):
+        service.create("profB")
+    assert not service._store.profile_dir("profB").exists()
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_create_rejects_symlink_at_source_snapshot(service: ProfileService, tmp_home: Path) -> None:
+    """A symlink at the source snapshot path is corruption — snapshot
+    writes use atomic rename, never link creation. _seed_config_files
+    must refuse rather than copy through or treat a broken symlink as
+    "missing", which would propagate corruption into the new profile
+    and surface only as warn-and-skip on the next `use` (Hermes
+    pass-PR-2).
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"a": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    # create() seeds from the active source — switch to profA so that
+    # profA becomes the seed source and the corrupt snapshot is the one
+    # the seed step will try to copy.
+    service.use("profA")
+
+    # Replace profA's snapshot with a (non-broken) symlink so _seed_config_files
+    # would otherwise copy through it. Pre-fix, the path was followed silently.
+    src_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    src_content = src_snap.read_text()
+    src_snap.unlink()
+    real_target = tmp_home / "real-target.json"
+    real_target.write_text(src_content)
+    src_snap.symlink_to(real_target)
+
+    with pytest.raises(StorageError, match="symlink"):
+        service.create("profB")
+    # No partial profile left behind: create()'s rollback rmtrees on failure.
+    assert not service._store.profile_dir("profB").exists()
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_create_rejects_broken_symlink_at_source_snapshot(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """Pre-fix: Path.exists() returned False for a broken symlink, so
+    _seed_config_files silently skipped (treating it as "missing source").
+    That turned a corrupt source profile into a child profile with no
+    snapshot, and the next `use` warn-and-skipped instead of surfacing
+    the corruption (Hermes pass-PR-2 specific repro)."""
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"a": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    # create() seeds from the active source — switch to profA so the
+    # corrupt snapshot is the seed source.
+    service.use("profA")
+
+    src_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    src_snap.unlink()
+    src_snap.symlink_to(tmp_home / ".does-not-exist.json")
+    assert src_snap.is_symlink()
+    assert not src_snap.exists()
+
+    with pytest.raises(StorageError, match="symlink"):
         service.create("profB")
     assert not service._store.profile_dir("profB").exists()

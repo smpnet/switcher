@@ -241,6 +241,16 @@ class ProfileService:
         ``switcher rescan --only <tool>`` (spec §3.6 migration path).
         Without this skip, every create() from a legacy profile would
         block on ``FileNotFoundError`` from ``shutil.copy2``.
+
+        Source-snapshot shape validation matches the apply / classifier
+        side: any link shape at the source snapshot path is corruption
+        (the snapshot writer always uses atomic rename, never link
+        creation), and a non-regular file is the same. Refuse loudly
+        rather than copy through a link or silently treat a dangling
+        symlink as "missing" — the latter would propagate corruption
+        into the new profile and surface only as warn-and-skip at the
+        next ``use``, defeating the corruption boundary the apply path
+        already enforces (Hermes pass-PR-2).
         """
         for cf in tool.config_files:
             src = self._store.config_file_snapshot_path(
@@ -249,8 +259,22 @@ class ProfileService:
             dst = self._store.config_file_snapshot_path(
                 dst_profile, cf.profile_subdir, cf.profile_filename
             )
+            if src.is_symlink():
+                raise StorageError(
+                    f"refusing to seed ConfigFile snapshot through symlink at "
+                    f"{src}; resolve the symlink (or remove it so the underlying "
+                    f"path is readable) and re-run."
+                )
             if not src.exists():
                 continue
+            if not src.is_file():
+                # Directory / FIFO / device at the snapshot path. Switcher
+                # owns this subtree, so the case shouldn't arise from
+                # normal use; external tampering or a partial init/rescan
+                # could create it. Same rejection rule as
+                # ``_plan_config_file_applies`` on the apply side.
+                kind = "directory" if src.is_dir() else "non-regular file"
+                raise StorageError(f"expected regular file at snapshot {src}, got {kind}")
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 
@@ -1634,6 +1658,25 @@ class ProfileService:
         for intent in record.mappings:
             if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
                 return False
+        # ConfigFile snapshots must also be COMPLETE for the dated-current
+        # AND vanilla profiles. Without both checks, a crash AFTER the
+        # active-map write but BEFORE one of the snapshot writes would
+        # leave the short-circuit firing — the journal would mark
+        # completed and the vanilla / current snapshot would remain
+        # missing (or AMBIGUOUS), defeating the isolation contract on
+        # the next ``switcher use`` (CR pass-PR-2 major).
+        for cf_entry in record.config_file_mappings:
+            if (
+                classify_config_file_mapping(cf_entry, profile_dir)
+                is not ConfigFileDiskState.COMPLETE
+            ):
+                return False
+            vanilla_dir = self._store.profile_dir("vanilla")
+            if (
+                classify_config_file_mapping(cf_entry, vanilla_dir)
+                is not ConfigFileDiskState.COMPLETE
+            ):
+                return False
         # Active invariant: dict equality, not subset. A clean init's
         # `set_active_state(active, ...)` REPLACES the active map with
         # `{tid: profile_name for tid in target_ids}` — no leftover
@@ -2527,6 +2570,21 @@ class ProfileService:
                 # compensation surfaces a clean refusal.
                 return False
             if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
+                return False
+        # Per-ConfigFile snapshots must classify COMPLETE on the tool's
+        # target profile. Mirrors the init-side check: a crash AFTER
+        # set_active_state but BEFORE a snapshot landed would otherwise
+        # short-circuit, mark_completed, and leave a future ``switcher
+        # use`` on the rescan profile hitting snapshot-missing
+        # warn-and-skip (CR pass-PR-2 major).
+        for cf_entry in record.config_file_mappings:
+            cf_profile_dir = profile_dir_by_tool.get(cf_entry.tool_id)
+            if cf_profile_dir is None:
+                return False
+            if (
+                classify_config_file_mapping(cf_entry, cf_profile_dir)
+                is not ConfigFileDiskState.COMPLETE
+            ):
                 return False
         active = self._store.get_active()
         for tid, profile_name in record.target_profiles.items():
@@ -4614,6 +4672,26 @@ class ProfileService:
                     f"profile {target!r} metadata.json revert failed "
                     f"(still lists tool {tool.id!r}): {meta_err}"
                 )
+
+        # Unlink any ConfigFile snapshots written into the --into target
+        # for this tool. The inner snapshot cleanup in
+        # ``_capture_tool_for_rescan`` only fires when
+        # ``_capture_config_files`` itself raises; if that succeeds and
+        # the LATER ``update_profile_tools`` (or ``set_active_state`` in
+        # the outer rescan loop) fails, the snapshot survives. For
+        # --into mode, target_dir is NOT rmtree'd by this rollback —
+        # the snapshot would leak under
+        # ``<target>/.switcher/config_files/...`` and trip the
+        # ``rescan --into`` collision pre-flight on the next retry
+        # (Hermes pass-PR-2). Cleanup is link-aware so a corrupt
+        # snapshot-path shape also gets removed.
+        for cf in tool.config_files:
+            snap_path = self._store.config_file_snapshot_path(
+                target, cf.profile_subdir, cf.profile_filename
+            )
+            if snap_path.is_symlink() or snap_path.exists():
+                with contextlib.suppress(Exception):
+                    snap_path.unlink(missing_ok=True)
         for i, dm in enumerate(tool.config_dirs):
             live = self._resolver.tool_dir(tool, i)
             if self._resolver.is_link(live):

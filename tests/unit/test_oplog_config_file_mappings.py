@@ -316,3 +316,32 @@ def test_cf_mapping_preserves_owned_json_paths_across_roundtrip() -> None:
         ".projects[].mcpServers",
         ".oauthAccount",
     )
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "mcpServers",  # missing leading '.'
+        ".projects[]",  # leaf '[]' rejected by v1 grammar
+        ".",  # empty after the dot
+        "[]",  # bare iter token without leading '.'
+    ],
+)
+def test_cf_mapping_rejects_invalid_owned_json_paths_at_parse_time(bad_path: str) -> None:
+    """CR pass-PR-2 major: ``owned_json_paths`` must parse against the
+    owned-path grammar at journal-parse time. Without parse-time
+    validation a hand-edited journal carrying out-of-grammar tokens
+    would only fail later at compensation time, defeating the
+    fail-fast corruption boundary the rest of this module is designed
+    around.
+    """
+    with pytest.raises(ValidationError, match="owned_json_paths"):
+        _ConfigFileMappingIntent.model_validate(
+            {
+                "tool_id": "claude",
+                "profile_subdir": "claude",
+                "profile_filename": "claude.json",
+                "live_path": _abs("/Users/test/.claude.json", "C:\\Users\\test\\.claude.json"),
+                "owned_json_paths": (bad_path,),
+            }
+        )

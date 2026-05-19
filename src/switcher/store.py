@@ -176,8 +176,20 @@ class FileProfileStore:
         # (metadata rewritten, dir move failed). Reconcile here so list() and
         # other observers see a consistent view: caller-visible name matches
         # the on-disk path. The cached name is repaired on the next rewrite.
+        #
+        # ``journal_id`` MUST be carried across this rebuild — fresh-mode
+        # rescan compensation proves ownership via
+        # ``profile.journal_id == record.rescan_id`` (service.py recovery
+        # paths). Dropping the field during drift-repair would let a
+        # post-rename ``get()`` silently return ``journal_id=None`` and
+        # cause recovery to misclassify a legitimate profile as foreign.
         if profile.name != name:
-            profile = Profile(name=name, created_at=profile.created_at, tools=profile.tools)
+            profile = Profile(
+                name=name,
+                created_at=profile.created_at,
+                tools=profile.tools,
+                journal_id=profile.journal_id,
+            )
         return profile
 
     def list(self) -> list[Profile]:
@@ -209,7 +221,15 @@ class FileProfileStore:
         # re-running rename(old, new) is idempotent. Reverse order leaves the
         # caller stuck (dir at new with stale metadata, old_dir gone).
         existing = self.get(old)
-        renamed = Profile(name=new, created_at=existing.created_at, tools=existing.tools)
+        # journal_id MUST be carried so fresh-mode rescan ownership
+        # proofs survive a rename of the reserved profile name. Same
+        # rationale as the drift-repair branch in ``get`` above.
+        renamed = Profile(
+            name=new,
+            created_at=existing.created_at,
+            tools=existing.tools,
+            journal_id=existing.journal_id,
+        )
         self._atomic_write(
             self._metadata_path(old),
             renamed.model_dump_json(by_alias=True),
@@ -417,6 +437,13 @@ class FileProfileStore:
             name=name,
             created_at=existing.created_at,
             tools=dict(tools),
+            # journal_id is load-bearing for fresh-mode rescan
+            # ownership — same rationale as the rename / drift-repair
+            # branches above. update_profile_tools is invoked by rescan
+            # --into's deferred metadata write; dropping the marker
+            # here would make a subsequent recovery falsely classify
+            # the profile as foreign.
+            journal_id=existing.journal_id,
         )
         typed = json.loads(new_prof.model_dump_json(by_alias=True))
         # Drop both alias variants so a manually-edited file with the

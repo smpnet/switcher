@@ -215,3 +215,52 @@ def test_rescan_rollback_removes_partial_snapshot(
     assert not snapshot_anywhere, (
         "rollback failed to remove the ConfigFile snapshot from the partial rescan profile"
     )
+
+
+def test_rescan_into_rollback_unlinks_orphan_snapshot(
+    service: ProfileService,
+    tmp_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermes pass-PR-2: in --into mode, if ``_capture_config_files``
+    succeeds but the LATER ``set_active_state`` step fails, the snapshot
+    was written into the --into target but the rollback only handles
+    dirs + metadata. Without explicit snapshot cleanup the orphan
+    survives under ``<target>/.switcher/config_files/...`` and trips the
+    snapshot-collision pre-flight on the next retry.
+    """
+    _freeze_now(monkeypatch)
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"original": {}}}))
+    service.init(["claude"])
+    service.save("target_profile")
+    # Drop claude so rescan re-discovers it; restore the live dir.
+    service.unmanage("claude")
+    # Wipe target_profile's claude dir + snapshot so the --into pre-flight
+    # collision check passes (the test exercises the rollback path, not
+    # the collision check).
+    target_dir = service._store.profile_dir("target_profile")
+    shutil.rmtree(target_dir / "claude")
+    snap_pre = service._store.config_file_snapshot_path("target_profile", "claude", "claude.json")
+    snap_pre.unlink()
+
+    # Force set_active_state to fail AFTER the capture (snapshot has been
+    # written into target_profile by then).
+    from switcher import store as store_mod
+
+    def boom(self: FileProfileStore, *args: object, **kwargs: object) -> None:
+        raise OSError("simulated post-snapshot failure")
+
+    monkeypatch.setattr(store_mod.FileProfileStore, "set_active_state", boom)
+
+    with pytest.raises(RescanCaptureError):
+        service.rescan(into="target_profile", only=["claude"])
+
+    # The orphan snapshot must have been cleaned. Otherwise the next
+    # `rescan --into target_profile` would refuse on the snapshot-
+    # collision pre-flight.
+    snap_post = service._store.config_file_snapshot_path("target_profile", "claude", "claude.json")
+    assert not snap_post.exists(), (
+        "rescan --into rollback failed to unlink the orphan ConfigFile "
+        "snapshot under the target profile"
+    )

@@ -451,6 +451,52 @@ def test_update_profile_tools_wraps_read_oserror_as_storage_error(
         store.update_profile_tools("work", {"claude": True, "copilot": True})
 
 
+def test_get_preserves_journal_id_through_name_drift_repair(
+    store: FileProfileStore,
+) -> None:
+    """Fresh-mode rescan compensation proves ownership via
+    ``profile.journal_id == record.rescan_id``. ``get()``'s drift-repair
+    branch (rebuilds Profile when metadata.name != dir name) must carry
+    journal_id across the rebuild — dropping it would let a recovery
+    pass falsely classify a legitimate profile as foreign (Hermes +
+    CR pass-PR-2 critical)."""
+    store.create("work", {"claude": True}, journal_id="jid-abc-123")
+    # Manually drift metadata.name (simulates a partial-failure rename:
+    # metadata rewritten but dir move never landed).
+    meta_path = store.profile_dir("work") / "metadata.json"
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw["name"] = "drifted-name"
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    p = store.get("work")
+    assert p.name == "work"  # reconciled to directory name
+    assert p.journal_id == "jid-abc-123"  # preserved through rebuild
+
+
+def test_rename_preserves_journal_id(store: FileProfileStore) -> None:
+    """Renaming a reserved profile name must NOT clear ``journal_id`` —
+    the fresh-mode rescan ownership marker has to survive the rewrite,
+    or recovery on the renamed profile would misclassify it as
+    foreign (Hermes + CR pass-PR-2 critical)."""
+    store.create("work", {"claude": True}, journal_id="jid-abc-123")
+    store.rename("work", "work2")
+    p = store.get("work2")
+    assert p.journal_id == "jid-abc-123"
+
+
+def test_update_profile_tools_preserves_journal_id(store: FileProfileStore) -> None:
+    """``rescan --into``'s deferred metadata update routes through
+    ``update_profile_tools``; the new tools dict must overlay onto the
+    existing journal_id, not blank it. Otherwise the very flow that
+    set the marker would silently clear it on its own next mutation
+    (Hermes + CR pass-PR-2 critical)."""
+    store.create("work", {"claude": True}, journal_id="jid-abc-123")
+    store.update_profile_tools("work", {"claude": True, "copilot": True})
+    p = store.get("work")
+    assert p.tools == {"claude": True, "copilot": True}
+    assert p.journal_id == "jid-abc-123"
+
+
 def test_update_profile_tools_preserves_unknown_metadata_keys(store: FileProfileStore) -> None:
     """Symmetric with config.json's unknown-key preservation: a forward-compat
     metadata field written by a newer version must survive a v0.1.3

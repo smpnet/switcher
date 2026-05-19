@@ -14,6 +14,7 @@ not the stdlib logging module.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,8 @@ from switcher.paths import PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
+
+IS_WINDOWS = sys.platform == "win32"
 
 CLAUDE_CONFIG_FILE = ConfigFile(
     posix_path="~/.claude.json",
@@ -147,6 +150,7 @@ def test_use_warns_and_skips_when_snapshot_missing(
     assert "rescan" not in err.lower()
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
 def test_use_rejects_broken_symlink_at_snapshot_path(
     service: ProfileService,
     tmp_home: Path,
@@ -337,6 +341,7 @@ def test_use_captures_live_when_switching_to_already_active_profile(
     assert snap_data["mcpServers"] == {"A": {}, "user-added": {"command": "z"}}
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
 def test_use_skips_capture_when_symlink_diverged_from_active(
     service: ProfileService, tmp_home: Path
 ) -> None:
@@ -485,6 +490,7 @@ def test_use_raises_storage_error_when_snapshot_has_non_object_at_iter(
     assert claude_dir.resolve() == before
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
 def test_use_capture_does_not_clobber_source_snapshot_on_broken_symlink(
     service: ProfileService, tmp_home: Path
 ) -> None:
@@ -518,6 +524,7 @@ def test_use_capture_does_not_clobber_source_snapshot_on_broken_symlink(
     assert json.loads(snap_path.read_text()) == snapshot_before
 
 
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
 def test_use_rejects_symlink_at_live_path(service: ProfileService, tmp_home: Path) -> None:
     """A symlink at the ConfigFile live path is fatal during pre-flight.
 

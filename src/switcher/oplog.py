@@ -42,6 +42,7 @@ from pydantic import (
 )
 
 from switcher.errors import OpLogCorruptError, StorageError
+from switcher.json_paths import InvalidOwnedPathError, parse_owned_path
 from switcher.models import validate_absolute_path, validate_safe_name
 
 # StrictStr blocks str/int/bool coercion; Field(min_length=1) rejects
@@ -96,6 +97,29 @@ SafeName = Annotated[NonEmptyStr, AfterValidator(validate_safe_name)]
 # `validate_credential_path` (which enforces the opposite invariant
 # for credential-file entries).
 AbsolutePath = Annotated[NonEmptyStr, AfterValidator(validate_absolute_path)]
+
+
+def _validate_owned_json_paths(paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Reject any entry that doesn't parse against the owned-path grammar.
+
+    Same fail-fast discipline as the surrounding ``Annotated`` types: a
+    hand-edited journal carrying garbage like ``"mcpServers"`` (missing
+    the leading ``.``) or ``".projects[]"`` (leaf ``[]`` is not v1
+    grammar) would otherwise satisfy ``tuple[str, ...]`` and only fail
+    later at compensation time, deep inside the walker. Surface the
+    corruption at the journal-parse boundary instead, where it routes
+    through the existing ``OpLogCorruptError`` mapping the IO layer
+    already does for ValidationError (CR pass-PR-2 major).
+    """
+    for path in paths:
+        try:
+            parse_owned_path(path)
+        except InvalidOwnedPathError as e:
+            raise ValueError(f"invalid owned_json_paths entry {path!r}: {e}") from e
+    return paths
+
+
+OwnedJsonPaths = Annotated[tuple[NonEmptyStr, ...], AfterValidator(_validate_owned_json_paths)]
 
 
 class _MappingIntent(BaseModel):
@@ -204,7 +228,7 @@ class _ConfigFileMappingIntent(BaseModel):
     # Tuple — frozen alongside the BaseModel's ``frozen=True`` config.
     # Strings stay un-aliased; the walker's parse step is the boundary
     # that validates each path expression.
-    owned_json_paths: tuple[str, ...]
+    owned_json_paths: OwnedJsonPaths
 
 
 def _check_config_file_mappings_against_target_ids(
