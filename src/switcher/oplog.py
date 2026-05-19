@@ -24,6 +24,7 @@ import uuid
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
+from collections.abc import Callable
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
@@ -210,6 +211,7 @@ def _check_config_file_mappings_against_target_ids(
     op_name: str,
     target_ids: list[str],
     mappings: list[_ConfigFileMappingIntent],
+    target_profile_for_tool: Callable[[str], str],
 ) -> None:
     """Shared cross-field validator for config_file_mappings.
 
@@ -220,11 +222,22 @@ def _check_config_file_mappings_against_target_ids(
        journal entry; recovery would not know whether to treat it as
        part of this op or as drift.
 
-    2. ``(tool_id, profile_subdir, profile_filename)`` is unique across
-       mappings. The triple identifies a single ConfigFile snapshot
-       within the targeted profile; duplicates in the journal would
-       let recovery double-extract and silently clobber the first
-       write with the second on a different live read.
+    2. The STORAGE-PATH identity
+       ``(target_profile, profile_subdir, profile_filename)`` is
+       unique across mappings. The triple identifies exactly the
+       on-disk snapshot file (spec §3.3 layout:
+       ``<profile_dir>/.switcher/config_files/<subdir>/<filename>``)
+       — duplicate storage paths in the journal let recovery double-
+       extract and silently clobber one tool's snapshot with another's
+       on a different live read (abby r-batch4 blocker). The
+       ``tool_id`` field is NOT part of the uniqueness key because
+       two different tool_ids pointing at the same storage path is
+       precisely the corruption shape this guard exists to refuse.
+
+       ``target_profile`` is resolved per tool via the caller-supplied
+       ``target_profile_for_tool`` function so the same validator
+       handles both init (single profile across all targets) and
+       rescan (potentially different profile per tool in fresh-mode).
 
     NOT enforced: that every tool in ``target_ids`` has at least one
     entry. Tools without config_files legitimately contribute zero
@@ -239,10 +252,13 @@ def _check_config_file_mappings_against_target_ids(
                 f"{op_name}: config_file_mappings entry references "
                 f"tool_id={m.tool_id!r} not in target_ids={sorted(target_set)!r}"
             )
-        key = (m.tool_id, m.profile_subdir, m.profile_filename)
+        storage_profile = target_profile_for_tool(m.tool_id)
+        key = (storage_profile, m.profile_subdir, m.profile_filename)
         if key in seen:
             raise ValueError(
-                f"{op_name}: duplicate config_file_mappings entry for {key!r}"
+                f"{op_name}: duplicate config_file_mappings storage path "
+                f"{key!r} (two entries would write to the same snapshot file "
+                f"under profile {storage_profile!r})"
             )
         seen.add(key)
 
@@ -387,8 +403,15 @@ class _InitOp(_BaseOp):
 
     @model_validator(mode="after")
     def _check_config_file_mappings_consistency(self) -> Self:
+        # All init mappings land in the same profile_name; the resolver
+        # is a constant function. Captured-by-default at class scope so
+        # Python's late-binding doesn't make ``self`` lookups surprising.
+        profile_name = self.profile_name
         _check_config_file_mappings_against_target_ids(
-            "_InitOp", self.target_ids, self.config_file_mappings
+            "_InitOp",
+            self.target_ids,
+            self.config_file_mappings,
+            lambda _tool_id: profile_name,
         )
         return self
 
@@ -506,8 +529,18 @@ class _RescanOp(_BaseOp):
 
     @model_validator(mode="after")
     def _check_config_file_mappings_consistency(self) -> Self:
+        # In rescan, target_profile depends on tool_id (fresh-mode can
+        # have different per-tool profiles; --into has a single one).
+        # The resolver consults ``target_profiles`` so the uniqueness
+        # check measures the actual storage path, not a per-tool key
+        # that wouldn't catch two tools writing the same snapshot file
+        # under a shared profile (abby r-batch4).
+        target_profiles = self.target_profiles
         _check_config_file_mappings_against_target_ids(
-            "_RescanOp", self.target_ids, self.config_file_mappings
+            "_RescanOp",
+            self.target_ids,
+            self.config_file_mappings,
+            lambda tool_id: target_profiles[tool_id],
         )
         return self
 

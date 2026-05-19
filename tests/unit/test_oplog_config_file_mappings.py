@@ -101,8 +101,35 @@ def test_init_op_rejects_duplicate_cf_tuple() -> None:
         _init_op(
             config_file_mappings=[
                 _cf_mapping(),
-                _cf_mapping(),  # duplicate (tool_id, subdir, filename)
+                _cf_mapping(),  # duplicate storage path
             ]
+        )
+
+
+def test_init_op_rejects_two_tools_writing_same_snapshot_path() -> None:
+    """Two different tool_ids that would write to the same storage
+    path under the init profile must be refused. ``tool_id`` is
+    intentionally not part of the uniqueness key because two distinct
+    tool_ids targeting the same snapshot file is precisely the
+    corruption shape the validator exists to catch (abby r-batch4).
+    """
+    with pytest.raises(ValidationError, match="duplicate.*storage path"):
+        _init_op(
+            target_ids=["claude", "other"],
+            mappings=[
+                _claude_dir_mapping(),
+                _MappingIntent(
+                    tool_id="other",
+                    mapping_index=0,
+                    live_path="/Users/test/.other",
+                    profile_subdir="other",
+                    original_kind="real-dir",
+                ),
+            ],
+            config_file_mappings=[
+                _cf_mapping(tool_id="claude"),
+                _cf_mapping(tool_id="other"),  # same (subdir, filename) under same init profile
+            ],
         )
 
 
@@ -128,6 +155,82 @@ def test_rescan_op_rejects_duplicate_cf_tuple() -> None:
                 _cf_mapping(),
                 _cf_mapping(),
             ]
+        )
+
+
+def test_rescan_op_allows_same_subdir_when_target_profiles_differ() -> None:
+    """Fresh-mode rescan with two tools landing in DIFFERENT target
+    profiles must accept identical (profile_subdir, profile_filename)
+    pairs — the storage paths differ because each tool's target
+    profile differs. abby r-batch4: uniqueness must be measured on
+    the actual storage path, not the (subdir, filename) tuple alone.
+
+    The check uses ``target_profile_for_tool`` so this case
+    legitimately resolves to two distinct storage paths.
+    """
+    op = _RescanOp.model_validate(
+        {
+            "op": "rescan",
+            "started_at": _now(),
+            "target_ids": ["claude", "other"],
+            "target_profiles": {
+                "claude": "claude-rescan",
+                "other": "other-rescan",
+            },
+            "into_mode": False,
+            "previous_tools": None,
+            "mappings": [
+                _claude_dir_mapping(),
+                _MappingIntent(
+                    tool_id="other",
+                    mapping_index=0,
+                    live_path="/Users/test/.other",
+                    profile_subdir="other-dir",
+                    original_kind="real-dir",
+                ),
+            ],
+            "config_file_mappings": [
+                _cf_mapping(tool_id="claude"),
+                # Same (subdir, filename) but lands in a different
+                # target profile — DIFFERENT storage path.
+                _cf_mapping(tool_id="other"),
+            ],
+        }
+    )
+    assert len(op.config_file_mappings) == 2
+
+
+def test_rescan_op_rejects_two_tools_writing_same_snapshot_under_into_target() -> None:
+    """--into rescan with two tools both pointing at the same
+    (subdir, filename) under the SAME --into target = collision.
+    """
+    with pytest.raises(ValidationError, match="duplicate.*storage path"):
+        _RescanOp.model_validate(
+            {
+                "op": "rescan",
+                "started_at": _now(),
+                "target_ids": ["claude", "other"],
+                "target_profiles": {
+                    "claude": "shared-into",
+                    "other": "shared-into",
+                },
+                "into_mode": True,
+                "previous_tools": {"shared-into": {"existing": True}},
+                "mappings": [
+                    _claude_dir_mapping(),
+                    _MappingIntent(
+                        tool_id="other",
+                        mapping_index=0,
+                        live_path="/Users/test/.other",
+                        profile_subdir="other-dir",
+                        original_kind="real-dir",
+                    ),
+                ],
+                "config_file_mappings": [
+                    _cf_mapping(tool_id="claude"),
+                    _cf_mapping(tool_id="other"),
+                ],
+            }
         )
 
 

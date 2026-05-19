@@ -94,7 +94,15 @@ def test_mcp_isolation_across_profile_switch(
     )
     s.save("profA")
 
-    # Switch to profB — the MCP must NOT bleed across.
+    # Switch to profB — the MCP must NOT bleed across. profB's
+    # snapshot has an EXPLICIT ``mcpServers: {}`` (the user wrote
+    # that shape into live before saving profB), so the walker
+    # writes that exact value back onto live. ``mcpServers`` is
+    # therefore present-but-empty after the switch, not absent —
+    # different from the vanilla test where the snapshot has no
+    # mcpServers key at all and delete-on-absence removes it.
+    # The invariant under test is "the MCP I installed in profA
+    # is not visible", not "mcpServers is absent."
     s.use("profB")
     live_after_switch = json.loads(live.read_text())
     assert "installed-under-A" not in live_after_switch.get("mcpServers", {})
@@ -281,6 +289,11 @@ def test_use_vanilla_clears_owned_subtrees(
     # subtrees collapse to the vanilla snapshot ({}).
     s.use("vanilla")
     out = json.loads(live.read_text())
-    assert "mcpServers" not in out or out["mcpServers"] == {}
+    # Strict "key absent" form: the walker's delete-on-absence
+    # semantics (json_paths.apply_owned_paths) removes owned keys
+    # whose snapshot value is missing. An empty {} would mean the
+    # walker stopped at the parent and set a literal empty dict —
+    # not the contract.
+    assert "mcpServers" not in out
     assert "oauthAccount" not in out
     assert out.get("hasCompletedOnboarding") is True
