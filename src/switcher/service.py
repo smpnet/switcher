@@ -445,6 +445,21 @@ class ProfileService:
                 f"{tool_id!r}, but the current registry has no such mapping. "
                 f"Manual recovery required."
             )
+        # v0.1.5: the Tool validator caps ``config_files`` at 1, so the
+        # match must be unique. A future cap lift (or a hand-edited
+        # registry that bypassed the validator) could let duplicates
+        # slip past — silently extracting against the first match
+        # would leave the "tuple anchor" ambiguous, and the journal's
+        # storage-path uniqueness contract would not be enforceable
+        # at the registry side. Defense in depth: refuse on any
+        # ambiguity rather than guess (abby r-batch4 round 4).
+        if len(matching) > 1:
+            raise OpLogCorruptError(
+                f"interrupted op continue: registry has {len(matching)} "
+                f"ConfigFile entries for tool {tool_id!r} matching "
+                f"({profile_subdir!r}, {profile_filename!r}); the tuple "
+                f"anchor must be unique. Manual recovery required."
+            )
 
         if live_path.is_symlink():
             raise StorageError(
