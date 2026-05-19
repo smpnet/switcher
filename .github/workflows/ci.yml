@@ -112,9 +112,15 @@ jobs:
         # meaningful base diff to compare against.
         if: github.event_name == 'pull_request'
         shell: bash
+        # Pass base_ref via env rather than expanding ${{ }} inside the
+        # shell command, so the branch name (PR-controlled) can't influence
+        # shell parsing. GitHub branch names are already character-restricted,
+        # but env-passing is the standard hardening for this pattern.
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
           pixi run -- diff-cover coverage.xml \
-            --compare-branch=origin/${{ github.base_ref }} \
+            --compare-branch="origin/${BASE_REF}" \
             --exclude '*cli.py' \
             --fail-under=90
 

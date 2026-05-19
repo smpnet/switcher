@@ -15,10 +15,14 @@ pytest = ">=8"
 pytest-cov = "*"
 freezegun = "*"
 build = "*"
-# Used only by the CI `coverage` job to gate PR diffs against coverage.xml;
-# local devs don't run it. Kept in the single env (no `ci` env split) to
-# match this project's flat env convention.
-diff-cover = "*"
+# Invoked by the CI `coverage` job to gate PR diffs against coverage.xml.
+# Lives in the single shared env (matching this project's flat-env
+# convention), so local devs also resolve it; running it locally is
+# optional but supported. `>=10.0` floor: v10 changed CLI flags
+# (--format replacing --html-report/--json-report/--markdown-report,
+# include/exclude normalization), and the CI invocation relies on v10
+# semantics -- a fresh-install resolve to v9 would silently break.
+diff-cover = ">=10.0"
 
 [tasks]
 test = "pytest tests/unit"
