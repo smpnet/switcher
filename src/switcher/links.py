@@ -26,6 +26,7 @@ hosted Windows runner.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -367,19 +368,19 @@ def atomic_write_file(target: Path, content: bytes) -> None:
             with os.fdopen(fd, "wb") as f:
                 f.write(content)
         except Exception:
-            try:
+            # Best-effort close — fdopen may or may not have taken
+            # ownership of fd before raising. Closing-after-close
+            # raises EBADF on some platforms; suppress so the original
+            # write failure surfaces.
+            with contextlib.suppress(OSError):
                 os.close(fd)
-            except OSError:
-                pass
             raise
         if prior_mode is not None:
-            try:
-                os.chmod(tmppath, prior_mode)
-            except OSError:
-                # Best-effort; the rename still proceeds with mkstemp's
-                # default mode. Filesystems that reject chmod (e.g. some
-                # Windows shares) shouldn't block the write.
-                pass
+            # Best-effort; the rename still proceeds with mkstemp's
+            # default mode. Filesystems that reject chmod (e.g. some
+            # Windows shares) shouldn't block the write.
+            with contextlib.suppress(OSError):
+                tmppath.chmod(prior_mode)
         tmppath.replace(target)
     except Exception:
         tmppath.unlink(missing_ok=True)

@@ -57,9 +57,7 @@ def registry() -> tuple[Tool, ...]:
 
 
 @pytest.fixture
-def service(
-    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
-) -> ProfileService:
+def service(tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]) -> ProfileService:
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
     return ProfileService(store, resolver, registry)
@@ -111,9 +109,7 @@ def test_rescan_fresh_captures_config_file_into_new_profile(
 
     active = service._store.get_active()
     profile_name = active["claude"]
-    snap = service._store.config_file_snapshot_path(
-        profile_name, "claude", "claude.json"
-    )
+    snap = service._store.config_file_snapshot_path(profile_name, "claude", "claude.json")
     assert snap.exists()
     assert json.loads(snap.read_text()) == {"mcpServers": {"x": {"command": "y"}}}
 
@@ -146,9 +142,7 @@ def test_rescan_into_refuses_when_snapshot_already_exists(
     # first. The snapshot under .switcher/config_files/... is unaffected.
     target_dir = service._store.profile_dir("target_profile")
     shutil.rmtree(target_dir / "claude")
-    snap = service._store.config_file_snapshot_path(
-        "target_profile", "claude", "claude.json"
-    )
+    snap = service._store.config_file_snapshot_path("target_profile", "claude", "claude.json")
     assert snap.exists(), "test precondition: snapshot must still be present"
 
     with pytest.raises(RescanCaptureError, match="snapshot"):
@@ -219,6 +213,5 @@ def test_rescan_rollback_removes_partial_snapshot(
         if p.is_dir()
     )
     assert not snapshot_anywhere, (
-        "rollback failed to remove the ConfigFile snapshot from the partial "
-        "rescan profile"
+        "rollback failed to remove the ConfigFile snapshot from the partial rescan profile"
     )

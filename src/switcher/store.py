@@ -67,6 +67,13 @@ class ProfileStore(Protocol):
 
     def profile_dir(self, name: str) -> Path: ...
     def state_dir(self) -> Path: ...
+    # ConfigFile snapshot path layout is the store's responsibility —
+    # callers (service, oplog compensation, tests) MUST route through
+    # this helper rather than reconstruct the .switcher/config_files/...
+    # path manually, so the layout doesn't drift.
+    def config_file_snapshot_path(
+        self, profile_name: str, profile_subdir: str, profile_filename: str
+    ) -> Path: ...
 
 
 class FileProfileStore:

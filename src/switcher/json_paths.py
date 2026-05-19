@@ -7,7 +7,7 @@ Implements the narrow jq-ish grammar from spec §3.4:
 - Composition: ``.projects[].mcpServers``
 
 Not supported in v1: array iteration, filter predicates, wildcards,
-recursive descent. Out-of-grammar tokens raise ``InvalidOwnedPath``.
+recursive descent. Out-of-grammar tokens raise ``InvalidOwnedPathError``.
 
 Three modes:
 
@@ -33,11 +33,11 @@ from typing import Any
 _KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-class InvalidOwnedPath(ValueError):
+class InvalidOwnedPathError(ValueError):
     """Raised when an ``owned_json_paths`` entry doesn't parse."""
 
 
-class UnsupportedWalkTarget(ValueError):
+class UnsupportedWalkTargetError(ValueError):
     """Raised when the walker hits a JSON shape v1 doesn't support
     (e.g. ``[]`` applied to a JSON array rather than an object)."""
 
@@ -63,7 +63,7 @@ def parse_owned_path(path: str) -> tuple[_Segment, ...]:
     is then unreachable in practice.
     """
     if not path or not path.startswith("."):
-        raise InvalidOwnedPath(f"owned path must start with '.': {path!r}")
+        raise InvalidOwnedPathError(f"owned path must start with '.': {path!r}")
 
     segments: list[_Segment] = []
     i = 0
@@ -75,9 +75,9 @@ def parse_owned_path(path: str) -> tuple[_Segment, ...]:
                 j += 1
             key = path[i + 1 : j]
             if not key:
-                raise InvalidOwnedPath(f"empty key segment in {path!r}")
+                raise InvalidOwnedPathError(f"empty key segment in {path!r}")
             if not _KEY_RE.fullmatch(key):
-                raise InvalidOwnedPath(
+                raise InvalidOwnedPathError(
                     f"unsupported key {key!r} in {path!r}; v1 grammar is jq-ish "
                     "and does not support wildcards, filters, or recursion"
                 )
@@ -85,7 +85,7 @@ def parse_owned_path(path: str) -> tuple[_Segment, ...]:
             i = j
         elif ch == "[":
             if path[i : i + 2] != "[]":
-                raise InvalidOwnedPath(
+                raise InvalidOwnedPathError(
                     f"unsupported token at {path[i:]!r}: v1 grammar only supports '[]', "
                     "not array indices, filters, or wildcards"
                 )
@@ -96,26 +96,22 @@ def parse_owned_path(path: str) -> tuple[_Segment, ...]:
             # (``.a[]b``) both have no v1 semantics — reject here so
             # ConfigFile's parse-based validator catches them at load.
             if i < len(path) and path[i] != ".":
-                raise InvalidOwnedPath(
+                raise InvalidOwnedPathError(
                     f"'[]' must be followed by '.' KEY (got {path[i]!r}) "
                     f"in {path!r}; consecutive '[]' is not allowed"
                 )
         else:
-            raise InvalidOwnedPath(
-                f"unexpected character {ch!r} at position {i} in {path!r}"
-            )
+            raise InvalidOwnedPathError(f"unexpected character {ch!r} at position {i} in {path!r}")
 
     if segments and segments[-1][0] == "iter":
-        raise InvalidOwnedPath(
+        raise InvalidOwnedPathError(
             f"owned path must not end with '[]': {path!r}; "
             "v1 grammar does not allow '[]' as a leaf segment"
         )
     return tuple(segments)
 
 
-def extract_owned_paths(
-    live: dict[str, Any], owned_paths: tuple[str, ...]
-) -> dict[str, Any]:
+def extract_owned_paths(live: dict[str, Any], owned_paths: tuple[str, ...]) -> dict[str, Any]:
     """Project owned subtrees from ``live`` into a new dict (snapshot shape).
 
     The output preserves the keys/indices needed to reconstruct each owned
@@ -155,17 +151,15 @@ def _extract_into(
         # Eagerly creating ``snap_node[key] = {}`` here would manufacture a
         # placeholder that lies about descendability — apply on the unchanged
         # live would later see ``snap_has=True`` at this path with a non-dict
-        # live value and raise ``UnsupportedWalkTarget`` (the symmetric fix
+        # live value and raise ``UnsupportedWalkTargetError`` (the symmetric fix
         # in apply's r7). Skipping the setdefault keeps extract/apply
         # round-trip stable on malformed live state.
         #
         # If the next segment is ``iter``, fall through so the iter branch's
-        # ``UnsupportedWalkTarget`` fires on the non-dict — matches apply's
+        # ``UnsupportedWalkTargetError`` fires on the non-dict — matches apply's
         # iter-fail-fast behavior and preserves the test that exercises
         # ``{"projects": []}`` shapes.
-        if not isinstance(live_node[key], dict) and not (
-            rest and rest[0][0] == "iter"
-        ):
+        if not isinstance(live_node[key], dict) and not (rest and rest[0][0] == "iter"):
             return
         snap_child = snap_node.setdefault(key, {})
         if not isinstance(snap_child, dict):
@@ -178,15 +172,12 @@ def _extract_into(
 
     elif head[0] == "iter":
         if not isinstance(live_node, dict):
-            raise UnsupportedWalkTarget(
-                "v1 '[]' only iterates JSON objects (string-keyed); "
-                f"got {type(live_node).__name__}"
+            raise UnsupportedWalkTargetError(
+                f"v1 '[]' only iterates JSON objects (string-keyed); got {type(live_node).__name__}"
             )
         for k, v in live_node.items():
             if not rest:
-                raise InvalidOwnedPath(
-                    "v1 grammar does not allow '[]' as a leaf segment"
-                )
+                raise InvalidOwnedPathError("v1 grammar does not allow '[]' as a leaf segment")
             child_snap = snap_node.setdefault(k, {})
             if not isinstance(child_snap, dict):
                 child_snap = {}
@@ -253,7 +244,7 @@ def _apply_segments(
         # delete owned data downstream. Raise so the user sees corruption
         # rather than data loss.
         if snap_has and not isinstance(snap_child, dict):
-            raise UnsupportedWalkTarget(
+            raise UnsupportedWalkTargetError(
                 f"snapshot at key {key!r} has type "
                 f"{type(snap_child).__name__}, expected JSON object for "
                 "non-leaf descent (snapshot is likely corrupted)"
@@ -269,7 +260,7 @@ def _apply_segments(
             # Live has a non-dict at a non-leaf descent point. Three sub-cases:
             #
             # - Next segment is ``iter``: fall through so the iter branch's
-            #   ``UnsupportedWalkTarget`` fires — iter on a non-dict is
+            #   ``UnsupportedWalkTargetError`` fires — iter on a non-dict is
             #   structurally undefined regardless of snapshot state, and
             #   matches extract's behavior.
             #
@@ -285,7 +276,7 @@ def _apply_segments(
             if rest and rest[0][0] == "iter":
                 pass
             elif snap_has:
-                raise UnsupportedWalkTarget(
+                raise UnsupportedWalkTargetError(
                     f"path requires descent through key {key!r}, but live has "
                     f"a {type(live_node[key]).__name__} here; snapshot has owned "
                     "data below this point — overwriting would destroy "
@@ -303,18 +294,21 @@ def _apply_segments(
             del live_node[key]
 
     elif head[0] == "iter":
-        if not isinstance(live_node, dict):
-            raise UnsupportedWalkTarget(
-                "v1 '[]' only iterates JSON objects (string-keyed); "
-                f"got {type(live_node).__name__}"
+        # Static type narrows ``live_node`` to ``dict[str, Any]``, but the
+        # recursive descent at the "key" branch above passes ``live_node[key]``
+        # (typed ``Any``) into the next ``_apply_segments`` call — meaning the
+        # actual runtime value here can be a scalar / list when the snapshot
+        # disagrees with the schema. The isinstance check is defensive
+        # runtime validation, NOT a static narrowing redundancy.
+        if not isinstance(live_node, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise UnsupportedWalkTargetError(
+                f"v1 '[]' only iterates JSON objects (string-keyed); got {type(live_node).__name__}"
             )
         if not rest:
             # Defense in depth — ``parse_owned_path`` rejects leaf ``[]``,
             # so the only way to land here is a direct walker call with a
             # hand-built segment tuple (test fixtures, future callers).
-            raise InvalidOwnedPath(
-                "v1 grammar does not allow '[]' as a leaf segment"
-            )
+            raise InvalidOwnedPathError("v1 grammar does not allow '[]' as a leaf segment")
         snap_is_dict = isinstance(snap_node, dict)
         # Iterate live keys in their existing dict order first, then append
         # snapshot-only keys in snapshot dict order. ``set | set`` would
@@ -326,7 +320,7 @@ def _apply_segments(
         ordered: list[str] = list(live_node.keys())
         seen = set(ordered)
         if snap_is_dict:
-            for k in snap_node.keys():
+            for k in snap_node:
                 if k not in seen:
                     ordered.append(k)
         for k in ordered:
@@ -336,7 +330,7 @@ def _apply_segments(
             # (rest is non-empty here per the leaf-iter check above), and
             # treating it as absence would silently delete owned data.
             if snap_is_dict and k in snap_node and not isinstance(child_snap, dict):
-                raise UnsupportedWalkTarget(
+                raise UnsupportedWalkTargetError(
                     f"snapshot at iter key {k!r} has type "
                     f"{type(child_snap).__name__}, expected JSON object "
                     "(snapshot is likely corrupted)"
@@ -353,7 +347,7 @@ def _apply_segments(
                 # to write (delete-on-absence or empty placeholder),
                 # preserve the scalar silently.
                 if isinstance(child_snap, dict) and child_snap:
-                    raise UnsupportedWalkTarget(
+                    raise UnsupportedWalkTargetError(
                         f"iter entry {k!r} requires descent, but live has "
                         f"a {type(live_node[k]).__name__} here; snapshot "
                         "has owned data below this point — overwriting "

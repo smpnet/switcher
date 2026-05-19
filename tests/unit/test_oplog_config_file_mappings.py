@@ -9,6 +9,7 @@ Three invariants the validator enforces:
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime
 
 import pytest
@@ -21,6 +22,18 @@ from switcher.oplog import (
     _RescanOp,
 )
 
+IS_WINDOWS = sys.platform == "win32"
+
+
+def _abs(posix: str, windows: str) -> str:
+    """Return a host-absolute path string the AbsolutePath validator accepts.
+
+    The validator rejects POSIX-shaped paths on Windows (and vice versa) —
+    hard-coding ``/Users/test/...`` made the validator fixtures fail on
+    Windows CI (CR pass batch-4). Pick the platform's canonical form.
+    """
+    return windows if IS_WINDOWS else posix
+
 
 def _now() -> datetime:
     return datetime(2026, 5, 19, 12, 0, 0, tzinfo=UTC)
@@ -30,7 +43,7 @@ def _claude_dir_mapping() -> _MappingIntent:
     return _MappingIntent(
         tool_id="claude",
         mapping_index=0,
-        live_path="/Users/test/.claude",
+        live_path=_abs("/Users/test/.claude", "C:\\Users\\test\\.claude"),
         profile_subdir="claude",
         original_kind="real-dir",
     )
@@ -40,14 +53,14 @@ def _cf_mapping(
     tool_id: str = "claude",
     profile_subdir: str = "claude",
     profile_filename: str = "claude.json",
-    live_path: str = "/Users/test/.claude.json",
+    live_path: str | None = None,
     owned_json_paths: tuple[str, ...] = (".mcpServers",),
 ) -> _ConfigFileMappingIntent:
     return _ConfigFileMappingIntent(
         tool_id=tool_id,
         profile_subdir=profile_subdir,
         profile_filename=profile_filename,
-        live_path=live_path,
+        live_path=live_path or _abs("/Users/test/.claude.json", "C:\\Users\\test\\.claude.json"),
         owned_json_paths=owned_json_paths,
     )
 
@@ -113,7 +126,7 @@ def test_init_op_rejects_two_tools_writing_same_snapshot_path() -> None:
     tool_ids targeting the same snapshot file is precisely the
     corruption shape the validator exists to catch (abby r-batch4).
     """
-    with pytest.raises(ValidationError, match="duplicate.*storage path"):
+    with pytest.raises(ValidationError, match=r"duplicate.*storage path"):
         _init_op(
             target_ids=["claude", "other"],
             mappings=[
@@ -121,7 +134,7 @@ def test_init_op_rejects_two_tools_writing_same_snapshot_path() -> None:
                 _MappingIntent(
                     tool_id="other",
                     mapping_index=0,
-                    live_path="/Users/test/.other",
+                    live_path=_abs("/Users/test/.other", "C:\\Users\\test\\.other"),
                     profile_subdir="other",
                     original_kind="real-dir",
                 ),
@@ -184,7 +197,7 @@ def test_rescan_op_allows_same_subdir_when_target_profiles_differ() -> None:
                 _MappingIntent(
                     tool_id="other",
                     mapping_index=0,
-                    live_path="/Users/test/.other",
+                    live_path=_abs("/Users/test/.other", "C:\\Users\\test\\.other"),
                     profile_subdir="other-dir",
                     original_kind="real-dir",
                 ),
@@ -204,7 +217,7 @@ def test_rescan_op_rejects_two_tools_writing_same_snapshot_under_into_target() -
     """--into rescan with two tools both pointing at the same
     (subdir, filename) under the SAME --into target = collision.
     """
-    with pytest.raises(ValidationError, match="duplicate.*storage path"):
+    with pytest.raises(ValidationError, match=r"duplicate.*storage path"):
         _RescanOp.model_validate(
             {
                 "op": "rescan",
@@ -221,7 +234,7 @@ def test_rescan_op_rejects_two_tools_writing_same_snapshot_under_into_target() -
                     _MappingIntent(
                         tool_id="other",
                         mapping_index=0,
-                        live_path="/Users/test/.other",
+                        live_path=_abs("/Users/test/.other", "C:\\Users\\test\\.other"),
                         profile_subdir="other-dir",
                         original_kind="real-dir",
                     ),
@@ -241,7 +254,7 @@ def test_cf_mapping_rejects_unsafe_subdir() -> None:
             tool_id="claude",
             profile_subdir="../escape",
             profile_filename="claude.json",
-            live_path="/Users/test/.claude.json",
+            live_path=_abs("/Users/test/.claude.json", "C:\\Users\\test\\.claude.json"),
             owned_json_paths=(".mcpServers",),
         )
 
@@ -252,7 +265,7 @@ def test_cf_mapping_rejects_unsafe_filename() -> None:
             tool_id="claude",
             profile_subdir="claude",
             profile_filename="../escape.json",
-            live_path="/Users/test/.claude.json",
+            live_path=_abs("/Users/test/.claude.json", "C:\\Users\\test\\.claude.json"),
             owned_json_paths=(".mcpServers",),
         )
 
@@ -281,7 +294,7 @@ def test_cf_mapping_requires_owned_json_paths() -> None:
                 "tool_id": "claude",
                 "profile_subdir": "claude",
                 "profile_filename": "claude.json",
-                "live_path": "/Users/test/.claude.json",
+                "live_path": _abs("/Users/test/.claude.json", "C:\\Users\\test\\.claude.json"),
             }
         )
 
@@ -293,7 +306,7 @@ def test_cf_mapping_preserves_owned_json_paths_across_roundtrip() -> None:
         tool_id="claude",
         profile_subdir="claude",
         profile_filename="claude.json",
-        live_path="/Users/test/.claude.json",
+        live_path=_abs("/Users/test/.claude.json", "C:\\Users\\test\\.claude.json"),
         owned_json_paths=(".mcpServers", ".projects[].mcpServers", ".oauthAccount"),
     )
     dumped = entry.model_dump()

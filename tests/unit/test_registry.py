@@ -151,15 +151,20 @@ def _write_cf_tool(
     rd: Path,
     filename_in_rd: str,
     *,
-    id: str,
-    dir: str,
+    tool_id: str,
+    subdir: str,
     posix: str,
     windows: str,
     filename: str,
 ) -> None:
     (rd / filename_in_rd).write_text(
         _TOOL_WITH_CF_TEMPLATE.format(
-            id=id, name=id, dir=dir, posix=posix, windows=windows, filename=filename
+            id=tool_id,
+            name=tool_id,
+            dir=subdir,
+            posix=posix,
+            windows=windows,
+            filename=filename,
         ),
         encoding="utf-8",
     )
@@ -177,8 +182,8 @@ def test_build_registry_rejects_cross_tool_snapshot_slot_collision(
     _write_cf_tool(
         rd,
         "a.toml",
-        id="atool",
-        dir="atool",
+        tool_id="atool",
+        subdir="atool",
         posix="~/.atool.json",
         windows="%USERPROFILE%\\\\.atool.json",
         filename="conf.json",
@@ -186,8 +191,8 @@ def test_build_registry_rejects_cross_tool_snapshot_slot_collision(
     _write_cf_tool(
         rd,
         "b.toml",
-        id="btool",
-        dir="atool",  # same subdir → snapshot slot collision
+        tool_id="btool",
+        subdir="atool",  # same subdir → snapshot slot collision
         posix="~/.btool.json",
         windows="%USERPROFILE%\\\\.btool.json",
         filename="conf.json",
@@ -206,8 +211,8 @@ def test_build_registry_rejects_cross_tool_posix_path_collision(
     _write_cf_tool(
         rd,
         "a.toml",
-        id="atool",
-        dir="atool",
+        tool_id="atool",
+        subdir="atool",
         posix="~/.shared.json",
         windows="%USERPROFILE%\\\\.a.json",
         filename="a.json",
@@ -215,8 +220,8 @@ def test_build_registry_rejects_cross_tool_posix_path_collision(
     _write_cf_tool(
         rd,
         "b.toml",
-        id="btool",
-        dir="btool",
+        tool_id="btool",
+        subdir="btool",
         posix="~/.shared.json",  # same posix → live-file collision
         windows="%USERPROFILE%\\\\.b.json",
         filename="b.json",
@@ -233,8 +238,8 @@ def test_build_registry_rejects_cross_tool_windows_path_collision(
     _write_cf_tool(
         rd,
         "a.toml",
-        id="atool",
-        dir="atool",
+        tool_id="atool",
+        subdir="atool",
         posix="~/.a.json",
         windows="%USERPROFILE%\\\\.shared.json",
         filename="a.json",
@@ -242,8 +247,8 @@ def test_build_registry_rejects_cross_tool_windows_path_collision(
     _write_cf_tool(
         rd,
         "b.toml",
-        id="btool",
-        dir="btool",
+        tool_id="btool",
+        subdir="btool",
         posix="~/.b.json",
         windows="%USERPROFILE%\\\\.shared.json",  # same windows → collision
         filename="b.json",
@@ -265,8 +270,8 @@ def test_build_registry_cross_tool_collision_is_case_insensitive(
     _write_cf_tool(
         rd,
         "a.toml",
-        id="atool",
-        dir="atool",
+        tool_id="atool",
+        subdir="atool",
         posix="~/.foo.json",
         windows="%USERPROFILE%\\\\.a.json",
         filename="a.json",
@@ -274,8 +279,8 @@ def test_build_registry_cross_tool_collision_is_case_insensitive(
     _write_cf_tool(
         rd,
         "b.toml",
-        id="btool",
-        dir="btool",
+        tool_id="btool",
+        subdir="btool",
         posix="~/.Foo.json",  # case-variant of ~/.foo.json
         windows="%USERPROFILE%\\\\.b.json",
         filename="b.json",
@@ -292,8 +297,8 @@ def test_build_registry_accepts_disjoint_config_files(tmp_path: Path) -> None:
     _write_cf_tool(
         rd,
         "a.toml",
-        id="atool",
-        dir="atool",
+        tool_id="atool",
+        subdir="atool",
         posix="~/.atool.json",
         windows="%USERPROFILE%\\\\.atool.json",
         filename="a.json",
@@ -301,8 +306,8 @@ def test_build_registry_accepts_disjoint_config_files(tmp_path: Path) -> None:
     _write_cf_tool(
         rd,
         "b.toml",
-        id="btool",
-        dir="btool",
+        tool_id="btool",
+        subdir="btool",
         posix="~/.btool.json",
         windows="%USERPROFILE%\\\\.btool.json",
         filename="b.json",

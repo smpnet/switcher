@@ -54,9 +54,7 @@ def registry() -> tuple[Tool, ...]:
 
 
 @pytest.fixture
-def service(
-    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
-) -> ProfileService:
+def service(tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]) -> ProfileService:
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
     return ProfileService(store, resolver, registry)
@@ -289,8 +287,7 @@ def test_continue_raises_corrupt_when_registry_drops_config_file(
     # even though the production claude.toml ships with the entry.
     base = build_registry(Path("/nonexistent"))
     registry = tuple(
-        t.model_copy(update={"config_files": ()}) if t.id == "claude" else t
-        for t in base
+        t.model_copy(update={"config_files": ()}) if t.id == "claude" else t for t in base
     )
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
@@ -316,9 +313,7 @@ def test_continue_raises_corrupt_when_registry_drops_config_file(
         service.init(continue_=True)
 
 
-def test_continue_uses_journaled_owned_paths_not_registry(
-    tmp_home: Path, tmp_state: Path
-) -> None:
+def test_continue_uses_journaled_owned_paths_not_registry(tmp_home: Path, tmp_state: Path) -> None:
     """Spec §3.7 idempotency: a registry that drifted its
     owned_json_paths between intent-write and recovery must NOT
     change the shape recovery extracts. The journal carries the
@@ -409,8 +404,7 @@ def test_continue_writes_vanilla_snapshot_from_journal_when_registry_drops_confi
     # Registry has NO config_files for claude (drift since intent).
     base = build_registry(Path("/nonexistent"))
     registry = tuple(
-        t.model_copy(update={"config_files": ()}) if t.id == "claude" else t
-        for t in base
+        t.model_copy(update={"config_files": ()}) if t.id == "claude" else t for t in base
     )
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
@@ -428,9 +422,7 @@ def test_continue_writes_vanilla_snapshot_from_journal_when_registry_drops_confi
     # (COMPLETE state). The next thing init would have done was create
     # vanilla and write its empty snapshot — that's what compensation
     # has to finish.
-    current_snap = store.config_file_snapshot_path(
-        profile_name, "claude", "claude.json"
-    )
+    current_snap = store.config_file_snapshot_path(profile_name, "claude", "claude.json")
     current_snap.parent.mkdir(parents=True, exist_ok=True)
     current_snap.write_text(json.dumps({"mcpServers": {"x": {}}}))
 
@@ -450,9 +442,7 @@ def test_continue_writes_vanilla_snapshot_from_journal_when_registry_drops_confi
     # Vanilla snapshot must exist and be empty `{}` — the journal
     # drove the write even though the registry no longer carries the
     # ConfigFile entry.
-    vanilla_snap = store.config_file_snapshot_path(
-        "vanilla", "claude", "claude.json"
-    )
+    vanilla_snap = store.config_file_snapshot_path("vanilla", "claude", "claude.json")
     assert vanilla_snap.exists(), (
         "vanilla snapshot must be written from journal, not from the "
         "current registry — recovery must remain faithful to the "

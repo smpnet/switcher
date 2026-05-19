@@ -27,7 +27,6 @@ from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
-
 CLAUDE_CONFIG_FILE = ConfigFile(
     posix_path="~/.claude.json",
     windows_path="%USERPROFILE%\\.claude.json",
@@ -55,9 +54,7 @@ def registry() -> tuple[Tool, ...]:
 
 
 @pytest.fixture
-def service(
-    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
-) -> ProfileService:
+def service(tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]) -> ProfileService:
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
     return ProfileService(store, resolver, registry)
@@ -73,12 +70,8 @@ def test_create_seeds_config_file_snapshot_from_active_source(
 
     service.create("profB")
 
-    src_snap = service._store.config_file_snapshot_path(
-        "profA", "claude", "claude.json"
-    )
-    dst_snap = service._store.config_file_snapshot_path(
-        "profB", "claude", "claude.json"
-    )
+    src_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    dst_snap = service._store.config_file_snapshot_path("profB", "claude", "claude.json")
     assert dst_snap.exists()
     assert dst_snap.read_text() == src_snap.read_text()
 
@@ -98,15 +91,11 @@ def test_create_silently_skips_when_source_snapshot_missing(
     src_profile = service._store.get_active()["claude"]
 
     # Simulate pre-feature profile by deleting its snapshot.
-    src_snap = service._store.config_file_snapshot_path(
-        src_profile, "claude", "claude.json"
-    )
+    src_snap = service._store.config_file_snapshot_path(src_profile, "claude", "claude.json")
     src_snap.unlink()
 
     service.create("profB")  # must not raise
-    dst_snap = service._store.config_file_snapshot_path(
-        "profB", "claude", "claude.json"
-    )
+    dst_snap = service._store.config_file_snapshot_path("profB", "claude", "claude.json")
     assert not dst_snap.exists()
 
 

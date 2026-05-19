@@ -21,10 +21,10 @@ import json
 import os
 import tempfile
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from collections.abc import Callable
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
@@ -800,11 +800,7 @@ def classify_config_file_mapping(
             classifier doesn't take a Store reference.
     """
     snap_path = (
-        profile_dir
-        / ".switcher"
-        / "config_files"
-        / entry.profile_subdir
-        / entry.profile_filename
+        profile_dir / ".switcher" / "config_files" / entry.profile_subdir / entry.profile_filename
     )
     # `Path.exists()` returns False for a broken symlink; `Path.is_symlink()`
     # returns True. Combine both to distinguish "absent" from "present in

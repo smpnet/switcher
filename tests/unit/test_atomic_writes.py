@@ -62,10 +62,9 @@ def test_atomic_write_target_is_a_regular_file(tmp_path: Path):
 def test_atomic_write_preserves_existing_mode(tmp_path: Path):
     """Pre-existing target file's mode survives the rename, even though
     mkstemp would otherwise default to 0o600."""
-    import os
     target = tmp_path / "out.json"
     target.write_bytes(b"OLD")
-    os.chmod(target, 0o644)
+    target.chmod(0o644)
     atomic_write_file(target, b"NEW")
     mode = target.stat().st_mode & 0o777
     assert mode == 0o644, f"expected 0o644, got {oct(mode)}"

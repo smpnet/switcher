@@ -31,7 +31,6 @@ from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
-
 CLAUDE_CONFIG_FILE = ConfigFile(
     posix_path="~/.claude.json",
     windows_path="%USERPROFILE%\\.claude.json",
@@ -59,21 +58,15 @@ def registry() -> tuple[Tool, ...]:
 
 
 @pytest.fixture
-def service(
-    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
-) -> ProfileService:
+def service(tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]) -> ProfileService:
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
     return ProfileService(store, resolver, registry)
 
 
-def test_unmanage_does_not_touch_live_config_file(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_unmanage_does_not_touch_live_config_file(service: ProfileService, tmp_home: Path) -> None:
     live = tmp_home / ".claude.json"
-    live.write_text(
-        json.dumps({"mcpServers": {"a": {}}, "hasCompletedOnboarding": True})
-    )
+    live.write_text(json.dumps({"mcpServers": {"a": {}}, "hasCompletedOnboarding": True}))
     service.init(["claude"])
     before = live.read_text()
     service.unmanage("claude")
@@ -81,16 +74,12 @@ def test_unmanage_does_not_touch_live_config_file(
     assert before == after
 
 
-def test_unmanage_does_not_delete_snapshot_files(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_unmanage_does_not_delete_snapshot_files(service: ProfileService, tmp_home: Path) -> None:
     live = tmp_home / ".claude.json"
     live.write_text(json.dumps({"mcpServers": {"a": {}}}))
     service.init(["claude"])
     active_source = service._store.get_active()["claude"]
-    snap = service._store.config_file_snapshot_path(
-        active_source, "claude", "claude.json"
-    )
+    snap = service._store.config_file_snapshot_path(active_source, "claude", "claude.json")
     assert snap.exists()
     service.unmanage("claude")
     assert snap.exists()  # snapshot preserved
@@ -115,9 +104,7 @@ def test_uninstall_non_purge_preserves_snapshot_files(
     live.write_text(json.dumps({"mcpServers": {"a": {}}}))
     service.init(["claude"])
     active_source = service._store.get_active()["claude"]
-    snap = service._store.config_file_snapshot_path(
-        active_source, "claude", "claude.json"
-    )
+    snap = service._store.config_file_snapshot_path(active_source, "claude", "claude.json")
     snap_before = snap.read_text()
     service.uninstall()
     assert snap.exists()

@@ -13,13 +13,7 @@ def test_snapshot_path_under_dot_switcher(tmp_path: Path) -> None:
     store = FileProfileStore(tmp_path)
     p = store.config_file_snapshot_path("workA", "claude", "claude.json")
     expected = (
-        tmp_path
-        / "profiles"
-        / "workA"
-        / ".switcher"
-        / "config_files"
-        / "claude"
-        / "claude.json"
+        tmp_path / "profiles" / "workA" / ".switcher" / "config_files" / "claude" / "claude.json"
     )
     assert p == expected
 

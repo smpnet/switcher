@@ -235,16 +235,14 @@ class ConfigFile(BaseModel):
         # importing at module scope would tighten the import graph for no
         # benefit. Parse-fail-loud at config-load time so a typo'd path
         # surfaces at registry load, not on the first ``use`` that touches it.
-        from switcher.json_paths import InvalidOwnedPath, parse_owned_path
+        from switcher.json_paths import InvalidOwnedPathError, parse_owned_path
 
         parsed: list[tuple[tuple[str, ...], ...]] = []
         for raw in self.owned_json_paths:
             try:
                 segments = parse_owned_path(raw)
-            except InvalidOwnedPath as e:
-                raise ValueError(
-                    f"invalid owned_json_paths entry {raw!r}: {e}"
-                ) from e
+            except InvalidOwnedPathError as e:
+                raise ValueError(f"invalid owned_json_paths entry {raw!r}: {e}") from e
             parsed.append(segments)
 
         # Reject duplicates and overlaps. A "prefix overlap" means the
@@ -266,8 +264,7 @@ class ConfigFile(BaseModel):
                     continue
                 if a == b and i < j:
                     raise ValueError(
-                        f"duplicate owned_json_paths entry "
-                        f"{self.owned_json_paths[j]!r}"
+                        f"duplicate owned_json_paths entry {self.owned_json_paths[j]!r}"
                     )
                 if len(a) > len(b):
                     # The pair will surface on the (j, i) iteration with

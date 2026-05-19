@@ -58,9 +58,7 @@ def registry() -> tuple[Tool, ...]:
 
 
 @pytest.fixture
-def service(
-    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
-) -> ProfileService:
+def service(tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]) -> ProfileService:
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
     return ProfileService(store, resolver, registry)
@@ -70,9 +68,7 @@ def _now() -> datetime:
     return datetime(2026, 5, 19, 10, 30, tzinfo=UTC)
 
 
-def _claude_dir_mapping(
-    tmp_home: Path, original_kind: str = "real-dir"
-) -> _MappingIntent:
+def _claude_dir_mapping(tmp_home: Path, original_kind: str = "real-dir") -> _MappingIntent:
     return _MappingIntent.model_validate(
         {
             "tool_id": "claude",
@@ -141,9 +137,7 @@ def _stage_completed_rescan_dir_mapping(
     live.symlink_to(target, target_is_directory=True)
 
 
-def _prepare_init_state(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def _prepare_init_state(service: ProfileService, tmp_home: Path) -> None:
     """The rescan compensation entry point pre-flights via
     ``_require_initialized``. Drop claude beforehand so init manages
     only copilot, then claude is a clean rescan target."""

@@ -21,7 +21,6 @@ from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
-
 CLAUDE_CONFIG_FILE = ConfigFile(
     posix_path="~/.claude.json",
     windows_path="%USERPROFILE%\\.claude.json",
@@ -50,17 +49,13 @@ def registry() -> tuple[Tool, ...]:
 
 
 @pytest.fixture
-def service(
-    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
-) -> ProfileService:
+def service(tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]) -> ProfileService:
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
     return ProfileService(store, resolver, registry)
 
 
-def test_save_writes_owned_paths_to_snapshot(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_save_writes_owned_paths_to_snapshot(service: ProfileService, tmp_home: Path) -> None:
     live = tmp_home / ".claude.json"
     live.write_text(
         json.dumps(
@@ -84,9 +79,7 @@ def test_save_writes_owned_paths_to_snapshot(
     service.init(["claude"])
     service.save("workA")
 
-    snap_path = service._store.config_file_snapshot_path(
-        "workA", "claude", "claude.json"
-    )
+    snap_path = service._store.config_file_snapshot_path("workA", "claude", "claude.json")
     snap = json.loads(snap_path.read_text())
     assert snap == {
         "mcpServers": {"shared": {"command": "x"}},
@@ -95,9 +88,7 @@ def test_save_writes_owned_paths_to_snapshot(
     }
 
 
-def test_save_handles_missing_live_file(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_save_handles_missing_live_file(service: ProfileService, tmp_home: Path) -> None:
     """No ~/.claude.json on disk (fresh machine, pre-first-run) → store `{}`.
 
     Refusing to capture in this case would block init on a freshly installed
@@ -107,15 +98,11 @@ def test_save_handles_missing_live_file(
     assert not (tmp_home / ".claude.json").exists()
     service.init(["claude"])
     service.save("workA")
-    snap_path = service._store.config_file_snapshot_path(
-        "workA", "claude", "claude.json"
-    )
+    snap_path = service._store.config_file_snapshot_path("workA", "claude", "claude.json")
     assert json.loads(snap_path.read_text()) == {}
 
 
-def test_save_raises_on_malformed_live_json(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_save_raises_on_malformed_live_json(service: ProfileService, tmp_home: Path) -> None:
     # init captures a clean (missing-live → `{}`) snapshot; the bad state is
     # introduced afterwards so the assertion targets save's branch of the
     # shared _capture_config_files validation, not init's.
@@ -175,7 +162,7 @@ def test_save_raises_storage_error_when_live_has_non_object_at_iter(
 ) -> None:
     """Live shape like ``{"projects": []}`` under an owned path
     ``.projects[].mcpServers`` makes the walker raise
-    ``UnsupportedWalkTarget`` (iter expects a JSON object). Service must
+    ``UnsupportedWalkTargetError`` (iter expects a JSON object). Service must
     catch and re-raise as StorageError with file context, instead of
     letting a raw ValueError escape — abby r9.
     """
@@ -188,9 +175,7 @@ def test_save_raises_storage_error_when_live_has_non_object_at_iter(
     assert not service._store.profile_dir("workA").exists()
 
 
-def test_save_rejects_broken_symlink_at_live_path(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_save_rejects_broken_symlink_at_live_path(service: ProfileService, tmp_home: Path) -> None:
     """A broken symlink at ~/.claude.json must not be silently treated as
     "missing" by capture — that would write an empty {} snapshot under a
     name that promises owned data, and a later use() would apply {} onto

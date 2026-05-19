@@ -52,9 +52,7 @@ def _suppress_copilot(tmp_home: Path) -> None:
                 target.unlink()
 
 
-def test_mcp_isolation_across_profile_switch(
-    tmp_state: Path, tmp_home: Path
-) -> None:
+def test_mcp_isolation_across_profile_switch(tmp_state: Path, tmp_home: Path) -> None:
     """Spec §1 motivating case: an MCP installed under profA must
     NOT appear in live state when profB is active. The pre-isolation
     leak path was Claude reading from a single ``~/.claude.json``;
@@ -73,9 +71,7 @@ def test_mcp_isolation_across_profile_switch(
     # Pre-install machine-global state to verify it rides across the
     # switch (spec §3.2: walker owns only mcpServers / oauthAccount /
     # projects[].mcpServers — everything else is live-machine-global).
-    live.write_text(
-        json.dumps({"mcpServers": {}, "hasCompletedOnboarding": True})
-    )
+    live.write_text(json.dumps({"mcpServers": {}, "hasCompletedOnboarding": True}))
 
     s = _service(tmp_state, tmp_home)
     s.init(["claude"])
@@ -118,9 +114,7 @@ def test_mcp_isolation_across_profile_switch(
     assert live_back["oauthAccount"] == {"email": "a@example.com"}
 
 
-def test_oauth_isolation_across_profile_switch(
-    tmp_state: Path, tmp_home: Path
-) -> None:
+def test_oauth_isolation_across_profile_switch(tmp_state: Path, tmp_home: Path) -> None:
     """``.oauthAccount`` is the second owned path; switching between
     profiles with different accounts must flip the live value."""
     _suppress_copilot(tmp_home)
@@ -171,9 +165,7 @@ def test_per_project_mcp_isolation(tmp_state: Path, tmp_home: Path) -> None:
     s.save("profA")
 
     # Profile B: no per-project MCP, but its own session id in live.
-    live.write_text(
-        json.dumps({"projects": {"/repo": {"lastSessionId": "B-session"}}})
-    )
+    live.write_text(json.dumps({"projects": {"/repo": {"lastSessionId": "B-session"}}}))
     s.save("profB")
 
     # Switch to A → MCP restored; lastSessionId from CURRENT live, not
@@ -259,9 +251,7 @@ def test_full_lifecycle_init_save_create_use_unmanage_rescan(
     assert json.loads(rescan_snap.read_text()) == {"mcpServers": {"saved": {}}}
 
 
-def test_use_vanilla_clears_owned_subtrees(
-    tmp_state: Path, tmp_home: Path
-) -> None:
+def test_use_vanilla_clears_owned_subtrees(tmp_state: Path, tmp_home: Path) -> None:
     """``vanilla`` represents factory-fresh tool state — switching onto
     it must wipe the owned subtrees back to empty. Without an explicit
     ``{}`` snapshot at init time, ``use("vanilla")`` falls into the

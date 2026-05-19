@@ -7,13 +7,12 @@ from copy import deepcopy
 import pytest
 
 from switcher.json_paths import (
-    InvalidOwnedPath,
-    UnsupportedWalkTarget,
+    InvalidOwnedPathError,
+    UnsupportedWalkTargetError,
     apply_owned_paths,
     extract_owned_paths,
     parse_owned_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # Parser
@@ -37,41 +36,41 @@ def test_parse_iter():
 
 
 def test_parse_rejects_missing_leading_dot():
-    with pytest.raises(InvalidOwnedPath):
+    with pytest.raises(InvalidOwnedPathError):
         parse_owned_path("mcpServers")
 
 
 def test_parse_rejects_empty_key():
-    with pytest.raises(InvalidOwnedPath):
+    with pytest.raises(InvalidOwnedPathError):
         parse_owned_path("..mcpServers")
 
 
 def test_parse_rejects_wildcard():
-    with pytest.raises(InvalidOwnedPath):
+    with pytest.raises(InvalidOwnedPathError):
         parse_owned_path(".*")
 
 
 def test_parse_rejects_filter():
-    with pytest.raises(InvalidOwnedPath):
+    with pytest.raises(InvalidOwnedPathError):
         parse_owned_path(".foo[?(@.bar)]")
 
 
 def test_parse_rejects_iter_as_leaf():
     """``[]`` at the end has no defined semantics in v1. The parser is the
     single source of truth, so it must reject — not just the walker."""
-    with pytest.raises(InvalidOwnedPath, match="must not end with"):
+    with pytest.raises(InvalidOwnedPathError, match="must not end with"):
         parse_owned_path(".projects[]")
 
 
 def test_parse_rejects_consecutive_iter():
     """``[][]`` violates the grammar (subpath after ``[]`` must be ``.KEY``)."""
-    with pytest.raises(InvalidOwnedPath, match="must be followed by"):
+    with pytest.raises(InvalidOwnedPathError, match="must be followed by"):
         parse_owned_path(".a[][].b")
 
 
 def test_parse_rejects_iter_without_dot_continuation():
     """``[]b`` (no dot after iter) violates the grammar."""
-    with pytest.raises(InvalidOwnedPath):
+    with pytest.raises(InvalidOwnedPathError):
         parse_owned_path(".a[]b")
 
 
@@ -118,7 +117,7 @@ def test_extract_skips_missing_inner_key_under_iter():
 
 def test_extract_rejects_array_iter():
     live = {"projects": [{"mcpServers": {}}]}
-    with pytest.raises(UnsupportedWalkTarget):
+    with pytest.raises(UnsupportedWalkTargetError):
         extract_owned_paths(live, (".projects[].mcpServers",))
 
 
@@ -277,24 +276,24 @@ def test_apply_rejects_iter_as_leaf_segment():
     """Mirror extract: ``[]`` as a leaf has no defined semantics in v1."""
     live = {"projects": {"/r/A": {"mcpServers": {}}}}
     snap = {"projects": {"/r/A": {"mcpServers": {}}}}
-    with pytest.raises(InvalidOwnedPath, match="leaf"):
+    with pytest.raises(InvalidOwnedPathError, match="leaf"):
         apply_owned_paths(live, snap, (".projects[]",))
 
 
 def test_apply_raises_when_iter_target_is_list_in_live():
     """Apply must fail loudly when live has a non-dict at an iter target,
-    matching extract's UnsupportedWalkTarget behavior. Silent no-op would
+    matching extract's UnsupportedWalkTargetError behavior. Silent no-op would
     hide a malformed live config."""
     live = {"projects": []}
     snap: dict[str, object] = {}
-    with pytest.raises(UnsupportedWalkTarget):
+    with pytest.raises(UnsupportedWalkTargetError):
         apply_owned_paths(live, snap, (".projects[].mcpServers",))
 
 
 def test_apply_raises_when_iter_target_is_scalar_in_live():
     live = {"projects": 1}
     snap: dict[str, object] = {}
-    with pytest.raises(UnsupportedWalkTarget):
+    with pytest.raises(UnsupportedWalkTargetError):
         apply_owned_paths(live, snap, (".projects[].mcpServers",))
 
 
@@ -303,7 +302,7 @@ def test_apply_raises_when_key_descent_blocked_and_snapshot_has_data():
     Overwriting destroys machine-global; skipping drops owned data; raise."""
     live = {"a": 1}
     snap = {"a": {"b": 2}}
-    with pytest.raises(UnsupportedWalkTarget):
+    with pytest.raises(UnsupportedWalkTargetError):
         apply_owned_paths(live, snap, (".a.b",))
 
 
@@ -322,7 +321,7 @@ def test_apply_raises_when_iter_entry_blocks_descent_and_snapshot_has_data():
     raise instead of silently dropping the owned data."""
     live = {"projects": {"/r/A": 1}}
     snap = {"projects": {"/r/A": {"mcpServers": {"x": {}}}}}
-    with pytest.raises(UnsupportedWalkTarget):
+    with pytest.raises(UnsupportedWalkTargetError):
         apply_owned_paths(live, snap, (".projects[].mcpServers",))
 
 
@@ -341,7 +340,7 @@ def test_apply_raises_on_malformed_snapshot_subtree_at_key():
     delete owned data from live."""
     live = {"a": {"b": "owned-data"}}
     snap = {"a": "corrupted"}
-    with pytest.raises(UnsupportedWalkTarget, match="corrupted"):
+    with pytest.raises(UnsupportedWalkTargetError, match="corrupted"):
         apply_owned_paths(live, snap, (".a.b",))
 
 
@@ -351,7 +350,7 @@ def test_apply_raises_on_malformed_snapshot_subtree_at_iter_entry():
     mcpServers from live when snapshot is corrupt."""
     live = {"projects": {"/r/A": {"mcpServers": {"x": {}}}}}
     snap = {"projects": {"/r/A": 1}}  # corrupted
-    with pytest.raises(UnsupportedWalkTarget, match="corrupted"):
+    with pytest.raises(UnsupportedWalkTargetError, match="corrupted"):
         apply_owned_paths(live, snap, (".projects[].mcpServers",))
     # Critically: live was NOT mutated before the raise. Apply must be
     # all-or-nothing on the input dict — partial mutation on raise would

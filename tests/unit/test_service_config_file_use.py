@@ -25,7 +25,6 @@ from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
-
 CLAUDE_CONFIG_FILE = ConfigFile(
     posix_path="~/.claude.json",
     windows_path="%USERPROFILE%\\.claude.json",
@@ -53,17 +52,13 @@ def registry() -> tuple[Tool, ...]:
 
 
 @pytest.fixture
-def service(
-    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
-) -> ProfileService:
+def service(tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]) -> ProfileService:
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
     return ProfileService(store, resolver, registry)
 
 
-def test_use_overlays_snapshot_onto_live(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_use_overlays_snapshot_onto_live(service: ProfileService, tmp_home: Path) -> None:
     live = tmp_home / ".claude.json"
     # Profile A's live state
     live.write_text(
@@ -152,9 +147,61 @@ def test_use_warns_and_skips_when_snapshot_missing(
     assert "rescan" not in err.lower()
 
 
-def test_use_synthesizes_live_when_missing(
-    service: ProfileService, tmp_home: Path
+def test_use_rejects_broken_symlink_at_snapshot_path(
+    service: ProfileService,
+    tmp_home: Path,
 ) -> None:
+    """A broken (dangling) symlink at the snapshot path must NOT be
+    silently treated as "missing" — Path.exists() returns False for
+    a broken symlink, but the apply path needs to refuse rather than
+    fall into warn-and-skip. Without the refusal, ``use()`` would
+    swap the config_dirs symlinks AND update ``active`` to the new
+    profile, but leave ``~/.claude.json`` carrying the PREVIOUS
+    profile's owned subtrees — a silent half-switched state that
+    re-opens the MCP-leak class for users with snapshot-path
+    corruption. The compensation classifier already treats any link
+    shape at the snapshot path as AMBIGUOUS; the apply side mirrors
+    that contract (Hermes + CR pass-PR-1).
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"profA-source": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    # profB carries the destination's MCP — would be the "live after
+    # switch" content if use() didn't refuse.
+    live.write_text(json.dumps({"mcpServers": {"profB-source": {}}}))
+    service.save("profB")
+    service.use("profB")  # live now reflects profB's snapshot
+
+    # Capture the live content the post-use state would have left
+    # behind if the symlink check didn't fire — proves the assertion
+    # below is actually testing the refusal, not coincidence.
+    live_before_switch = live.read_text()
+
+    # Replace profA's snapshot with a dangling symlink. This is the
+    # exact scenario in the Hermes reproducer: ``snap_path.exists()``
+    # returns False, but the path is corrupt and must NOT degrade to
+    # warn-and-skip.
+    snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    snap.unlink()
+    snap.symlink_to(tmp_home / ".does-not-exist.json")
+    assert snap.is_symlink()
+    assert not snap.exists()
+
+    with pytest.raises(StorageError, match="symlink"):
+        service.use("profA")
+
+    # Pre-flight refusal means live is UNTOUCHED (matches the
+    # plan-then-commit contract). If the refusal fires post-swap
+    # instead, this would silently regress to the half-switched
+    # state the Hermes finding describes.
+    assert live.read_text() == live_before_switch
+    # Active map must not have flipped — use() refused before
+    # commit so the on-disk active still reports profB.
+    assert service._store.get_active()["claude"] == "profB"
+
+
+def test_use_synthesizes_live_when_missing(service: ProfileService, tmp_home: Path) -> None:
     live = tmp_home / ".claude.json"
     live.write_text(json.dumps({"mcpServers": {}}))
     service.init(["claude"])
@@ -168,9 +215,7 @@ def test_use_synthesizes_live_when_missing(
     assert "mcpServers" in out
 
 
-def test_use_raises_on_malformed_live(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_use_raises_on_malformed_live(service: ProfileService, tmp_home: Path) -> None:
     live = tmp_home / ".claude.json"
     live.write_text(json.dumps({}))
     service.init(["claude"])
@@ -181,9 +226,7 @@ def test_use_raises_on_malformed_live(
         service.use("profA")
 
 
-def test_use_raises_on_malformed_snapshot(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_use_raises_on_malformed_snapshot(service: ProfileService, tmp_home: Path) -> None:
     live = tmp_home / ".claude.json"
     live.write_text(json.dumps({}))
     service.init(["claude"])
@@ -211,9 +254,7 @@ def test_use_raises_when_snapshot_is_not_a_json_object(
         service.use("profA")
 
 
-def test_use_raises_when_live_is_not_a_json_object(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_use_raises_when_live_is_not_a_json_object(service: ProfileService, tmp_home: Path) -> None:
     live = tmp_home / ".claude.json"
     live.write_text(json.dumps({}))
     service.init(["claude"])
@@ -327,7 +368,7 @@ def test_use_skips_capture_when_symlink_diverged_from_active(
     service.use("profA")
 
     snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
-    profA_before = json.loads(snap.read_text())
+    prof_a_before = json.loads(snap.read_text())
 
     # Simulate post-partial-commit drift: claude's symlink and live moved
     # to profB content, on-disk active still says profA (set_active_state
@@ -344,10 +385,10 @@ def test_use_skips_capture_when_symlink_diverged_from_active(
     # and refuse to overwrite profA's snapshot.
     service.use("profB")
 
-    profA_after = json.loads(snap.read_text())
-    assert profA_after == profA_before
+    prof_a_after = json.loads(snap.read_text())
+    assert prof_a_after == prof_a_before
     # The owned content must still be "src", NOT "dst" (live at retry time).
-    assert profA_after["mcpServers"] == {"src": {}}
+    assert prof_a_after["mcpServers"] == {"src": {}}
 
 
 def test_use_raises_storage_error_when_snapshot_path_is_a_directory(
@@ -422,7 +463,7 @@ def test_use_raises_storage_error_when_snapshot_has_non_object_at_iter(
 ) -> None:
     """abby r9 (apply side): a snapshot shape like ``{"projects": []}``
     under an owned path ``.projects[].mcpServers`` makes the walker raise
-    UnsupportedWalkTarget. Service must re-raise as StorageError so the
+    UnsupportedWalkTargetError. Service must re-raise as StorageError so the
     CLI's friendly error handling kicks in instead of a raw ValueError
     traceback, and it must fire pre-flight (no swap_link).
     """
@@ -459,9 +500,7 @@ def test_use_capture_does_not_clobber_source_snapshot_on_broken_symlink(
     service.save("profB")
     service.use("profA")  # active is now profA; profA snapshot has the data
 
-    snap_path = service._store.config_file_snapshot_path(
-        "profA", "claude", "claude.json"
-    )
+    snap_path = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
     snapshot_before = json.loads(snap_path.read_text())
     assert snapshot_before == {"mcpServers": {"A": {"command": "x"}}}
 
@@ -479,9 +518,7 @@ def test_use_capture_does_not_clobber_source_snapshot_on_broken_symlink(
     assert json.loads(snap_path.read_text()) == snapshot_before
 
 
-def test_use_rejects_symlink_at_live_path(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_use_rejects_symlink_at_live_path(service: ProfileService, tmp_home: Path) -> None:
     """A symlink at the ConfigFile live path is fatal during pre-flight.
 
     atomic_write_file refuses to atomic-rename through a symlink (it would
@@ -534,9 +571,9 @@ def test_use_rolls_back_swap_link_when_write_fails(
     service.use("profA")  # active is now profA; profA's config_dir is live
 
     claude_dir = tmp_home / ".claude"
-    profA_subdir = service._store.profile_dir("profA") / "claude"
-    profB_subdir = service._store.profile_dir("profB") / "claude"
-    assert claude_dir.resolve() == profA_subdir.resolve()
+    prof_a_subdir = service._store.profile_dir("profA") / "claude"
+    prof_b_subdir = service._store.profile_dir("profB") / "claude"
+    assert claude_dir.resolve() == prof_a_subdir.resolve()
 
     # Patch atomic_write_file to fail at commit time. swap_link will have
     # already run by then — rollback should swap claude_dir back to profA.
@@ -564,9 +601,9 @@ def test_use_rolls_back_swap_link_when_write_fails(
         service.use("profB")
 
     # config_dirs symlink must be rolled back to profA (the source).
-    assert claude_dir.resolve() == profA_subdir.resolve()
+    assert claude_dir.resolve() == prof_a_subdir.resolve()
     # And NOT pointing at profB (the destination of the failed switch).
-    assert claude_dir.resolve() != profB_subdir.resolve()
+    assert claude_dir.resolve() != prof_b_subdir.resolve()
 
 
 def test_use_aborts_before_swap_link_when_snapshot_malformed(
@@ -586,8 +623,8 @@ def test_use_aborts_before_swap_link_when_snapshot_malformed(
     # use profA first to establish a clean baseline pointing at profA.
     service.use("profA")
     claude_dir = tmp_home / ".claude"
-    profA_subdir = service._store.profile_dir("profA") / "claude"
-    assert claude_dir.resolve() == profA_subdir.resolve()
+    prof_a_subdir = service._store.profile_dir("profA") / "claude"
+    assert claude_dir.resolve() == prof_a_subdir.resolve()
 
     # Corrupt profB's snapshot, then attempt to switch to it.
     snap_b = service._store.config_file_snapshot_path("profB", "claude", "claude.json")
@@ -597,4 +634,4 @@ def test_use_aborts_before_swap_link_when_snapshot_malformed(
         service.use("profB")
 
     # swap_link must NOT have fired — symlink still points at profA's subdir.
-    assert claude_dir.resolve() == profA_subdir.resolve()
+    assert claude_dir.resolve() == prof_a_subdir.resolve()

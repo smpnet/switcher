@@ -45,7 +45,7 @@ from switcher.errors import (
     UnknownToolError,
 )
 from switcher.json_paths import (
-    UnsupportedWalkTarget,
+    UnsupportedWalkTargetError,
     apply_owned_paths,
     extract_owned_paths,
 )
@@ -254,9 +254,7 @@ class ProfileService:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 
-    def _symlink_matches_active_source(
-        self, tool: Tool, source_profile: str
-    ) -> bool:
+    def _symlink_matches_active_source(self, tool: Tool, source_profile: str) -> bool:
         """True iff every config_dirs symlink for ``tool`` resolves to
         ``source_profile``'s expected subdir.
 
@@ -313,9 +311,7 @@ class ProfileService:
             ``_plan_config_file_applies`` rejects on the apply side.
         """
         for cf in tool.config_files:
-            live_path = self._resolver.expand(
-                cf.windows_path if IS_WINDOWS else cf.posix_path
-            )
+            live_path = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
             if live_path.is_symlink():
                 raise StorageError(
                     f"refusing to capture ConfigFile through symlink at "
@@ -329,9 +325,7 @@ class ProfileService:
                 # read_text() would raise IsADirectoryError or similar
                 # past the service boundary (abby r12). Reject explicitly.
                 kind = "directory" if live_path.is_dir() else "non-regular file"
-                raise StorageError(
-                    f"expected regular file at {live_path}, got {kind}"
-                )
+                raise StorageError(f"expected regular file at {live_path}, got {kind}")
             if live_path.exists():
                 try:
                     live_text = live_path.read_text(encoding="utf-8")
@@ -340,9 +334,7 @@ class ProfileService:
                     # as realistic as bad JSON for user-controlled live files
                     # and must surface as StorageError, not a raw decode
                     # traceback (abby r10).
-                    raise StorageError(
-                        f"non-UTF-8 bytes at {live_path}: {e}"
-                    ) from e
+                    raise StorageError(f"non-UTF-8 bytes at {live_path}: {e}") from e
                 try:
                     live_data = json.loads(live_text)
                 except json.JSONDecodeError as e:
@@ -351,20 +343,18 @@ class ProfileService:
                     ) from e
                 if not isinstance(live_data, dict):
                     raise StorageError(
-                        f"expected JSON object at {live_path}, got "
-                        f"{type(live_data).__name__}"
+                        f"expected JSON object at {live_path}, got {type(live_data).__name__}"
                     )
                 try:
                     snapshot = extract_owned_paths(live_data, cf.owned_json_paths)
-                except UnsupportedWalkTarget as e:
+                except UnsupportedWalkTargetError as e:
                     # e.g., live has {"projects": []} but owned path is
                     # ``.projects[].mcpServers`` — iter expects a JSON object,
                     # gets a list. This is live-data drift, not a registry
                     # config bug, so surface it consistently with the other
                     # live-validation errors above (abby r9).
                     raise StorageError(
-                        f"owned path walks into a non-object value at "
-                        f"{live_path}: {e}"
+                        f"owned path walks into a non-object value at {live_path}: {e}"
                     ) from e
             else:
                 snapshot = {}
@@ -435,8 +425,7 @@ class ProfileService:
         matching = [
             cf
             for cf in tool.config_files
-            if cf.profile_subdir == profile_subdir
-            and cf.profile_filename == profile_filename
+            if cf.profile_subdir == profile_subdir and cf.profile_filename == profile_filename
         ]
         if not matching:
             raise OpLogCorruptError(
@@ -469,16 +458,12 @@ class ProfileService:
             )
         if live_path.exists() and not live_path.is_file():
             kind = "directory" if live_path.is_dir() else "non-regular file"
-            raise StorageError(
-                f"expected regular file at {live_path}, got {kind}"
-            )
+            raise StorageError(f"expected regular file at {live_path}, got {kind}")
         if live_path.exists():
             try:
                 live_text = live_path.read_text(encoding="utf-8")
             except UnicodeDecodeError as e:
-                raise StorageError(
-                    f"non-UTF-8 bytes at {live_path}: {e}"
-                ) from e
+                raise StorageError(f"non-UTF-8 bytes at {live_path}: {e}") from e
             try:
                 live_data = json.loads(live_text)
             except json.JSONDecodeError as e:
@@ -487,15 +472,13 @@ class ProfileService:
                 ) from e
             if not isinstance(live_data, dict):
                 raise StorageError(
-                    f"expected JSON object at {live_path}, got "
-                    f"{type(live_data).__name__}"
+                    f"expected JSON object at {live_path}, got {type(live_data).__name__}"
                 )
             try:
                 snapshot = extract_owned_paths(live_data, owned_json_paths)
-            except UnsupportedWalkTarget as e:
+            except UnsupportedWalkTargetError as e:
                 raise StorageError(
-                    f"owned path walks into a non-object value at "
-                    f"{live_path}: {e}"
+                    f"owned path walks into a non-object value at {live_path}: {e}"
                 ) from e
         else:
             snapshot = {}
@@ -508,9 +491,7 @@ class ProfileService:
             json.dumps(snapshot, indent=2, sort_keys=True).encode("utf-8"),
         )
 
-    def _plan_config_file_applies(
-        self, profile_name: str, tool: Tool
-    ) -> list[tuple[Path, bytes]]:
+    def _plan_config_file_applies(self, profile_name: str, tool: Tool) -> list[tuple[Path, bytes]]:
         """Read-only: validate and plan each ConfigFile's apply.
 
         Returns a list of ``(live_path, content_bytes)`` pairs the caller can
@@ -523,7 +504,7 @@ class ProfileService:
           * malformed live JSON / non-object live
           * symlink at live_path (atomic_write_file would refuse at commit
             time, post-swap — see r5 fix)
-          * ``UnsupportedWalkTarget`` from the walker (live or snapshot has
+          * ``UnsupportedWalkTargetError`` from the walker (live or snapshot has
             a shape — typically a JSON array — under an ``iter`` segment).
             Re-raised as ``StorageError`` with file context (abby r9). The
             unwalkable shape is a live-data or snapshot-data issue, not a
@@ -546,9 +527,7 @@ class ProfileService:
         """
         plans: list[tuple[Path, bytes]] = []
         for cf in tool.config_files:
-            live_path = self._resolver.expand(
-                cf.windows_path if IS_WINDOWS else cf.posix_path
-            )
+            live_path = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
             snap_path = self._store.config_file_snapshot_path(
                 profile_name, cf.profile_subdir, cf.profile_filename
             )
@@ -570,6 +549,24 @@ class ProfileService:
                     f"it so the underlying path is writable) and re-run."
                 )
 
+            # Refuse symlinks at the snapshot path BEFORE the missing-
+            # snapshot warn-and-skip. ``Path.exists()`` returns False for a
+            # broken (dangling) symlink, so without this guard a corrupted
+            # snapshot path with a stale symlink would degrade to "missing
+            # → warn-and-skip" and leave the previous profile's owned
+            # subtree in live AFTER the config_dirs swap_link had already
+            # flipped — half-switched state: ``active`` claims the new
+            # profile but ``~/.claude.json`` still carries the previous
+            # profile's data. The classifier already treats any snapshot-
+            # path link shape as AMBIGUOUS for the same reason; mirror
+            # that on the apply side so reserved-state corruption fails
+            # loud instead of degrading silently (Hermes + CR pass-PR-1).
+            if snap_path.is_symlink():
+                raise StorageError(
+                    f"refusing to read config_file snapshot through symlink at "
+                    f"{snap_path}; resolve the symlink (or remove it so the "
+                    f"underlying path is readable) and re-run."
+                )
             if not snap_path.exists():
                 # Stderr matches the project's existing warning convention
                 # (see `_warn_migration`). caplog won't pick this up; tests
@@ -592,9 +589,7 @@ class ProfileService:
                 # owns this subtree so the case shouldn't arise from normal
                 # use, but external tampering could create it (abby r12).
                 kind = "directory" if snap_path.is_dir() else "non-regular file"
-                raise StorageError(
-                    f"expected regular file at snapshot {snap_path}, got {kind}"
-                )
+                raise StorageError(f"expected regular file at snapshot {snap_path}, got {kind}")
 
             try:
                 snap_text = snap_path.read_text(encoding="utf-8")
@@ -603,55 +598,41 @@ class ProfileService:
                 # in our normal flow; this branch only fires on concurrent
                 # external corruption of the snapshot file. Re-raise as
                 # StorageError to keep the boundary consistent (abby r10).
-                raise StorageError(
-                    f"non-UTF-8 bytes at snapshot {snap_path}: {e}"
-                ) from e
+                raise StorageError(f"non-UTF-8 bytes at snapshot {snap_path}: {e}") from e
             try:
                 snapshot = json.loads(snap_text)
             except json.JSONDecodeError as e:
                 raise StorageError(
-                    f"malformed snapshot JSON at {snap_path}: {e.msg} "
-                    f"(line {e.lineno})"
+                    f"malformed snapshot JSON at {snap_path}: {e.msg} (line {e.lineno})"
                 ) from e
             if not isinstance(snapshot, dict):
-                raise StorageError(
-                    f"snapshot at {snap_path} is not a JSON object"
-                )
+                raise StorageError(f"snapshot at {snap_path} is not a JSON object")
 
             if live_path.exists() and not live_path.is_file():
                 # Mirrors the capture-side regular-file gate (abby r12):
                 # without this, read_text would raise IsADirectoryError or
                 # similar past the service boundary.
                 kind = "directory" if live_path.is_dir() else "non-regular file"
-                raise StorageError(
-                    f"expected regular file at {live_path}, got {kind}"
-                )
+                raise StorageError(f"expected regular file at {live_path}, got {kind}")
             if live_path.exists():
                 try:
                     live_text = live_path.read_text(encoding="utf-8")
                 except UnicodeDecodeError as e:
-                    raise StorageError(
-                        f"non-UTF-8 bytes at {live_path}: {e}"
-                    ) from e
+                    raise StorageError(f"non-UTF-8 bytes at {live_path}: {e}") from e
                 try:
                     live_data = json.loads(live_text)
                 except json.JSONDecodeError as e:
                     raise StorageError(
-                        f"malformed live JSON at {live_path}: {e.msg} "
-                        f"(line {e.lineno})"
+                        f"malformed live JSON at {live_path}: {e.msg} (line {e.lineno})"
                     ) from e
                 if not isinstance(live_data, dict):
-                    raise StorageError(
-                        f"live file at {live_path} is not a JSON object"
-                    )
+                    raise StorageError(f"live file at {live_path} is not a JSON object")
             else:
                 live_data = {}
 
             try:
-                merged = apply_owned_paths(
-                    live_data, snapshot, cf.owned_json_paths
-                )
-            except UnsupportedWalkTarget as e:
+                merged = apply_owned_paths(live_data, snapshot, cf.owned_json_paths)
+            except UnsupportedWalkTargetError as e:
                 # e.g., snapshot or live has {"projects": []} but the owned
                 # path is ``.projects[].mcpServers`` — iter expects a JSON
                 # object, gets a list. The walker can't tell us which side
@@ -1432,9 +1413,7 @@ class ProfileService:
         config_file_mappings: list[_ConfigFileMappingIntent] = []
         for tool in installed:
             for cf in tool.config_files:
-                live_cf = self._resolver.expand(
-                    cf.windows_path if IS_WINDOWS else cf.posix_path
-                )
+                live_cf = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
                 config_file_mappings.append(
                     _ConfigFileMappingIntent.model_validate(
                         {
@@ -3213,8 +3192,7 @@ class ProfileService:
         # preserves the "links first, file overlay second" ordering inside
         # a single tool while keeping all parses upfront across tools.
         config_file_plans: dict[str, list[tuple[Path, bytes]]] = {
-            tid: self._plan_config_file_applies(profile_name, tool)
-            for tid, tool in resolved
+            tid: self._plan_config_file_applies(profile_name, tool) for tid, tool in resolved
         }
         for tid, tool in resolved:
             # Within-tool rollback: if any post-swap step (atomic_write_file)
@@ -3247,15 +3225,10 @@ class ProfileService:
             swapped: list[tuple[Path, Path]] = []
             try:
                 for i, dm in enumerate(tool.config_dirs):
-                    target = (
-                        self._store.profile_dir(profile_name) / dm.profile_subdir
-                    )
+                    target = self._store.profile_dir(profile_name) / dm.profile_subdir
                     live = self._resolver.tool_dir(tool, i)
                     if source_profile is not None:
-                        source_target = (
-                            self._store.profile_dir(source_profile)
-                            / dm.profile_subdir
-                        )
+                        source_target = self._store.profile_dir(source_profile) / dm.profile_subdir
                         swap_link(target, live)
                         swapped.append((live, source_target))
                     else:
@@ -4329,9 +4302,7 @@ class ProfileService:
         rescan_config_file_mappings: list[_ConfigFileMappingIntent] = []
         for tool in candidates:
             for cf in tool.config_files:
-                live_cf = self._resolver.expand(
-                    cf.windows_path if IS_WINDOWS else cf.posix_path
-                )
+                live_cf = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
                 rescan_config_file_mappings.append(
                     _ConfigFileMappingIntent.model_validate(
                         {

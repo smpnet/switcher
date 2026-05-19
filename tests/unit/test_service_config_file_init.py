@@ -21,7 +21,6 @@ from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
-
 CLAUDE_CONFIG_FILE = ConfigFile(
     posix_path="~/.claude.json",
     windows_path="%USERPROFILE%\\.claude.json",
@@ -50,9 +49,7 @@ def registry() -> tuple[Tool, ...]:
 
 
 @pytest.fixture
-def service(
-    tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]
-) -> ProfileService:
+def service(tmp_home: Path, tmp_state: Path, registry: tuple[Tool, ...]) -> ProfileService:
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
     return ProfileService(store, resolver, registry)
@@ -78,9 +75,7 @@ def test_init_captures_live_config_file_to_default_profile(
     service.init(["claude"])
     active = service._store.get_active()
     default_profile = active["claude"]
-    snap_path = service._store.config_file_snapshot_path(
-        default_profile, "claude", "claude.json"
-    )
+    snap_path = service._store.config_file_snapshot_path(default_profile, "claude", "claude.json")
     snap = json.loads(snap_path.read_text())
     assert snap == {
         "mcpServers": {"installed": {"command": "x"}},
@@ -89,9 +84,7 @@ def test_init_captures_live_config_file_to_default_profile(
     }
 
 
-def test_init_handles_missing_live_config_file(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_init_handles_missing_live_config_file(service: ProfileService, tmp_home: Path) -> None:
     """Fresh-machine init: ~/.claude.json does not exist yet → snapshot is {}.
 
     Refusing to capture here would block init on a freshly installed Claude
@@ -101,15 +94,11 @@ def test_init_handles_missing_live_config_file(
     service.init(["claude"])
     active = service._store.get_active()
     default_profile = active["claude"]
-    snap_path = service._store.config_file_snapshot_path(
-        default_profile, "claude", "claude.json"
-    )
+    snap_path = service._store.config_file_snapshot_path(default_profile, "claude", "claude.json")
     assert json.loads(snap_path.read_text()) == {}
 
 
-def test_init_raises_on_malformed_live_config_file(
-    service: ProfileService, tmp_home: Path
-) -> None:
+def test_init_raises_on_malformed_live_config_file(service: ProfileService, tmp_home: Path) -> None:
     live = tmp_home / ".claude.json"
     live.write_text("not valid json {")
     with pytest.raises(StorageError):

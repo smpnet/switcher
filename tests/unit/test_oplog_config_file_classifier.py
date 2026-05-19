@@ -33,9 +33,7 @@ def _entry(
     # AbsolutePath needs a platform-appropriate canonical string. The
     # path doesn't have to point at an existing file — the classifier
     # only reads the snapshot side (profile_dir / .switcher / ...).
-    live_path = (
-        "C:\\Users\\test\\.claude.json" if IS_WINDOWS else "/Users/test/.claude.json"
-    )
+    live_path = "C:\\Users\\test\\.claude.json" if IS_WINDOWS else "/Users/test/.claude.json"
     return _ConfigFileMappingIntent(
         tool_id="claude",
         profile_subdir=profile_subdir,
@@ -53,17 +51,11 @@ def test_classifier_complete_when_snapshot_is_valid_json(tmp_path: Path) -> None
     snap = _snap(tmp_path)
     snap.parent.mkdir(parents=True)
     snap.write_text(json.dumps({"mcpServers": {}}))
-    assert (
-        classify_config_file_mapping(_entry(), tmp_path)
-        == ConfigFileDiskState.COMPLETE
-    )
+    assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.COMPLETE
 
 
 def test_classifier_untouched_when_snapshot_absent(tmp_path: Path) -> None:
-    assert (
-        classify_config_file_mapping(_entry(), tmp_path)
-        == ConfigFileDiskState.UNTOUCHED
-    )
+    assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.UNTOUCHED
 
 
 def test_classifier_ambiguous_when_snapshot_is_dir(tmp_path: Path) -> None:
@@ -71,10 +63,7 @@ def test_classifier_ambiguous_when_snapshot_is_dir(tmp_path: Path) -> None:
     writes are atomic file renames, never mkdir."""
     snap = _snap(tmp_path)
     snap.mkdir(parents=True)
-    assert (
-        classify_config_file_mapping(_entry(), tmp_path)
-        == ConfigFileDiskState.AMBIGUOUS
-    )
+    assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.AMBIGUOUS
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
@@ -86,10 +75,7 @@ def test_classifier_ambiguous_when_snapshot_is_symlink(tmp_path: Path) -> None:
     target = tmp_path / "target.json"
     target.write_text("{}")
     snap.symlink_to(target)
-    assert (
-        classify_config_file_mapping(_entry(), tmp_path)
-        == ConfigFileDiskState.AMBIGUOUS
-    )
+    assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.AMBIGUOUS
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
@@ -100,10 +86,7 @@ def test_classifier_ambiguous_when_snapshot_is_broken_symlink(tmp_path: Path) ->
     snap = _snap(tmp_path)
     snap.parent.mkdir(parents=True)
     snap.symlink_to(tmp_path / "does-not-exist.json")
-    assert (
-        classify_config_file_mapping(_entry(), tmp_path)
-        == ConfigFileDiskState.AMBIGUOUS
-    )
+    assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.AMBIGUOUS
 
 
 def test_classifier_ambiguous_when_snapshot_is_malformed_json(tmp_path: Path) -> None:
@@ -113,10 +96,7 @@ def test_classifier_ambiguous_when_snapshot_is_malformed_json(tmp_path: Path) ->
     snap = _snap(tmp_path)
     snap.parent.mkdir(parents=True)
     snap.write_text("not valid json {")
-    assert (
-        classify_config_file_mapping(_entry(), tmp_path)
-        == ConfigFileDiskState.AMBIGUOUS
-    )
+    assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.AMBIGUOUS
 
 
 @pytest.mark.parametrize(
@@ -142,10 +122,7 @@ def test_classifier_ambiguous_when_snapshot_is_valid_json_but_not_object(
     snap = _snap(tmp_path)
     snap.parent.mkdir(parents=True)
     snap.write_text(payload)
-    assert (
-        classify_config_file_mapping(_entry(), tmp_path)
-        == ConfigFileDiskState.AMBIGUOUS
-    )
+    assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.AMBIGUOUS
 
 
 def test_classifier_pure_read_no_mutations(tmp_path: Path) -> None:
