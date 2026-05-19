@@ -698,6 +698,84 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
     return MappingDiskState.AMBIGUOUS
 
 
+class ConfigFileDiskState(Enum):
+    """Per-ConfigFile on-disk state for op-log compensation (spec §3.7).
+
+    Three states partition the snapshot-path shape space:
+
+    - COMPLETE: snapshot is a regular file containing valid JSON —
+      ``_capture_config_files`` ran to completion for this entry.
+    - UNTOUCHED: snapshot file absent — the SIGKILL window between
+      intent-write and the atomic snapshot rename. ``--continue``
+      re-extracts from the (journaled) live_path; ``--abort`` is a
+      no-op.
+    - AMBIGUOUS: any non-regular-file shape (directory, symlink,
+      junction, special file) OR a regular file that fails to parse as
+      JSON. Refuse to compensate; surface to the user.
+
+    The dir-mapping classifier has four states because move +
+    swap_link is a two-step commit. ``_capture_config_files`` uses
+    ``atomic_write_file`` (write-temp + rename), a single commit point
+    — so the MOVE_DONE_LINK_MISSING shape that the dir classifier
+    needs has no analogue here. Two states "did we write it?" and
+    "is the write parseable?" are observable from one ``stat`` + one
+    ``json.loads`` call, which is what this function does.
+    """
+
+    COMPLETE = "complete"
+    UNTOUCHED = "untouched"
+    AMBIGUOUS = "ambiguous"
+
+
+def classify_config_file_mapping(
+    entry: _ConfigFileMappingIntent, profile_dir: Path
+) -> ConfigFileDiskState:
+    """Classify the on-disk state of a ConfigFile snapshot.
+
+    The snapshot path is derived structurally from the entry; the
+    classifier never trusts a stored snapshot path — the entry carries
+    only ``profile_subdir`` + ``profile_filename``, and the snapshot
+    layout (``<profile_dir>/.switcher/config_files/<subdir>/<filename>``)
+    is the single source of truth that every writer
+    (``FileProfileStore.config_file_snapshot_path``) routes through.
+
+    Pure read; no mutations. Mirrors ``classify_mapping`` in shape and
+    in being a pure observation of the live filesystem at compensation
+    time.
+
+    Args:
+        entry: the per-ConfigFile intent record.
+        profile_dir: the resolved ``<state_dir>/profiles/<profile_name>``
+            directory the op was targeting. Passed in explicitly so the
+            classifier doesn't take a Store reference.
+    """
+    snap_path = (
+        profile_dir
+        / ".switcher"
+        / "config_files"
+        / entry.profile_subdir
+        / entry.profile_filename
+    )
+    # `Path.exists()` returns False for a broken symlink; `Path.is_symlink()`
+    # returns True. Combine both to distinguish "absent" from "present in
+    # a corrupt shape". Without the is_symlink check, a broken-symlink
+    # snapshot would misclassify as UNTOUCHED and the --continue path
+    # would re-extract over it, silently destroying the link target.
+    if not snap_path.exists() and not snap_path.is_symlink():
+        return ConfigFileDiskState.UNTOUCHED
+    # is_file() follows symlinks, so an unbroken symlink to a real file
+    # would pass it; the explicit is_symlink() check rejects link
+    # shapes regardless of what they point at. ``_is_link`` covers
+    # Windows junctions too, mirroring the dir-mapping classifier.
+    if _is_link(snap_path) or not snap_path.is_file():
+        return ConfigFileDiskState.AMBIGUOUS
+    try:
+        json.loads(snap_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return ConfigFileDiskState.AMBIGUOUS
+    return ConfigFileDiskState.COMPLETE
+
+
 class OpLogIO:
     """Thin façade over ``<state_dir>/oplog.json``.
 
