@@ -95,7 +95,9 @@ def _freeze_now(monkeypatch: pytest.MonkeyPatch) -> datetime:
 def test_rescan_default_creates_fresh_profile_per_new_tool(
     tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Init claude only, then drop a copilot dir, then rescan → fresh profile for copilot."""
+    """tmp_home seeds claude + codex; this test suppresses copilot pre-init so
+    init captures claude + codex (not copilot). Then it materializes copilot
+    dirs and rescans → fresh profile mints for copilot."""
     frozen = _freeze_now(monkeypatch)
     s = _service(tmp_state, tmp_home)
     # Pretend copilot wasn't installed at init time.

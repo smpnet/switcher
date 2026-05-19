@@ -258,8 +258,11 @@ def test_use_pre_validates_target_subdirs_before_mutating(
     """A profile missing one tool's profile_subdir must fail before any swap.
 
     Setup: only seed 'claude' subdir; intentionally omit copilot's subdirs.
-    Sorted target order is ['claude', 'copilot'] — without pre-flight 2,
-    swap_link succeeds for claude (its subdir exists) and then raises on
+    The partial profile claims `{"claude": True, "copilot": True}`, so the
+    intersection with the active map restricts target_ids to claude and
+    copilot regardless of which other builtins are registered. Sorted
+    target order over those two is ['claude', 'copilot']: without pre-flight
+    2, swap_link succeeds for claude (its subdir exists) and then raises on
     copilot's missing subdir, leaving claude pointed at the partial profile.
     Pre-flight must reject the whole call without touching any link.
     """

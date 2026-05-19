@@ -57,6 +57,7 @@ def test_uninstall_default_restores_real_dirs_and_clears_active(
     # Every live path is now a real dir (no longer a link).
     for live in [
         tmp_home / ".claude",
+        tmp_home / ".codex",
         tmp_home / ".copilot",
         tmp_home / ".config" / "github-copilot",
     ]:

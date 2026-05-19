@@ -755,9 +755,9 @@ def test_interrupted_rename_auto_compensates_on_next_command(
     service = _service(tmp_state, tmp_home)
     service.init()
     active_before = store.get_active()
-    # conftest.tmp_home seeds both claude and copilot live paths, so
-    # init captures both. affected_ids needs to cover every tool whose
-    # active entry references the renaming profile — compensation
+    # conftest.tmp_home seeds claude, codex, and copilot live paths, so
+    # init captures all three. affected_ids needs to cover every tool
+    # whose active entry references the renaming profile — compensation
     # refuses on any orphan entry pointing at the rename endpoints.
     old_name = active_before["claude"]
     affected = sorted(tid for tid, prof in active_before.items() if prof == old_name)
