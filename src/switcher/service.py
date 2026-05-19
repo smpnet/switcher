@@ -63,12 +63,15 @@ from switcher.models import Profile, Tool
 # legitimate cross-module consumer that builds and dispatches them; the
 # per-line suppression keeps the convention without leaking module-wide.
 from switcher.oplog import (
+    ConfigFileDiskState,
     MappingDiskState,
     OpLogIO,
+    _ConfigFileMappingIntent,  # pyright: ignore[reportPrivateUsage]
     _InitOp,  # pyright: ignore[reportPrivateUsage]
     _MappingIntent,  # pyright: ignore[reportPrivateUsage]
     _RenameOp,  # pyright: ignore[reportPrivateUsage]
     _RescanOp,  # pyright: ignore[reportPrivateUsage]
+    classify_config_file_mapping,
     classify_mapping,
 )
 from switcher.paths import IS_WINDOWS, PathResolver
@@ -374,6 +377,113 @@ class ProfileService:
                 json.dumps(snapshot, indent=2, sort_keys=True).encode("utf-8"),
             )
 
+    def _extract_and_write_config_file_snapshot(
+        self,
+        *,
+        profile_name: str,
+        live_path: Path,
+        profile_subdir: str,
+        profile_filename: str,
+        tool_id: str,
+    ) -> None:
+        """Compensation-path counterpart to ``_capture_config_files``.
+
+        Re-extracts a single ConfigFile snapshot during op-log
+        ``--continue`` replay. Two differences from the capture path:
+
+        (a) ``live_path`` is the journal record's stored value, not
+            the registry-derived path. The journal is the authoritative
+            source for "which file was the op going to read" — if the
+            registry path changed between intent-write and recovery,
+            the rescan/init that the user is finishing should still
+            read the same file it intended.
+
+        (b) Spec §3.7 runtime check: the tool's CURRENT registry must
+            still carry a ConfigFile entry whose
+            ``(profile_subdir, profile_filename)`` matches the journal.
+            Registry drift since the op was recorded surfaces here as
+            ``OpLogCorruptError`` because compensation can't reason
+            about ``owned_json_paths`` for an entry that no longer
+            exists — silently extracting the whole live dict would be
+            data corruption, refusing without it would lose work, so
+            we surface the corruption and let the user restore the
+            registry or hand-edit the journal.
+
+        Live-side validation mirrors ``_capture_config_files`` byte-
+        for-byte. Keeping the rules identical means a clean init's
+        snapshot and a ``--continue`` replay's snapshot are
+        bit-identical for the same live state — exactly what idempotent
+        recovery needs.
+        """
+        tool = find_tool(self._registry, tool_id)
+        if tool is None:
+            raise OpLogCorruptError(
+                f"interrupted op continue: journal references unknown tool "
+                f"{tool_id!r}; restore the registry TOML or hand-edit the "
+                f"journal to remove the entry. Manual recovery required."
+            )
+        matching = [
+            cf
+            for cf in tool.config_files
+            if cf.profile_subdir == profile_subdir
+            and cf.profile_filename == profile_filename
+        ]
+        if not matching:
+            raise OpLogCorruptError(
+                f"interrupted op continue: journal references config_file "
+                f"({profile_subdir!r}, {profile_filename!r}) for tool "
+                f"{tool_id!r}, but the current registry has no such mapping. "
+                f"Manual recovery required."
+            )
+        cf = matching[0]
+
+        if live_path.is_symlink():
+            raise StorageError(
+                f"refusing to recapture ConfigFile through symlink at "
+                f"{live_path}; resolve the symlink (or remove it so the "
+                f"underlying path is readable) and re-run."
+            )
+        if live_path.exists() and not live_path.is_file():
+            kind = "directory" if live_path.is_dir() else "non-regular file"
+            raise StorageError(
+                f"expected regular file at {live_path}, got {kind}"
+            )
+        if live_path.exists():
+            try:
+                live_text = live_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as e:
+                raise StorageError(
+                    f"non-UTF-8 bytes at {live_path}: {e}"
+                ) from e
+            try:
+                live_data = json.loads(live_text)
+            except json.JSONDecodeError as e:
+                raise StorageError(
+                    f"malformed JSON at {live_path}: {e.msg} (line {e.lineno})"
+                ) from e
+            if not isinstance(live_data, dict):
+                raise StorageError(
+                    f"expected JSON object at {live_path}, got "
+                    f"{type(live_data).__name__}"
+                )
+            try:
+                snapshot = extract_owned_paths(live_data, cf.owned_json_paths)
+            except UnsupportedWalkTarget as e:
+                raise StorageError(
+                    f"owned path walks into a non-object value at "
+                    f"{live_path}: {e}"
+                ) from e
+        else:
+            snapshot = {}
+
+        snap_path = self._store.config_file_snapshot_path(
+            profile_name, profile_subdir, profile_filename
+        )
+        atomic_write_file(
+            snap_path,
+            json.dumps(snapshot, indent=2, sort_keys=True).encode("utf-8"),
+        )
+
     def _plan_config_file_applies(
         self, profile_name: str, tool: Tool
     ) -> list[tuple[Path, bytes]]:
@@ -403,8 +513,7 @@ class ProfileService:
 
         The Tool validator caps ``config_files`` at 1 in v0.1.5, so the
         list this returns is 0 or 1 entries; the loop shape is kept general
-        for forward-compat with the op-log work that lifts the cap (plan
-        Task 11).
+        for forward-compat with the future work that would lift the cap.
 
         The read of live happens immediately before the atomic rename in
         the caller — a concurrent Claude write between read and rename is
@@ -1290,6 +1399,28 @@ class ProfileService:
                         }
                     )
                 )
+        # ConfigFile intents — same canonicalization story as the dir
+        # mappings above: ``expand()`` resolves ``~`` / env vars, then
+        # ``os.path.normpath`` folds out any ``..`` segments so the
+        # journal's ``AbsolutePath`` validator accepts the string. A
+        # registry-side path with ``..`` would otherwise pass capture
+        # and only surface as load-time corruption on the recovery pass.
+        config_file_mappings: list[_ConfigFileMappingIntent] = []
+        for tool in installed:
+            for cf in tool.config_files:
+                live_cf = self._resolver.expand(
+                    cf.windows_path if IS_WINDOWS else cf.posix_path
+                )
+                config_file_mappings.append(
+                    _ConfigFileMappingIntent.model_validate(
+                        {
+                            "tool_id": tool.id,
+                            "profile_subdir": cf.profile_subdir,
+                            "profile_filename": cf.profile_filename,
+                            "live_path": os.path.normpath(str(live_cf)),
+                        }
+                    )
+                )
         intent = _InitOp.model_validate(
             {
                 "op": "init",
@@ -1297,6 +1428,7 @@ class ProfileService:
                 "target_ids": [t.id for t in installed],
                 "profile_name": current_name,
                 "mappings": mappings,
+                "config_file_mappings": config_file_mappings,
             }
         )
         oplog.append_record(intent)
@@ -1685,6 +1817,39 @@ class ProfileService:
             # an unknown state.
             raise AssertionError(f"unhandled mapping state {state}")
 
+        # ConfigFile replay (spec §3.7). Two-pass discipline mirrors
+        # the dir-mapping shape above: validate every entry first,
+        # then mutate. AMBIGUOUS snapshot (corrupt shape — directory,
+        # symlink, junction, or malformed JSON) refuses BEFORE any
+        # snapshot write, so we never partially overwrite a recoverable
+        # state. COMPLETE skips (idempotent); UNTOUCHED re-extracts
+        # from the journal's live_path via the registry-validated
+        # helper, which folds in the §3.7 runtime check.
+        for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init: config_file snapshot for tool "
+                    f"{cf_entry.tool_id!r} at "
+                    f"{profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
+                    f"on-disk state is ambiguous; manual recovery "
+                    f"required — see docs/RELEASE.md"
+                )
+        for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, profile_dir)
+            if state is ConfigFileDiskState.COMPLETE:
+                continue
+            if state is ConfigFileDiskState.UNTOUCHED:
+                self._extract_and_write_config_file_snapshot(
+                    profile_name=record.profile_name,
+                    live_path=Path(cf_entry.live_path),
+                    profile_subdir=cf_entry.profile_subdir,
+                    profile_filename=cf_entry.profile_filename,
+                    tool_id=cf_entry.tool_id,
+                )
+                continue
+            raise AssertionError(f"unhandled config_file state {state}")
+
         # Step 6: vanilla profile + credential seeding. Shape of
         # vanilla_dir was already validated in the first-pass scan; a
         # symlink / file at profiles/vanilla raised OpLogCorruptError
@@ -1960,6 +2125,40 @@ class ProfileService:
                     # disappearing between classification and mutation
                     # (race / external removal). CR pass-10 nit.
                     shutil.rmtree(target)
+
+        # ConfigFile abort (spec §3.7). Validation pass first — refuse
+        # on any AMBIGUOUS snapshot shape before any unlink runs (the
+        # validate-then-mutate discipline applies to snapshots the
+        # same way it does to dir mappings). Init never writes to
+        # live for ConfigFile (capture is read-only on live), so abort
+        # has no live-side restore to do — only the snapshot side.
+        #
+        # The profile-delete pass below would rmtree the whole profile
+        # dir and take the snapshots with it. The explicit unlink loop
+        # is defense in depth: it produces a tighter per-step audit
+        # trail, surfaces an unexpected per-snapshot failure as a
+        # localized error rather than buried inside rmtree's
+        # ignore_errors behaviour, and keeps init's abort shape
+        # symmetric with --into rescan abort (which preserves the
+        # profile dir and depends on per-snapshot unlink for cleanup).
+        for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init abort: config_file snapshot for "
+                    f"tool {cf_entry.tool_id!r} is in an ambiguous "
+                    f"state at "
+                    f"{profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}; "
+                    f"manual recovery required."
+                )
+        for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, profile_dir)
+            if state is ConfigFileDiskState.COMPLETE:
+                self._store.config_file_snapshot_path(
+                    record.profile_name,
+                    cf_entry.profile_subdir,
+                    cf_entry.profile_filename,
+                ).unlink(missing_ok=True)
 
         # Profile-delete. Both dated-current and vanilla — init
         # pre-flight requires `_store.list()` to be empty, so any
@@ -2502,6 +2701,49 @@ class ProfileService:
                 continue
             raise AssertionError(f"unhandled mapping state {state}")
 
+        # ConfigFile replay (spec §3.7). Same two-pass discipline as
+        # the init-continue counterpart: validate every entry for
+        # AMBIGUOUS shape first, then dispatch per-state. The
+        # registry runtime check rides inside
+        # ``_extract_and_write_config_file_snapshot`` so a registry
+        # that no longer carries the journaled
+        # ``(profile_subdir, profile_filename)`` pair surfaces as
+        # OpLogCorruptError rather than a silent extract-everything.
+        for cf_entry in record.config_file_mappings:
+            cf_profile_name = record.target_profiles.get(cf_entry.tool_id)
+            if cf_profile_name is None:
+                raise OpLogCorruptError(
+                    f"interrupted rescan continue: config_file mapping "
+                    f"references tool_id {cf_entry.tool_id!r} without a "
+                    f"target_profiles entry; manual recovery required"
+                )
+            cf_profile_dir = self._store.profile_dir(cf_profile_name)
+            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted rescan: config_file snapshot for tool "
+                    f"{cf_entry.tool_id!r} at "
+                    f"{cf_profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
+                    f"on-disk state is ambiguous; manual recovery "
+                    f"required — see docs/RELEASE.md"
+                )
+        for cf_entry in record.config_file_mappings:
+            cf_profile_name = record.target_profiles[cf_entry.tool_id]
+            cf_profile_dir = self._store.profile_dir(cf_profile_name)
+            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            if state is ConfigFileDiskState.COMPLETE:
+                continue
+            if state is ConfigFileDiskState.UNTOUCHED:
+                self._extract_and_write_config_file_snapshot(
+                    profile_name=cf_profile_name,
+                    live_path=Path(cf_entry.live_path),
+                    profile_subdir=cf_entry.profile_subdir,
+                    profile_filename=cf_entry.profile_filename,
+                    tool_id=cf_entry.tool_id,
+                )
+                continue
+            raise AssertionError(f"unhandled config_file state {state}")
+
         # Deferred metadata write for --into mode. Idempotent on the
         # post-write metadata shape; required when crash happened
         # before the original op's deferred update_profile_tools ran.
@@ -2718,6 +2960,44 @@ class ProfileService:
                     move_or_seed_dir(target, live)
                 elif intent.original_kind == "missing" and target.exists():
                     shutil.rmtree(target)
+
+        # ConfigFile abort (spec §3.7). Validate every entry first
+        # (AMBIGUOUS refusal), then unlink COMPLETE snapshots. For
+        # fresh-profile mode the cleanup loop below rmtree's the
+        # profile dir and would take the snapshots with it; for
+        # --into mode the profile dir is preserved, so per-snapshot
+        # unlink is load-bearing — without it, the next rescan into
+        # the same profile would trip the snapshot-collision check
+        # added in Task 10 even though the snapshot is no longer
+        # journal-owned.
+        for cf_entry in record.config_file_mappings:
+            cf_profile_name = record.target_profiles.get(cf_entry.tool_id)
+            if cf_profile_name is None:
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: config_file mapping "
+                    f"references tool_id {cf_entry.tool_id!r} without a "
+                    f"target_profiles entry; manual recovery required"
+                )
+            cf_profile_dir = self._store.profile_dir(cf_profile_name)
+            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: config_file snapshot for "
+                    f"tool {cf_entry.tool_id!r} is in an ambiguous state "
+                    f"at "
+                    f"{cf_profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}; "
+                    f"manual recovery required."
+                )
+        for cf_entry in record.config_file_mappings:
+            cf_profile_name = record.target_profiles[cf_entry.tool_id]
+            cf_profile_dir = self._store.profile_dir(cf_profile_name)
+            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            if state is ConfigFileDiskState.COMPLETE:
+                self._store.config_file_snapshot_path(
+                    cf_profile_name,
+                    cf_entry.profile_subdir,
+                    cf_entry.profile_filename,
+                ).unlink(missing_ok=True)
 
         # Per-profile cleanup. Fresh-profile mode deletes; --into mode
         # restores previous_tools.
@@ -3967,6 +4247,26 @@ class ProfileService:
         previous_tools_snapshot: dict[str, dict[str, bool]] | None = None
         if into is not None:
             previous_tools_snapshot = {into: dict(self._store.get(into).tools)}
+        # ConfigFile intents for rescan, parallel to the init branch.
+        # Canonicalize live_path via expand() + normpath so the
+        # AbsolutePath validator accepts the string and recovery sees
+        # the same canonical form a fresh rescan would compute.
+        rescan_config_file_mappings: list[_ConfigFileMappingIntent] = []
+        for tool in candidates:
+            for cf in tool.config_files:
+                live_cf = self._resolver.expand(
+                    cf.windows_path if IS_WINDOWS else cf.posix_path
+                )
+                rescan_config_file_mappings.append(
+                    _ConfigFileMappingIntent.model_validate(
+                        {
+                            "tool_id": tool.id,
+                            "profile_subdir": cf.profile_subdir,
+                            "profile_filename": cf.profile_filename,
+                            "live_path": os.path.normpath(str(live_cf)),
+                        }
+                    )
+                )
         intent = _RescanOp.model_validate(
             {
                 "op": "rescan",
@@ -3976,6 +4276,7 @@ class ProfileService:
                 "into_mode": into is not None,
                 "previous_tools": previous_tools_snapshot,
                 "mappings": rescan_mappings,
+                "config_file_mappings": rescan_config_file_mappings,
             }
         )
         oplog.append_record(intent)
