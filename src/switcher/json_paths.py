@@ -204,6 +204,84 @@ def _extract_into(
             _extract_into(v, rest, child_snap)
 
 
+def validate_snapshot_against_owned_paths(
+    snapshot: dict[str, Any], owned_paths: tuple[str, ...]
+) -> None:
+    """Validate ``snapshot``'s shape is compatible with ``owned_paths``.
+
+    Raises ``UnsupportedWalkTargetError`` if any owned-path's prefix
+    descends into a non-object value somewhere inside ``snapshot``.
+    Used by ``classify_config_file_mapping`` and ``_seed_config_files``
+    to surface corruption at the validation boundary instead of
+    deferring the failure to the first ``use()`` that walks the
+    snapshot (Hermes pass-PR-5).
+
+    A snapshot is shape-valid for an owned path iff, at every keyed
+    segment of the path, the corresponding node in the snapshot is
+    either absent OR a dict; and at every ``[]`` segment, the
+    corresponding node is a dict whose VALUES are themselves
+    shape-valid for the remaining segments. ``{"projects": []}`` is
+    rejected against ``.projects[].mcpServers`` because the iter
+    segment lands on a list rather than a dict.
+
+    Non-mutating: ``snapshot`` is walked, never modified.
+    """
+    for raw_path in owned_paths:
+        segments = parse_owned_path(raw_path)
+        _validate_snapshot_segments(snapshot, segments, raw_path)
+
+
+def _validate_snapshot_segments(
+    snap_node: Any, segments: tuple[_Segment, ...], raw_path: str
+) -> None:
+    """Walk ``segments`` against ``snap_node`` and raise on any
+    non-object descent target. See ``validate_snapshot_against_owned_paths``.
+    """
+    if not segments:
+        return
+    head, *tail = segments
+    rest: tuple[_Segment, ...] = tuple(tail)
+
+    if head[0] == "key":
+        key = head[1]
+        # The top level of the snapshot is required to be a dict by the
+        # classifier; deeper keyed segments tolerate either "key absent"
+        # (nothing to validate) or "key present and dict-shaped". A
+        # non-dict node at a non-leaf keyed segment is corruption — the
+        # owned path's prefix says "descend through a JSON object" but
+        # the snapshot has a scalar/list there.
+        if not isinstance(snap_node, dict):
+            raise UnsupportedWalkTargetError(
+                f"snapshot has non-object value at a keyed segment of "
+                f"{raw_path!r}; got {type(snap_node).__name__}"
+            )
+        if key not in snap_node:
+            return  # absent → snapshot has nothing to validate further
+        if not rest:
+            # Leaf — value can be anything (extract deep-copies whatever
+            # was at this position; apply writes it back as-is).
+            return
+        _validate_snapshot_segments(snap_node[key], rest, raw_path)
+    elif head[0] == "iter":
+        if not isinstance(snap_node, dict):
+            raise UnsupportedWalkTargetError(
+                f"snapshot has non-object value at iter segment of "
+                f"{raw_path!r}; got {type(snap_node).__name__}"
+            )
+        if not rest:
+            raise InvalidOwnedPathError(
+                f"v1 grammar does not allow '[]' as a leaf segment: {raw_path!r}"
+            )
+        for v in snap_node.values():
+            # Each iter-entry must continue to be walkable. If it's a
+            # scalar/list and the next segment is keyed, the extract-side
+            # gate ALSO skips silently (no placeholder created), so the
+            # snapshot would simply not contain such entries. Refuse if
+            # we find one — the snapshot was written by hand or by an
+            # incompatible writer.
+            _validate_snapshot_segments(v, rest, raw_path)
+
+
 def apply_owned_paths(
     live: dict[str, Any],
     snapshot: dict[str, Any],

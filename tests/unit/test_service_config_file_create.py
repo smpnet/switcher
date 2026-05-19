@@ -139,6 +139,111 @@ def test_create_rollback_removes_partial_profile_on_seed_failure(
     assert not service._store.profile_dir("profB").exists()
 
 
+def test_create_rejects_non_regular_file_at_source_snapshot(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """A directory at the source snapshot path is corruption — snapshot
+    writers always emit regular files. Refuse at the seed boundary
+    rather than propagate the wrong shape into the child profile.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"a": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    service.use("profA")
+
+    src_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    src_snap.unlink()
+    src_snap.mkdir()
+
+    with pytest.raises(StorageError, match="directory"):
+        service.create("profB")
+    assert not service._store.profile_dir("profB").exists()
+
+
+def test_create_rejects_non_utf8_source_snapshot(service: ProfileService, tmp_home: Path) -> None:
+    """Non-UTF-8 bytes at the source snapshot path are corruption —
+    snapshot writers always emit UTF-8 encoded JSON.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"a": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    service.use("profA")
+
+    src_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    # 0xff is an invalid UTF-8 start byte.
+    src_snap.write_bytes(b"\xff\xfe\xfd")
+
+    with pytest.raises(StorageError, match="non-UTF-8"):
+        service.create("profB")
+    assert not service._store.profile_dir("profB").exists()
+
+
+def test_create_rejects_malformed_json_source_snapshot(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"a": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    service.use("profA")
+
+    src_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    src_snap.write_text("not valid json {")
+
+    with pytest.raises(StorageError, match="malformed"):
+        service.create("profB")
+    assert not service._store.profile_dir("profB").exists()
+
+
+def test_create_rejects_non_object_source_snapshot(service: ProfileService, tmp_home: Path) -> None:
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"a": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    service.use("profA")
+
+    src_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    src_snap.write_text(json.dumps(["not", "an", "object"]))
+
+    with pytest.raises(StorageError, match="not a JSON object"):
+        service.create("profB")
+    assert not service._store.profile_dir("profB").exists()
+
+
+def test_create_rejects_shape_invalid_source_snapshot(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """Hermes pass-PR-5: a source snapshot that parses as a JSON object
+    but doesn't match the tool's ``owned_json_paths`` shape (e.g.,
+    ``{"projects": []}`` against ``.projects[].mcpServers``) must be
+    refused at the seed boundary. Pre-fix ``_seed_config_files`` only
+    checked top-level dict shape and ``shutil.copy2``'d the corrupt
+    snapshot into the child profile; the failure deferred to the first
+    ``use`` of that child, which would either silently delete owned
+    leaves on apply or raise mid-walk.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"a": {}}}))
+    service.init(["claude"])
+    service.save("profA")
+    # Switch active to profA so create() seeds from profA.
+    service.use("profA")
+
+    # Replace profA's snapshot with a parses-as-JSON-object but
+    # shape-incompatible payload. owned_json_paths includes
+    # ``.projects[].mcpServers``; ``projects`` as a list breaks the
+    # iter contract.
+    src_snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    src_snap.write_text(json.dumps({"projects": []}))
+
+    with pytest.raises(StorageError, match="shape-incompatible"):
+        service.create("profB")
+    # No partial profile left behind: create()'s rollback rmtrees on failure.
+    assert not service._store.profile_dir("profB").exists()
+
+
 @pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
 def test_create_rejects_symlink_at_source_snapshot(service: ProfileService, tmp_home: Path) -> None:
     """A symlink at the source snapshot path is corruption — snapshot

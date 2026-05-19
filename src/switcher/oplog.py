@@ -42,7 +42,12 @@ from pydantic import (
 )
 
 from switcher.errors import OpLogCorruptError, StorageError
-from switcher.json_paths import InvalidOwnedPathError, parse_owned_path
+from switcher.json_paths import (
+    InvalidOwnedPathError,
+    UnsupportedWalkTargetError,
+    parse_owned_path,
+    validate_snapshot_against_owned_paths,
+)
 from switcher.models import validate_absolute_path, validate_safe_name
 
 # StrictStr blocks str/int/bool coercion; Field(min_length=1) rejects
@@ -853,6 +858,19 @@ def classify_config_file_mapping(
     # at compensation time (abby r-batch4: detectable corruption must
     # surface at the boundary, not at a later use).
     if not isinstance(parsed, dict):
+        return ConfigFileDiskState.AMBIGUOUS
+    # Validate the snapshot's shape against the journaled owned-paths.
+    # A regular file that parses as a JSON object can still be
+    # structurally incompatible: a snapshot like ``{"projects": []}``
+    # with owned-path ``.projects[].mcpServers`` parses fine but the
+    # iter segment lands on a list, so a later ``use`` would either
+    # silently delete owned leaves from live or raise mid-apply.
+    # Surfacing that AT the classifier boundary keeps compensation
+    # from short-circuiting (marking the journal completed) while
+    # corruption persists in the on-disk snapshot (Hermes pass-PR-5).
+    try:
+        validate_snapshot_against_owned_paths(parsed, entry.owned_json_paths)
+    except (UnsupportedWalkTargetError, InvalidOwnedPathError):
         return ConfigFileDiskState.AMBIGUOUS
     return ConfigFileDiskState.COMPLETE
 

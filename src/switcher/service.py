@@ -45,9 +45,11 @@ from switcher.errors import (
     UnknownToolError,
 )
 from switcher.json_paths import (
+    InvalidOwnedPathError,
     UnsupportedWalkTargetError,
     apply_owned_paths,
     extract_owned_paths,
+    validate_snapshot_against_owned_paths,
 )
 from switcher.links import (
     atomic_write_file,
@@ -294,6 +296,21 @@ class ProfileService:
                 ) from e
             if not isinstance(src_data, dict):
                 raise StorageError(f"snapshot at {src} is not a JSON object")
+            # Validate the source snapshot's shape against the tool's
+            # current owned_json_paths. Pre-fix, ``_seed_config_files``
+            # only checked "is a dict" — a structurally-invalid object
+            # (e.g., ``{"projects": []}`` against ``.projects[].mcpServers``)
+            # would pass and get cloned into the child profile, with the
+            # failure deferred to the first ``use`` of that child. The
+            # apply/walker boundary already rejects shape-mismatched
+            # snapshots; mirror it at the seed boundary so corruption
+            # doesn't multiply across profiles (Hermes pass-PR-5).
+            try:
+                validate_snapshot_against_owned_paths(src_data, cf.owned_json_paths)
+            except (UnsupportedWalkTargetError, InvalidOwnedPathError) as e:
+                raise StorageError(
+                    f"snapshot at {src} is shape-incompatible with the tool's owned_json_paths: {e}"
+                ) from e
             # Write the already-validated bytes via atomic_write_file
             # instead of re-reading ``src`` through ``shutil.copy2``.
             # ``copy2`` would reopen the source file AFTER the
@@ -4200,10 +4217,7 @@ class ProfileService:
             # and the user is responsible — same as pre-fix.
             profile_name = active[tool_id]
             profile_dir = self._store.profile_dir(profile_name)
-            expected_subdirs = self._expected_subdirs_for(tool_id)
-            existing_subdirs = sorted(
-                sub for sub in expected_subdirs if (profile_dir / sub).is_dir()
-            )
+            config_file_root = profile_dir / ".switcher" / "config_files"
             # Same protection applied to ConfigFile snapshots under
             # ``.switcher/config_files/<subdir>/``. Pre-fix, the orphan-
             # force path only checked owned config_dir subtrees; an
@@ -4216,7 +4230,57 @@ class ProfileService:
             # (Tool validator enforces ``cf.profile_subdir in
             # config_dirs subdirs``), so the historical-subdir union
             # already bounds both sides.
-            config_file_root = profile_dir / ".switcher" / "config_files"
+            expected_subdirs: set[str] = set(self._expected_subdirs_for(tool_id))
+            if not expected_subdirs:
+                # Truly unknown orphan: no registry entry AND no
+                # historical anchor. _expected_subdirs_for returns an
+                # empty set, which would otherwise let on-disk state
+                # slip past the check entirely — both lists empty,
+                # ``skipped_orphan = True``, and ``uninstall --purge``
+                # later rmtree's whatever's there. Fall back to listing
+                # the actual subdirs under the profile dir and snapshot
+                # root so unknown orphans with on-disk presence are
+                # still flagged (CR pass-PR-5 major).
+                #
+                # CRITICAL: exclude subdirs that any OTHER tool in the
+                # registry or historical table claims. In a multi-tool
+                # profile, the dated-current dir contains subdirs for
+                # claude, copilot, etc. — those belong to THOSE tools,
+                # not to the orphan being force-unmanaged. Without the
+                # exclusion, the fallback would over-attribute and
+                # refuse force-unmanage even when the orphan itself
+                # has no on-disk presence. The orphan owns at most
+                # whatever is NOT claimed by a known sibling.
+                claimed_by_others: set[str] = set()
+                for other_tool in self._registry:
+                    if other_tool.id == tool_id:
+                        continue
+                    claimed_by_others.update(self._expected_subdirs_for(other_tool.id))
+                for hist_tool_id, hist_subdirs in _HISTORICAL_PROFILE_SUBDIRS.items():
+                    if hist_tool_id == tool_id:
+                        continue
+                    claimed_by_others.update(hist_subdirs)
+                # ``.switcher`` is the reserved snapshot subtree, never a
+                # config_dir subdir — exclude it from the top-level
+                # enumeration too.
+                with contextlib.suppress(OSError):
+                    expected_subdirs.update(
+                        child.name
+                        for child in profile_dir.iterdir()
+                        if child.is_dir()
+                        and child.name != ".switcher"
+                        and child.name not in claimed_by_others
+                    )
+                if config_file_root.is_dir():
+                    with contextlib.suppress(OSError):
+                        expected_subdirs.update(
+                            child.name
+                            for child in config_file_root.iterdir()
+                            if child.is_dir() and child.name not in claimed_by_others
+                        )
+            existing_subdirs = sorted(
+                sub for sub in expected_subdirs if (profile_dir / sub).is_dir()
+            )
             existing_config_file_subdirs = sorted(
                 sub for sub in expected_subdirs if (config_file_root / sub).is_dir()
             )

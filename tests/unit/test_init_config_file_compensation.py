@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,6 +32,15 @@ from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
+IS_WINDOWS = sys.platform == "win32"
+pytestmark = pytest.mark.skipif(
+    IS_WINDOWS,
+    reason=(
+        "directory symlinks via Path.symlink_to require elevation on Windows "
+        "(matches the convention used in test_oplog_config_file_classifier.py)"
+    ),
+)
+
 CLAUDE_CONFIG_FILE = ConfigFile(
     posix_path="~/.claude.json",
     windows_path="%USERPROFILE%\\.claude.json",
@@ -42,8 +52,10 @@ CLAUDE_CONFIG_FILE = ConfigFile(
 
 
 @pytest.fixture
-def registry() -> tuple[Tool, ...]:
-    base = build_registry(Path("/nonexistent"))
+def registry(tmp_path: Path) -> tuple[Tool, ...]:
+    # Guaranteed-missing directory under ``tmp_path`` keeps the fixture
+    # hermetic and platform-independent (CR pass-PR-5 minor).
+    base = build_registry(tmp_path / "missing-registry-dir")
     out: list[Tool] = []
     for t in base:
         if t.id == "claude":
@@ -270,7 +282,7 @@ def test_abort_unlinks_complete_snapshot(
 
 
 def test_continue_raises_corrupt_when_registry_drops_config_file(
-    tmp_home: Path, tmp_state: Path
+    tmp_home: Path, tmp_state: Path, tmp_path: Path
 ) -> None:
     """Spec §3.7 runtime registry check: if the tool's current
     ConfigFile registry list no longer carries the (profile_subdir,
@@ -285,7 +297,7 @@ def test_continue_raises_corrupt_when_registry_drops_config_file(
     # Local service whose registry has NO config_files for claude —
     # explicitly strip them via model_copy so the runtime check trips
     # even though the production claude.toml ships with the entry.
-    base = build_registry(Path("/nonexistent"))
+    base = build_registry(tmp_path / "missing-registry-dir")
     registry = tuple(
         t.model_copy(update={"config_files": ()}) if t.id == "claude" else t for t in base
     )
@@ -313,7 +325,9 @@ def test_continue_raises_corrupt_when_registry_drops_config_file(
         service.init(continue_=True)
 
 
-def test_continue_uses_journaled_owned_paths_not_registry(tmp_home: Path, tmp_state: Path) -> None:
+def test_continue_uses_journaled_owned_paths_not_registry(
+    tmp_home: Path, tmp_state: Path, tmp_path: Path
+) -> None:
     """Spec §3.7 idempotency: a registry that drifted its
     owned_json_paths between intent-write and recovery must NOT
     change the shape recovery extracts. The journal carries the
@@ -334,7 +348,7 @@ def test_continue_uses_journaled_owned_paths_not_registry(tmp_home: Path, tmp_st
         merge_strategy="json_subtree_merge",
         owned_json_paths=(".mcpServers", ".oauthAccount"),
     )
-    base = build_registry(Path("/nonexistent"))
+    base = build_registry(tmp_path / "missing-registry-dir")
     registry = tuple(
         t.model_copy(update={"config_files": (drifted_cf,)}) if t.id == "claude" else t
         for t in base
@@ -485,7 +499,7 @@ def test_continue_short_circuit_requires_config_file_snapshots_complete(
 
 
 def test_continue_writes_vanilla_snapshot_from_journal_when_registry_drops_config_files(
-    tmp_home: Path, tmp_state: Path
+    tmp_home: Path, tmp_state: Path, tmp_path: Path
 ) -> None:
     """abby r-batch4 round 3 blocker: a registry edit that removes
     the [[config_files]] entry between intent-write and recovery
@@ -496,7 +510,7 @@ def test_continue_writes_vanilla_snapshot_from_journal_when_registry_drops_confi
     feature was supposed to close.
     """
     # Registry has NO config_files for claude (drift since intent).
-    base = build_registry(Path("/nonexistent"))
+    base = build_registry(tmp_path / "missing-registry-dir")
     registry = tuple(
         t.model_copy(update={"config_files": ()}) if t.id == "claude" else t for t in base
     )

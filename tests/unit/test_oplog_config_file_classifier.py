@@ -125,6 +125,38 @@ def test_classifier_ambiguous_when_snapshot_is_valid_json_but_not_object(
     assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.AMBIGUOUS
 
 
+def test_classifier_ambiguous_when_snapshot_shape_mismatches_owned_paths(
+    tmp_path: Path,
+) -> None:
+    """Hermes pass-PR-5: a snapshot that parses as a JSON object but
+    has a non-object value where ``owned_json_paths`` says to descend
+    (e.g., ``{"projects": []}`` against ``.projects[].mcpServers``)
+    must classify AMBIGUOUS. Pre-fix the classifier returned COMPLETE
+    for any dict-shaped JSON, so compensation could short-circuit and
+    mark the journal completed while shape corruption persisted in
+    the on-disk snapshot — and the next ``use()`` would either
+    silently delete owned leaves from live or raise mid-apply.
+    """
+    snap = _snap(tmp_path)
+    snap.parent.mkdir(parents=True)
+    # Top-level is a dict (passes the existing object check), but
+    # ``projects`` is a list — the iter segment of
+    # ``.projects[].mcpServers`` lands on a non-object.
+    snap.write_text(json.dumps({"projects": []}))
+
+    # The default _entry() owns_json_paths is (".mcpServers",) which
+    # would NOT flag this snapshot. Pass an entry whose journaled
+    # owned path actually walks into ``projects``.
+    entry_with_iter = _ConfigFileMappingIntent(
+        tool_id="claude",
+        profile_subdir="claude",
+        profile_filename="claude.json",
+        live_path="C:\\Users\\test\\.claude.json" if IS_WINDOWS else "/Users/test/.claude.json",
+        owned_json_paths=(".projects[].mcpServers",),
+    )
+    assert classify_config_file_mapping(entry_with_iter, tmp_path) == ConfigFileDiskState.AMBIGUOUS
+
+
 def test_classifier_pure_read_no_mutations(tmp_path: Path) -> None:
     snap = _snap(tmp_path)
     snap.parent.mkdir(parents=True)

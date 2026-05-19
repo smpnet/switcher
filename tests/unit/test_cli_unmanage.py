@@ -289,6 +289,55 @@ def test_unmanage_force_succeeds_for_truly_unknown_orphan_tool(
     assert "fake_orphan_tool" not in service._store.get_active()
 
 
+def test_unmanage_force_refuses_unknown_orphan_with_on_disk_presence(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """CR pass-PR-5 major: a tool id with NO registry entry AND NO
+    historical fallback (``_expected_subdirs_for`` returns ``set()``)
+    used to slip past the orphan-force safety check entirely — both
+    subdir lists were empty and ``skipped_orphan`` went True. If the
+    profile actually had on-disk data (config_dir subdir OR ConfigFile
+    snapshot) for that unknown tool, a later ``uninstall --purge``
+    would rmtree it silently.
+
+    The fix falls back to enumerating actual subdirs under the active
+    profile dir + ``.switcher/config_files/`` when the registry/
+    historical anchor is empty.
+    """
+    import pytest as _pytest
+
+    from switcher.errors import UninstallPreflightError
+    from switcher.paths import PathResolver
+    from switcher.registry import build_registry
+    from switcher.service import ProfileService
+    from switcher.store import FileProfileStore
+
+    full_registry = build_registry(tmp_state / "registry.d")
+    service = ProfileService(
+        FileProfileStore(tmp_state),
+        PathResolver(home=tmp_home),
+        full_registry,
+    )
+    service.init()
+    active = service._store.get_active()
+    profile_name = next(iter(active.values()))
+    profile_dir = service._store.profile_dir(profile_name)
+    new_active = dict(active)
+    new_active["fake_orphan_tool"] = profile_name
+    cache = service._store.get_active_live_paths()
+    service._store.set_active_state(new_active, dict(cache))
+
+    # Plant on-disk state for the unknown orphan: a config_dir subdir
+    # name the registry has never heard of.
+    (profile_dir / "fake-orphan-subdir").mkdir()
+    (profile_dir / "fake-orphan-subdir" / "data.json").write_text("{}")
+
+    with _pytest.raises(UninstallPreflightError, match="still has profile data"):
+        service.unmanage("fake_orphan_tool", force=True)
+    # active map unchanged — refusal preserves the purge guard.
+    assert "fake_orphan_tool" in service._store.get_active()
+
+
 def test_unmanage_force_dry_run_orphan_does_not_say_already_restored(
     tmp_home: Path, tmp_state: Path
 ) -> None:
