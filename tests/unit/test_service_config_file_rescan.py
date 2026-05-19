@@ -29,7 +29,6 @@ from switcher.registry import build_registry
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
-
 CLAUDE_CONFIG_FILE = ConfigFile(
     posix_path="~/.claude.json",
     windows_path="%USERPROFILE%\\.claude.json",

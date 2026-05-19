@@ -280,10 +280,13 @@ def test_continue_raises_corrupt_when_registry_drops_config_file(
     switcher binary whose registry predates the entry.
     """
     # Local service whose registry has NO config_files for claude —
-    # the journal still references one (planted below), so the
-    # runtime check must trip.
-    base = build_registry(Path("/nonexistent"))  # no ConfigFile injection
-    registry = tuple(base)
+    # explicitly strip them via model_copy so the runtime check trips
+    # even though the production claude.toml ships with the entry.
+    base = build_registry(Path("/nonexistent"))
+    registry = tuple(
+        t.model_copy(update={"config_files": ()}) if t.id == "claude" else t
+        for t in base
+    )
     store = FileProfileStore(tmp_state)
     resolver = PathResolver(home=tmp_home)
     service = ProfileService(store, resolver, registry)
