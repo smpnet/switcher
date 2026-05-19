@@ -193,8 +193,8 @@ jobs:
       # normalization the same way, so an exact string match after stripping
       # is the right contract.
       #
-      # `switcher tools` exercises the entry point and confirms the built-in
-      # TOMLs (claude.toml, copilot.toml) are present in the wheel.
+      # `switcher tools` exercises the entry point and confirms the bundled
+      # built-in TOMLs (under `src/switcher/builtins/`) are present in the wheel.
       - name: Wheel install smoke test
         run: |
           # The "Verify dist contents" step above already enforces exactly
