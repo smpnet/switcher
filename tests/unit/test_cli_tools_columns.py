@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 
 from switcher.cli import _build_tools_table_rows, app, get_deps
 from switcher.paths import IS_WINDOWS
+from switcher.registry import load_builtin_tools
 
 runner = CliRunner()
 
@@ -122,12 +123,9 @@ def test_status_on_empty_active_map(tmp_home: Path, tmp_state: Path) -> None:
     """Initialized + every tool unmanaged → suggest rescan (spec §3.5)."""
     init_result = runner.invoke(app, ["init"])
     assert init_result.exit_code == 0, _combined(init_result)
-    unmanage_claude = runner.invoke(app, ["unmanage", "claude"])
-    assert unmanage_claude.exit_code == 0, _combined(unmanage_claude)
-    unmanage_codex = runner.invoke(app, ["unmanage", "codex"])
-    assert unmanage_codex.exit_code == 0, _combined(unmanage_codex)
-    unmanage_copilot = runner.invoke(app, ["unmanage", "copilot"])
-    assert unmanage_copilot.exit_code == 0, _combined(unmanage_copilot)
+    for tool in load_builtin_tools():
+        unmanage_result = runner.invoke(app, ["unmanage", tool.id])
+        assert unmanage_result.exit_code == 0, _combined(unmanage_result)
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0
     out = result.output.lower()

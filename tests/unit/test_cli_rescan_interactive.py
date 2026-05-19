@@ -10,6 +10,7 @@ from click.testing import Result
 from typer.testing import CliRunner
 
 from switcher.cli import app, get_deps
+from switcher.registry import load_builtin_tools
 
 runner = CliRunner()
 
@@ -54,29 +55,31 @@ def test_rescan_all_and_only_mutually_exclusive(tmp_home: Path, tmp_state: Path)
 def test_rescan_tty_prompt_accepts_all(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """init-only-copilot leaves claude AND codex unmanaged; rescan prompts for
-    each in registry order (alphabetical-by-filename: claude → codex). Two
-    default-Y answers capture both."""
+    """init-only-copilot leaves every other builtin unmanaged; rescan prompts
+    for each in registry order (alphabetical-by-filename). One default-Y answer
+    per unmanaged builtin captures them all."""
     _setup_init_only_copilot()
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["rescan"], input="\n\n")
+    unmanaged_ids = [t.id for t in load_builtin_tools() if t.id != "copilot"]
+    result = runner.invoke(app, ["rescan"], input="\n" * len(unmanaged_ids))
     assert result.exit_code == 0, result.output
     active = get_deps().store.get_active()
-    assert "claude" in active
-    assert "codex" in active
+    for tid in unmanaged_ids:
+        assert tid in active
 
 
 def test_rescan_tty_prompt_rejects_all(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two `n` answers reject both unmanaged tools."""
+    """One `n` answer per unmanaged builtin rejects every prompt."""
     _setup_init_only_copilot()
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["rescan"], input="n\nn\n")
+    unmanaged_ids = [t.id for t in load_builtin_tools() if t.id != "copilot"]
+    result = runner.invoke(app, ["rescan"], input="n\n" * len(unmanaged_ids))
     assert result.exit_code == 0, result.output
     active = get_deps().store.get_active()
-    assert "claude" not in active
-    assert "codex" not in active
+    for tid in unmanaged_ids:
+        assert tid not in active
 
 
 def test_rescan_non_tty_warns_and_captures_all(
@@ -213,12 +216,14 @@ def test_rescan_into_tty_prompt_path(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """--into P with no --only/--all on TTY: prompt the user, then capture
-    accepted tools into P. Two unmanaged tools (claude + codex) → two answers."""
+    accepted tools into P. One default-Y per unmanaged builtin (every builtin
+    except the copilot the setup pinned)."""
     _setup_init_only_copilot()
     _setup_create("shared")
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["rescan", "--into", "shared"], input="\n\n")
+    unmanaged_ids = [t.id for t in load_builtin_tools() if t.id != "copilot"]
+    result = runner.invoke(app, ["rescan", "--into", "shared"], input="\n" * len(unmanaged_ids))
     assert result.exit_code == 0, result.output
     active = get_deps().store.get_active()
-    assert active.get("claude") == "shared"
-    assert active.get("codex") == "shared"
+    for tid in unmanaged_ids:
+        assert active.get(tid) == "shared"
