@@ -1940,21 +1940,30 @@ class ProfileService:
             if tool is None:
                 continue
             self._seed_credentials(record.profile_name, "vanilla", tool)
-            # Mirror init's vanilla-snapshot write (CR r-batch4 major).
-            # Idempotent: an already-written ``{}`` re-writes the same
-            # bytes via atomic rename. Skipping this on continue would
-            # leave the first ``switcher use vanilla`` falling into
-            # the snapshot-missing warn-and-skip branch, defeating the
-            # isolation contract for the vanilla profile in exactly
-            # the recovery scenarios the journal is meant to harden.
-            for cf in tool.config_files:
-                snap_path = self._store.config_file_snapshot_path(
-                    "vanilla", cf.profile_subdir, cf.profile_filename
-                )
-                atomic_write_file(
-                    snap_path,
-                    json.dumps({}, indent=2, sort_keys=True).encode("utf-8"),
-                )
+
+        # Vanilla-snapshot write driven from the JOURNAL, not from the
+        # current registry (CR r-batch4 major + abby r-batch4 round 3
+        # follow-up). A registry edit between intent-write and recovery
+        # that removed the ``[[config_files]]`` block would otherwise
+        # let continue succeed without writing vanilla's snapshot —
+        # next ``switcher use vanilla`` falls into the snapshot-missing
+        # warn-and-skip branch and silently leaves user MCPs in live.
+        # Reading from ``record.config_file_mappings`` keeps recovery
+        # faithful to the interrupted init regardless of later
+        # registry drift.
+        #
+        # Vanilla content is structurally ``{}`` (factory-fresh: no
+        # MCPs, no oauth account, no per-project state), so no
+        # owned_json_paths walker is needed — only the (subdir,
+        # filename) location, which the journal carries.
+        for cf_entry in record.config_file_mappings:
+            snap_path = self._store.config_file_snapshot_path(
+                "vanilla", cf_entry.profile_subdir, cf_entry.profile_filename
+            )
+            atomic_write_file(
+                snap_path,
+                json.dumps({}, indent=2, sort_keys=True).encode("utf-8"),
+            )
 
         # Step 7: active map + live-paths cache, one atomic write. Both
         # maps cover the SAME set — `record.target_ids` — so the

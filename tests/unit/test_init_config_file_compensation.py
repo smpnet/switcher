@@ -393,3 +393,69 @@ def test_continue_uses_journaled_owned_paths_not_registry(
     # changes — exactly the non-idempotent recovery abby flagged.
     assert "mcpServers" in extracted
     assert "oauthAccount" not in extracted
+
+
+def test_continue_writes_vanilla_snapshot_from_journal_when_registry_drops_config_files(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """abby r-batch4 round 3 blocker: a registry edit that removes
+    the [[config_files]] entry between intent-write and recovery
+    must NOT let continue skip writing the vanilla snapshot. Without
+    journal-driven vanilla writes, the next ``use vanilla`` would
+    fall into the snapshot-missing warn-and-skip branch and silently
+    leave the user's MCPs in live — the exact isolation gap the
+    feature was supposed to close.
+    """
+    # Registry has NO config_files for claude (drift since intent).
+    base = build_registry(Path("/nonexistent"))
+    registry = tuple(
+        t.model_copy(update={"config_files": ()}) if t.id == "claude" else t
+        for t in base
+    )
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, registry)
+
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"x": {}}}))
+
+    profile_name = "2026-05-19-current"
+    store.create(profile_name, {"claude": True})
+    profile_dir = store.profile_dir(profile_name)
+    _stage_completed_dir_mapping(tmp_home, profile_dir)
+
+    # Pretend the current-profile snapshot was written before the crash
+    # (COMPLETE state). The next thing init would have done was create
+    # vanilla and write its empty snapshot — that's what compensation
+    # has to finish.
+    current_snap = store.config_file_snapshot_path(
+        profile_name, "claude", "claude.json"
+    )
+    current_snap.parent.mkdir(parents=True, exist_ok=True)
+    current_snap.write_text(json.dumps({"mcpServers": {"x": {}}}))
+
+    # Journal carries the entry — original intent was to manage
+    # ~/.claude.json — even though the current registry no longer
+    # mentions config_files for claude.
+    record = _make_init_record(
+        profile_name,
+        target_ids=["claude"],
+        mappings=[_claude_mapping(tmp_home)],
+        config_file_mappings=[_claude_cf_mapping(tmp_home)],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(continue_=True)
+
+    # Vanilla snapshot must exist and be empty `{}` — the journal
+    # drove the write even though the registry no longer carries the
+    # ConfigFile entry.
+    vanilla_snap = store.config_file_snapshot_path(
+        "vanilla", "claude", "claude.json"
+    )
+    assert vanilla_snap.exists(), (
+        "vanilla snapshot must be written from journal, not from the "
+        "current registry — recovery must remain faithful to the "
+        "interrupted init regardless of later registry drift"
+    )
+    assert json.loads(vanilla_snap.read_text()) == {}
