@@ -26,11 +26,11 @@ profile_subdir = "gemini"
 """
 
 
-def test_load_builtins_includes_claude_and_copilot() -> None:
+def test_load_builtins_includes_day_one_tools() -> None:
     """Subset assertion so adding new builtins later doesn't trip the test
     on legitimate growth — we only care that the day-one set is loaded."""
     ids = {t.id for t in load_builtin_tools()}
-    assert {"claude", "copilot"} <= ids
+    assert {"claude", "copilot", "codex"} <= ids
 
 
 def test_load_user_tools_empty_when_no_dir(tmp_path: Path) -> None:
@@ -69,7 +69,7 @@ def test_build_registry_merges_builtins_and_user(tmp_path: Path) -> None:
     (rd / "gemini.toml").write_text(USER_TOOL, encoding="utf-8")
     tools = build_registry(rd)
     ids = sorted(t.id for t in tools)
-    assert ids == ["claude", "copilot", "gemini"]
+    assert ids == ["claude", "codex", "copilot", "gemini"]
 
 
 def test_build_registry_user_overrides_builtin(
