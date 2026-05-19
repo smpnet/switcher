@@ -41,12 +41,14 @@ def _cf_mapping(
     profile_subdir: str = "claude",
     profile_filename: str = "claude.json",
     live_path: str = "/Users/test/.claude.json",
+    owned_json_paths: tuple[str, ...] = (".mcpServers",),
 ) -> _ConfigFileMappingIntent:
     return _ConfigFileMappingIntent(
         tool_id=tool_id,
         profile_subdir=profile_subdir,
         profile_filename=profile_filename,
         live_path=live_path,
+        owned_json_paths=owned_json_paths,
     )
 
 
@@ -137,6 +139,7 @@ def test_cf_mapping_rejects_unsafe_subdir() -> None:
             profile_subdir="../escape",
             profile_filename="claude.json",
             live_path="/Users/test/.claude.json",
+            owned_json_paths=(".mcpServers",),
         )
 
 
@@ -147,6 +150,7 @@ def test_cf_mapping_rejects_unsafe_filename() -> None:
             profile_subdir="claude",
             profile_filename="../escape.json",
             live_path="/Users/test/.claude.json",
+            owned_json_paths=(".mcpServers",),
         )
 
 
@@ -159,4 +163,40 @@ def test_cf_mapping_rejects_relative_live_path() -> None:
             profile_subdir="claude",
             profile_filename="claude.json",
             live_path="relative/path.json",
+            owned_json_paths=(".mcpServers",),
         )
+
+
+def test_cf_mapping_requires_owned_json_paths() -> None:
+    """owned_json_paths is the journaled walker contract — recovery
+    must use the original op's intended paths, not whatever the
+    current registry says. Missing the field is corruption.
+    """
+    with pytest.raises(ValidationError, match="owned_json_paths"):
+        _ConfigFileMappingIntent.model_validate(
+            {
+                "tool_id": "claude",
+                "profile_subdir": "claude",
+                "profile_filename": "claude.json",
+                "live_path": "/Users/test/.claude.json",
+            }
+        )
+
+
+def test_cf_mapping_preserves_owned_json_paths_across_roundtrip() -> None:
+    """The journaled walker contract must roundtrip exactly so
+    compensation extracts the same shape on replay (abby r-batch4)."""
+    entry = _ConfigFileMappingIntent(
+        tool_id="claude",
+        profile_subdir="claude",
+        profile_filename="claude.json",
+        live_path="/Users/test/.claude.json",
+        owned_json_paths=(".mcpServers", ".projects[].mcpServers", ".oauthAccount"),
+    )
+    dumped = entry.model_dump()
+    restored = _ConfigFileMappingIntent.model_validate(dumped)
+    assert restored.owned_json_paths == (
+        ".mcpServers",
+        ".projects[].mcpServers",
+        ".oauthAccount",
+    )

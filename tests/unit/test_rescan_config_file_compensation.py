@@ -91,6 +91,11 @@ def _claude_cf_mapping(tmp_home: Path) -> _ConfigFileMappingIntent:
             "profile_subdir": "claude",
             "profile_filename": "claude.json",
             "live_path": str(tmp_home / ".claude.json"),
+            "owned_json_paths": (
+                ".mcpServers",
+                ".projects[].mcpServers",
+                ".oauthAccount",
+            ),
         }
     )
 

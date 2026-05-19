@@ -385,11 +385,12 @@ class ProfileService:
         profile_subdir: str,
         profile_filename: str,
         tool_id: str,
+        owned_json_paths: tuple[str, ...],
     ) -> None:
         """Compensation-path counterpart to ``_capture_config_files``.
 
         Re-extracts a single ConfigFile snapshot during op-log
-        ``--continue`` replay. Two differences from the capture path:
+        ``--continue`` replay. Three differences from the capture path:
 
         (a) ``live_path`` is the journal record's stored value, not
             the registry-derived path. The journal is the authoritative
@@ -398,16 +399,25 @@ class ProfileService:
             the rescan/init that the user is finishing should still
             read the same file it intended.
 
-        (b) Spec §3.7 runtime check: the tool's CURRENT registry must
+        (b) ``owned_json_paths`` comes from the journal too (passed in
+            by the caller from ``_ConfigFileMappingIntent``). The
+            registry's current owned-paths list might have changed
+            between intent-write and recovery — switcher upgrade,
+            registry override edit — and using the current list would
+            silently extract a different shape than the original op
+            intended. abby r-batch4 blocker: idempotent recovery
+            requires the walker contract to come from the journal,
+            not from whatever the registry says today.
+
+        (c) Spec §3.7 runtime check: the tool's CURRENT registry must
             still carry a ConfigFile entry whose
             ``(profile_subdir, profile_filename)`` matches the journal.
-            Registry drift since the op was recorded surfaces here as
-            ``OpLogCorruptError`` because compensation can't reason
-            about ``owned_json_paths`` for an entry that no longer
-            exists — silently extracting the whole live dict would be
-            data corruption, refusing without it would lose work, so
-            we surface the corruption and let the user restore the
-            registry or hand-edit the journal.
+            Registry drift on the tuple identity surfaces here as
+            ``OpLogCorruptError`` — distinct from owned-paths drift
+            (handled by journaling, above) because a missing tuple
+            means the user removed the file from management entirely;
+            compensation can't reason about whether to extract,
+            unlink, or refuse without that anchor.
 
         Live-side validation mirrors ``_capture_config_files`` byte-
         for-byte. Keeping the rules identical means a clean init's
@@ -435,7 +445,6 @@ class ProfileService:
                 f"{tool_id!r}, but the current registry has no such mapping. "
                 f"Manual recovery required."
             )
-        cf = matching[0]
 
         if live_path.is_symlink():
             raise StorageError(
@@ -467,7 +476,7 @@ class ProfileService:
                     f"{type(live_data).__name__}"
                 )
             try:
-                snapshot = extract_owned_paths(live_data, cf.owned_json_paths)
+                snapshot = extract_owned_paths(live_data, owned_json_paths)
             except UnsupportedWalkTarget as e:
                 raise StorageError(
                     f"owned path walks into a non-object value at "
@@ -1418,6 +1427,7 @@ class ProfileService:
                             "profile_subdir": cf.profile_subdir,
                             "profile_filename": cf.profile_filename,
                             "live_path": os.path.normpath(str(live_cf)),
+                            "owned_json_paths": tuple(cf.owned_json_paths),
                         }
                     )
                 )
@@ -1490,6 +1500,22 @@ class ProfileService:
         self._store.create("vanilla", {t.id: True for t in installed})
         for tool in installed:
             self._seed_credentials(current_name, "vanilla", tool)
+            # vanilla represents factory-fresh state — write an empty
+            # owned-subtree snapshot for each ConfigFile so the first
+            # ``switcher use vanilla`` actually clears the owned
+            # subtrees on live (CR r-batch4 major). Without this,
+            # _plan_config_file_applies hits the snapshot-missing
+            # warn-and-skip branch and leaves the user's MCPs / oauth
+            # in live — silently defeating the isolation contract for
+            # the vanilla profile that the rest of init enforces.
+            for cf in tool.config_files:
+                snap_path = self._store.config_file_snapshot_path(
+                    "vanilla", cf.profile_subdir, cf.profile_filename
+                )
+                atomic_write_file(
+                    snap_path,
+                    json.dumps({}, indent=2, sort_keys=True).encode("utf-8"),
+                )
         # Single atomic write of both keys — never set_active then
         # set_active_live_paths separately (crash window).
         active = {t.id: current_name for t in installed}
@@ -1846,6 +1872,7 @@ class ProfileService:
                     profile_subdir=cf_entry.profile_subdir,
                     profile_filename=cf_entry.profile_filename,
                     tool_id=cf_entry.tool_id,
+                    owned_json_paths=cf_entry.owned_json_paths,
                 )
                 continue
             raise AssertionError(f"unhandled config_file state {state}")
@@ -1913,6 +1940,21 @@ class ProfileService:
             if tool is None:
                 continue
             self._seed_credentials(record.profile_name, "vanilla", tool)
+            # Mirror init's vanilla-snapshot write (CR r-batch4 major).
+            # Idempotent: an already-written ``{}`` re-writes the same
+            # bytes via atomic rename. Skipping this on continue would
+            # leave the first ``switcher use vanilla`` falling into
+            # the snapshot-missing warn-and-skip branch, defeating the
+            # isolation contract for the vanilla profile in exactly
+            # the recovery scenarios the journal is meant to harden.
+            for cf in tool.config_files:
+                snap_path = self._store.config_file_snapshot_path(
+                    "vanilla", cf.profile_subdir, cf.profile_filename
+                )
+                atomic_write_file(
+                    snap_path,
+                    json.dumps({}, indent=2, sort_keys=True).encode("utf-8"),
+                )
 
         # Step 7: active map + live-paths cache, one atomic write. Both
         # maps cover the SAME set — `record.target_ids` — so the
@@ -2740,6 +2782,7 @@ class ProfileService:
                     profile_subdir=cf_entry.profile_subdir,
                     profile_filename=cf_entry.profile_filename,
                     tool_id=cf_entry.tool_id,
+                    owned_json_paths=cf_entry.owned_json_paths,
                 )
                 continue
             raise AssertionError(f"unhandled config_file state {state}")
@@ -4185,11 +4228,19 @@ class ProfileService:
                 # (an older save / a partial uninstall) — overwriting it
                 # would silently destroy the previously-captured MCP /
                 # oauth subtree (spec §3.8).
+                #
+                # ``exists() or is_symlink()`` so a broken (dangling)
+                # symlink at the snapshot path doesn't slip past the
+                # check — Path.exists() returns False for a broken
+                # symlink, but the classifier already treats any link
+                # shape at the snapshot path as AMBIGUOUS corruption.
+                # Refusing here keeps preflight consistent with the
+                # compensation rules (abby r-batch4 nit).
                 for cf in tool.config_files:
                     snap = self._store.config_file_snapshot_path(
                         into, cf.profile_subdir, cf.profile_filename
                     )
-                    if snap.exists():
+                    if snap.exists() or snap.is_symlink():
                         raise RescanCaptureError(
                             f"profile {into!r} already has a config_file "
                             f"snapshot at {snap} (would overwrite)"
@@ -4264,6 +4315,7 @@ class ProfileService:
                             "profile_subdir": cf.profile_subdir,
                             "profile_filename": cf.profile_filename,
                             "live_path": os.path.normpath(str(live_cf)),
+                            "owned_json_paths": tuple(cf.owned_json_paths),
                         }
                     )
                 )

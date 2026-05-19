@@ -180,6 +180,19 @@ class _ConfigFileMappingIntent(BaseModel):
     AbsolutePath rejects ``..`` segments, so a non-canonicalized
     expansion would fail validation at intent-write time rather than
     silently slipping into the journal.
+
+    ``owned_json_paths`` snapshots the EXACT walker contract that
+    capture was supposed to use, copied from the registry's
+    ``ConfigFile.owned_json_paths`` at intent-write time. Recovery
+    replays from this journaled list rather than re-reading the
+    current registry, so a registry edit between intent-write and
+    recovery (e.g., switcher upgrade that changes which subtrees are
+    owned for the same ``(profile_subdir, profile_filename)`` pair)
+    cannot silently change the shape of the snapshot the original op
+    intended. abby r-batch4 blocker: the runtime registry check
+    confirms the tuple still exists, but without this field the
+    extracted shape would drift across version changes — non-
+    idempotent recovery.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -187,6 +200,10 @@ class _ConfigFileMappingIntent(BaseModel):
     profile_subdir: SafeName
     profile_filename: SafeName
     live_path: AbsolutePath
+    # Tuple — frozen alongside the BaseModel's ``frozen=True`` config.
+    # Strings stay un-aliased; the walker's parse step is the boundary
+    # that validates each path expression.
+    owned_json_paths: tuple[str, ...]
 
 
 def _check_config_file_mappings_against_target_ids(
@@ -770,8 +787,19 @@ def classify_config_file_mapping(
     if _is_link(snap_path) or not snap_path.is_file():
         return ConfigFileDiskState.AMBIGUOUS
     try:
-        json.loads(snap_path.read_text(encoding="utf-8"))
+        parsed = json.loads(snap_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
+        return ConfigFileDiskState.AMBIGUOUS
+    # ``_capture_config_files`` / ``_extract_and_write_config_file_snapshot``
+    # always emit a JSON object — the snapshot is an extract of owned
+    # subtrees keyed by name. A parseable-but-wrong shape (``[]``, ``"x"``,
+    # ``null``, ``42``, ...) is corruption from our perspective: the apply
+    # side rejects non-object snapshots with StorageError, so classifying
+    # such a file as COMPLETE would defer a detectable corruption to a
+    # later ``use`` and silently preserve / unlink the wrong-shape state
+    # at compensation time (abby r-batch4: detectable corruption must
+    # surface at the boundary, not at a later use).
+    if not isinstance(parsed, dict):
         return ConfigFileDiskState.AMBIGUOUS
     return ConfigFileDiskState.COMPLETE
 

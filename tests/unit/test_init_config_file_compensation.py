@@ -85,6 +85,11 @@ def _claude_cf_mapping(tmp_home: Path) -> _ConfigFileMappingIntent:
             "profile_subdir": "claude",
             "profile_filename": "claude.json",
             "live_path": str(tmp_home / ".claude.json"),
+            "owned_json_paths": (
+                ".mcpServers",
+                ".projects[].mcpServers",
+                ".oauthAccount",
+            ),
         }
     )
 
@@ -309,3 +314,82 @@ def test_continue_raises_corrupt_when_registry_drops_config_file(
 
     with pytest.raises(OpLogCorruptError, match="config_file"):
         service.init(continue_=True)
+
+
+def test_continue_uses_journaled_owned_paths_not_registry(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """Spec §3.7 idempotency: a registry that drifted its
+    owned_json_paths between intent-write and recovery must NOT
+    change the shape recovery extracts. The journal carries the
+    walker contract; the registry's current value is consulted only
+    for the (subdir, filename) tuple anchor (abby r-batch4 blocker).
+
+    Concretely: journal carries ``.mcpServers`` only; the live
+    registry has added ``.oauthAccount``. After recovery, the
+    snapshot must contain ONLY ``.mcpServers`` — proving the
+    journaled paths drove extraction, not the registry.
+    """
+    # Live registry has TWO owned paths (registry drift since intent).
+    drifted_cf = ConfigFile(
+        posix_path="~/.claude.json",
+        windows_path="%USERPROFILE%\\.claude.json",
+        profile_subdir="claude",
+        profile_filename="claude.json",
+        merge_strategy="json_subtree_merge",
+        owned_json_paths=(".mcpServers", ".oauthAccount"),
+    )
+    base = build_registry(Path("/nonexistent"))
+    registry = tuple(
+        t.model_copy(update={"config_files": (drifted_cf,)}) if t.id == "claude" else t
+        for t in base
+    )
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, registry)
+
+    live = tmp_home / ".claude.json"
+    live.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"x": {}},
+                "oauthAccount": {"email": "drifted@x"},
+            }
+        )
+    )
+
+    profile_name = "2026-05-19-current"
+    store.create(profile_name, {"claude": True})
+    profile_dir = store.profile_dir(profile_name)
+    _stage_completed_dir_mapping(tmp_home, profile_dir)
+
+    # Journal entry carries ONLY .mcpServers — pretend that was the
+    # owned-path list in the registry at the original intent-write time.
+    cf_entry = _ConfigFileMappingIntent.model_validate(
+        {
+            "tool_id": "claude",
+            "profile_subdir": "claude",
+            "profile_filename": "claude.json",
+            "live_path": str(live),
+            "owned_json_paths": (".mcpServers",),
+        }
+    )
+    record = _make_init_record(
+        profile_name,
+        target_ids=["claude"],
+        mappings=[_claude_mapping(tmp_home)],
+        config_file_mappings=[cf_entry],
+    )
+    OpLogIO(tmp_state).append_record(record)
+
+    service.init(continue_=True)
+
+    snap = store.config_file_snapshot_path(profile_name, "claude", "claude.json")
+    extracted = json.loads(snap.read_text())
+    # JOURNALED paths win: snapshot has mcpServers but NOT oauthAccount,
+    # even though the registry's current owned_json_paths would include
+    # both. If this assertion fails, recovery used the registry instead
+    # of the journal and the snapshot has drifted shape across version
+    # changes — exactly the non-idempotent recovery abby flagged.
+    assert "mcpServers" in extracted
+    assert "oauthAccount" not in extracted

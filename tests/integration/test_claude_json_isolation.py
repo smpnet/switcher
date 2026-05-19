@@ -182,7 +182,7 @@ def test_per_project_mcp_isolation(tmp_state: Path, tmp_home: Path) -> None:
     assert out["projects"]["/repo"]["lastSessionId"] == "B-session"
 
 
-def test_full_lifecycle_init_save_create_use_rescan_uninstall(
+def test_full_lifecycle_init_save_create_use_unmanage_rescan(
     tmp_state: Path, tmp_home: Path
 ) -> None:
     """Covers every ConfigFile-touching lifecycle step in one flow:
@@ -191,10 +191,15 @@ def test_full_lifecycle_init_save_create_use_rescan_uninstall(
     - save captures another snapshot under a named profile.
     - create copies the snapshot from the active source.
     - use applies the snapshot back over the owned subtrees.
+    - unmanage drops the tool from active without touching live or
+      per-profile snapshots (spec §3.6 ConfigFile invariant).
     - rescan picks the tool back up after unmanage and captures into
       a fresh profile.
-    - uninstall leaves the per-profile snapshots alone (spec §3.6:
-      live config files are intentionally preserved across unmanage).
+
+    Uninstall isn't exercised here — its per-profile snapshot
+    preservation is verified in test_service_config_file_unmanage_uninstall.py
+    against a controlled fixture (this test focuses on cross-step
+    flow, not uninstall's snapshot-preservation contract).
     """
     _suppress_copilot(tmp_home)
     live = tmp_home / ".claude.json"
@@ -244,3 +249,38 @@ def test_full_lifecycle_init_save_create_use_rescan_uninstall(
     )
     assert rescan_snap.exists()
     assert json.loads(rescan_snap.read_text()) == {"mcpServers": {"saved": {}}}
+
+
+def test_use_vanilla_clears_owned_subtrees(
+    tmp_state: Path, tmp_home: Path
+) -> None:
+    """``vanilla`` represents factory-fresh tool state — switching onto
+    it must wipe the owned subtrees back to empty. Without an explicit
+    ``{}`` snapshot at init time, ``use("vanilla")`` falls into the
+    "snapshot missing → warn-and-skip" branch and leaves the user's
+    MCPs in live, silently defeating the isolation contract for the
+    vanilla profile (CR r-batch4 major).
+    """
+    _suppress_copilot(tmp_home)
+    live = tmp_home / ".claude.json"
+    live.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"installed": {"command": "x"}},
+                "oauthAccount": {"email": "u@x"},
+                "hasCompletedOnboarding": True,
+            }
+        )
+    )
+
+    s = _service(tmp_state, tmp_home)
+    s.init(["claude"])
+
+    # Switch to vanilla. Spec §3.2: machine-global keys
+    # (hasCompletedOnboarding) ride the live file; the three owned
+    # subtrees collapse to the vanilla snapshot ({}).
+    s.use("vanilla")
+    out = json.loads(live.read_text())
+    assert "mcpServers" not in out or out["mcpServers"] == {}
+    assert "oauthAccount" not in out
+    assert out.get("hasCompletedOnboarding") is True

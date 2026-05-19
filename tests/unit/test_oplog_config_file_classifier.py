@@ -41,6 +41,7 @@ def _entry(
         profile_subdir=profile_subdir,
         profile_filename=profile_filename,
         live_path=live_path,
+        owned_json_paths=(".mcpServers",),
     )
 
 
@@ -112,6 +113,35 @@ def test_classifier_ambiguous_when_snapshot_is_malformed_json(tmp_path: Path) ->
     snap = _snap(tmp_path)
     snap.parent.mkdir(parents=True)
     snap.write_text("not valid json {")
+    assert (
+        classify_config_file_mapping(_entry(), tmp_path)
+        == ConfigFileDiskState.AMBIGUOUS
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "[]",
+        '"x"',
+        "null",
+        "42",
+        "true",
+    ],
+    ids=["array", "string", "null", "number", "bool"],
+)
+def test_classifier_ambiguous_when_snapshot_is_valid_json_but_not_object(
+    tmp_path: Path, payload: str
+) -> None:
+    """The snapshot writer always emits a JSON object; a parseable-but-
+    wrong shape (array / scalar / null) is detectable corruption that
+    must surface AT the classifier boundary (where compensation can
+    refuse and the user can recover), not later at apply time when the
+    snapshot is consumed against a live read. abby r-batch4 blocker.
+    """
+    snap = _snap(tmp_path)
+    snap.parent.mkdir(parents=True)
+    snap.write_text(payload)
     assert (
         classify_config_file_mapping(_entry(), tmp_path)
         == ConfigFileDiskState.AMBIGUOUS
