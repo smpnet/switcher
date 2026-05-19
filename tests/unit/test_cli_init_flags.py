@@ -18,15 +18,21 @@ runner = CliRunner()
 
 @pytest.fixture
 def tmp_home_no_copilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Like `tmp_home` but with no Copilot live dirs seeded.
+    """Like `tmp_home` but seeds only claude — no copilot, no codex.
 
     Used by tests that need --only/--skip to surface "requested but not
-    detected" for copilot. The post-T4 builtin only references
-    ~/.copilot (or %USERPROFILE%\\.copilot on Windows); not creating
-    that dir is sufficient to make detect_installed() miss copilot.
+    detected" for tools other than claude, or that need claude to be the
+    sole detected tool for an "every detected tool" repro. Seeds whatever
+    happens to be required by the consumers in this module — do NOT add
+    more builtin dirs here without checking every consumer test for
+    detection-count assumptions.
     """
     home = tmp_path / "home"
     home.mkdir()
+    # Mirror tmp_home: clear every builtin's env_override so a developer
+    # shell can't make tests escape the temp home.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     if IS_WINDOWS:
         monkeypatch.setenv("USERPROFILE", str(home))
         monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
@@ -301,6 +307,10 @@ def test_init_interactive_zero_detected_distinct_wording(
     # Empty home — no .claude, no .copilot, no github-copilot.
     home = tmp_path / "home"
     home.mkdir()
+    # Clear env_overrides so the deliberately-empty home survives a
+    # developer shell with CODEX_HOME / CLAUDE_CONFIG_DIR set.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     if IS_WINDOWS:
         monkeypatch.setenv("USERPROFILE", str(home))
         monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
