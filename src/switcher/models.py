@@ -6,6 +6,8 @@ and serialized back the same way. Field aliases keep on-disk shapes clean.
 
 from __future__ import annotations
 
+import ntpath
+import posixpath
 import re
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -392,15 +394,18 @@ class Tool(BaseModel):
         # live path on either OS would extract from / apply to the same
         # file twice — silent clobbering. Reject both at load time.
         #
-        # Comparison is case-insensitive (``str.casefold``). Default Windows
-        # filesystems (NTFS) and default macOS filesystems (APFS) are
-        # case-insensitive-but-preserving, so ``~/.claude.json`` and
-        # ``~/.Claude.json`` resolve to the same file. Raw string compare
-        # would silently accept them as distinct and re-introduce the
-        # clobber class. Linux case-sensitive ext4 may produce a rare
-        # false positive (two genuinely distinct paths flagged as
-        # duplicates), but the convention in tool configs is lowercase
-        # only, so the trade-off favors safety.
+        # Comparison is case-insensitive (``str.casefold``) AND
+        # path-normalized via ``posixpath.normpath`` / ``ntpath.normpath``.
+        # The runtime path goes through ``PathResolver.expand`` +
+        # ``os.path.normpath``, so ``~/.claude.json`` and
+        # ``~/.config/../.claude.json`` canonicalize to the same live file
+        # — the validator must catch that equivalence here too, or
+        # two semantically-identical-but-syntactically-different entries
+        # silently re-introduce the clobber class (Hermes pass-PR-3).
+        # Default Windows (NTFS) and macOS (APFS) filesystems are
+        # case-insensitive-but-preserving; Linux ext4 may flag a rare
+        # genuinely-distinct-pair as duplicate, but tool-config
+        # convention is lowercase only, so the trade-off favors safety.
         seen_slots: set[tuple[str, str]] = set()
         seen_posix: set[str] = set()
         seen_windows: set[str] = set()
@@ -414,18 +419,20 @@ class Tool(BaseModel):
                     "comparison is case-insensitive"
                 )
             seen_slots.add(slot)
-            posix_key = cf.posix_path.casefold()
+            posix_key = posixpath.normpath(cf.posix_path).casefold()
             if posix_key in seen_posix:
                 raise ValueError(
-                    f"duplicate config_file posix_path {cf.posix_path!r}; "
-                    "comparison is case-insensitive"
+                    f"duplicate config_file posix_path {cf.posix_path!r} "
+                    f"(canonicalized to {posix_key!r}); comparison is "
+                    "case-insensitive and path-normalized"
                 )
             seen_posix.add(posix_key)
-            windows_key = cf.windows_path.casefold()
+            windows_key = ntpath.normpath(cf.windows_path).casefold()
             if windows_key in seen_windows:
                 raise ValueError(
-                    f"duplicate config_file windows_path {cf.windows_path!r}; "
-                    "comparison is case-insensitive"
+                    f"duplicate config_file windows_path {cf.windows_path!r} "
+                    f"(canonicalized to {windows_key!r}); comparison is "
+                    "case-insensitive and path-normalized"
                 )
             seen_windows.add(windows_key)
         return self

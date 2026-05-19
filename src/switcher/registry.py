@@ -4,6 +4,8 @@ builtins (with a stderr warning)."""
 
 from __future__ import annotations
 
+import ntpath
+import posixpath
 import sys
 import tomllib
 from importlib.resources import files
@@ -48,16 +50,24 @@ def _validate_config_files_unique_across_tools(tools: tuple[Tool, ...]) -> None:
     """Reject cross-tool ConfigFile collisions.
 
     Per-tool ``ConfigFile`` uniqueness (snapshot slot + posix/windows live
-    paths, all case-insensitive) is enforced by the Tool model validator,
-    but that only catches collisions *within* a single tool. Two distinct
-    tools could still claim the same snapshot slot or the same live config
-    file (abby r13). On ``save()`` / ``use()`` that would silently race the
-    two tools in registry order — the later writer wins, the earlier tool's
-    data is lost.
+    paths, all case-insensitive AND path-normalized) is enforced by the
+    Tool model validator, but that only catches collisions *within* a
+    single tool. Two distinct tools could still claim the same snapshot
+    slot or the same live config file (abby r13). On ``save()`` /
+    ``use()`` that would silently race the two tools in registry order
+    — the later writer wins, the earlier tool's data is lost.
 
-    Comparison is case-insensitive (``str.casefold``) for the same reason
-    as the intra-tool check: default Windows (NTFS) and default macOS
-    (APFS) filesystems are case-insensitive-but-preserving.
+    Comparison runs each path through the platform-appropriate
+    ``normpath`` first so ``~/.claude.json`` and
+    ``~/.config/../.claude.json`` (which canonicalize to the same live
+    file via ``PathResolver.expand`` + ``os.path.normpath`` at runtime)
+    are flagged as duplicates here too. Raw-string compare alone would
+    let semantically-identical-but-syntactically-different entries pass
+    and reopen the cross-tool clobber class these validators close
+    (Hermes pass-PR-3 blocker).
+
+    Casefold matches the runtime behavior on default Windows (NTFS) and
+    default macOS (APFS) filesystems — case-insensitive-but-preserving.
 
     With the v0.1.5 max-one-ConfigFile-per-tool cap, each tool contributes
     at most one entry to each map; we don't need a same-tool guard.
@@ -76,22 +86,24 @@ def _validate_config_files_unique_across_tools(tools: tuple[Tool, ...]) -> None:
                     f"profile_filename={cf.profile_filename!r})"
                 )
             seen_slot[slot] = t.id
-            posix_key = cf.posix_path.casefold()
+            posix_key = posixpath.normpath(cf.posix_path).casefold()
             if posix_key in seen_posix:
                 raise ValueError(
                     f"cross-tool config_file collision: tools "
                     f"{seen_posix[posix_key]!r} and {t.id!r} both claim "
-                    f"posix_path {cf.posix_path!r}; comparison is "
-                    f"case-insensitive"
+                    f"posix_path {cf.posix_path!r} (canonicalized to "
+                    f"{posix_key!r}); comparison is case-insensitive and "
+                    f"path-normalized"
                 )
             seen_posix[posix_key] = t.id
-            windows_key = cf.windows_path.casefold()
+            windows_key = ntpath.normpath(cf.windows_path).casefold()
             if windows_key in seen_windows:
                 raise ValueError(
                     f"cross-tool config_file collision: tools "
                     f"{seen_windows[windows_key]!r} and {t.id!r} both claim "
-                    f"windows_path {cf.windows_path!r}; comparison is "
-                    f"case-insensitive"
+                    f"windows_path {cf.windows_path!r} (canonicalized to "
+                    f"{windows_key!r}); comparison is case-insensitive and "
+                    f"path-normalized"
                 )
             seen_windows[windows_key] = t.id
 

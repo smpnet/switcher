@@ -178,6 +178,25 @@ def _extract_into(
         for k, v in live_node.items():
             if not rest:
                 raise InvalidOwnedPathError("v1 grammar does not allow '[]' as a leaf segment")
+            # Mirror the keyed branch's descendability gate: if ``v`` is
+            # not a dict, the descent under the next "key" segment would
+            # silently skip — but the ``setdefault(k, {})`` would still
+            # plant an empty placeholder, and apply would later interpret
+            # that as "iter entry present in snapshot but owned leaf
+            # absent" and DELETE the leaf from a healthy live (Hermes
+            # pass-PR-3 blocker). For example, live
+            # ``{"projects": {"/repo": 1}}`` paired with
+            # ``.projects[].mcpServers`` would extract to
+            # ``{"projects": {"/repo": {}}}``, then a later apply onto
+            # ``{"projects": {"/repo": {"mcpServers": {"keep": {}}}}}``
+            # would delete ``mcpServers`` from /repo.
+            #
+            # If the next segment is also ``iter``, fall through so the
+            # nested iter branch raises ``UnsupportedWalkTargetError`` on
+            # the non-dict — matches the keyed branch's fail-loud
+            # behavior on iter-into-non-object.
+            if not isinstance(v, dict) and not (rest and rest[0][0] == "iter"):
+                continue
             child_snap = snap_node.setdefault(k, {})
             if not isinstance(child_snap, dict):
                 child_snap = {}

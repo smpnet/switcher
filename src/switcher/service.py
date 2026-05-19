@@ -275,6 +275,25 @@ class ProfileService:
                 # ``_plan_config_file_applies`` on the apply side.
                 kind = "directory" if src.is_dir() else "non-regular file"
                 raise StorageError(f"expected regular file at snapshot {src}, got {kind}")
+            # Validate JSON-object shape at the corruption boundary. A regular
+            # file that fails to parse as a JSON object is still corrupt —
+            # blindly copy2-ing it would propagate the corruption into the
+            # child profile and defer the failure to the first ``use`` of
+            # that child. ``.switcher/config_files/...`` is switcher-owned
+            # state; refuse non-object snapshots loudly here the same way
+            # the apply / classifier paths do (Hermes pass-PR-3 blocker).
+            try:
+                src_text = src.read_text(encoding="utf-8")
+            except UnicodeDecodeError as e:
+                raise StorageError(f"non-UTF-8 bytes at snapshot {src}: {e}") from e
+            try:
+                src_data = json.loads(src_text)
+            except json.JSONDecodeError as e:
+                raise StorageError(
+                    f"malformed snapshot JSON at {src}: {e.msg} (line {e.lineno})"
+                ) from e
+            if not isinstance(src_data, dict):
+                raise StorageError(f"snapshot at {src} is not a JSON object")
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 

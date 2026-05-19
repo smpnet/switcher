@@ -130,6 +130,50 @@ def test_extract_skips_non_dict_descent_target():
     assert snap == {}
 
 
+def test_extract_skips_non_dict_iter_entry_no_placeholder():
+    """Hermes pass-PR-3 blocker: an iter entry whose value isn't a dict
+    must NOT plant an empty ``{}`` placeholder under the iter parent.
+    The placeholder would lie about descendability — apply later sees
+    "iter entry present in snapshot but owned leaf absent" and DELETES
+    the leaf from a healthy live, even though capture saw nothing
+    delete-worthy.
+
+    Repro: live ``{"projects": {"/r/A": 1}}`` paired with
+    ``.projects[].mcpServers`` extracted to ``{"projects": {"/r/A": {}}}``
+    pre-fix. Applying that snapshot onto a healthy
+    ``{"projects": {"/r/A": {"mcpServers": {"keep": {}}, ...}}}`` then
+    removed ``mcpServers`` — silent destruction of unrelated data.
+    """
+    live = {"projects": {"/r/A": 1}}
+    snap = extract_owned_paths(live, (".projects[].mcpServers",))
+    # Iter entry skipped entirely; no destructive placeholder baked in.
+    assert snap == {} or snap == {"projects": {}}
+
+
+def test_extract_apply_round_trip_stable_on_malformed_iter_entry():
+    """Hermes pass-PR-3 round-trip pin: extract → apply on the SAME
+    unchanged-shape live must be a no-op when an iter entry isn't a
+    dict. Pre-fix, the placeholder caused apply to delete owned leaves
+    from healthy entries that happened to share the iter parent with a
+    malformed sibling.
+    """
+    # Healthy entry under the same iter parent as the malformed one;
+    # without the fix, the malformed entry's placeholder propagated
+    # delete-on-absence to the healthy entry's owned leaf.
+    live = {
+        "projects": {
+            "/r/healthy": {"mcpServers": {"keep": {}}, "lastSessionId": "x"},
+            "/r/malformed": 1,
+        }
+    }
+    snap = extract_owned_paths(live, (".projects[].mcpServers",))
+    out = apply_owned_paths(live, snap, (".projects[].mcpServers",))
+    # Healthy entry survives; malformed one is left as-is.
+    assert out["projects"]["/r/healthy"]["mcpServers"] == {"keep": {}}
+    assert out["projects"]["/r/healthy"]["lastSessionId"] == "x"
+    assert out["projects"]["/r/malformed"] == 1
+
+
 def test_extract_apply_round_trip_stable_on_blocked_key_descent():
     """The motivating regression: extract followed by apply on the same
     unchanged live must be a no-op even when the descent path doesn't fit
