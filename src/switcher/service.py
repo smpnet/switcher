@@ -1932,6 +1932,29 @@ class ProfileService:
                     f"required — see docs/RELEASE.md"
                 )
 
+        # ConfigFile preflight — hoisted BEFORE the dir-mapping
+        # mutation pass below so an AMBIGUOUS snapshot raises before
+        # any ``move_or_seed_dir`` / ``swap_link`` runs. Pre-hoist,
+        # the AMBIGUOUS refusal sat after the mutation pass; a
+        # corrupt snapshot would leave init --continue half-applied
+        # with live dirs already mutated and the journal still open
+        # (CR pass-PR-5 major). States cache here is consumed by
+        # the dispatch loop after dir mutation completes.
+        cf_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
+        for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init: config_file snapshot for tool "
+                    f"{cf_entry.tool_id!r} at "
+                    f"{profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
+                    f"on-disk state is ambiguous; manual recovery "
+                    f"required — see docs/RELEASE.md"
+                )
+            cf_states[(cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)] = (
+                state
+            )
+
         # Deferred profile-dir create (Hermes pass-PR-2 blocker):
         # the earliest crash window (intent landed, first _store.create
         # never ran) leaves profile_dir absent. Recreating BEFORE the
@@ -1965,26 +1988,16 @@ class ProfileService:
             # an unknown state.
             raise AssertionError(f"unhandled mapping state {state}")
 
-        # ConfigFile replay (spec §3.7). Two-pass discipline mirrors
-        # the dir-mapping shape above: validate every entry first,
-        # then mutate. AMBIGUOUS snapshot (corrupt shape — directory,
-        # symlink, junction, or malformed JSON) refuses BEFORE any
-        # snapshot write, so we never partially overwrite a recoverable
-        # state. COMPLETE skips (idempotent); UNTOUCHED re-extracts
-        # from the journal's live_path via the registry-validated
-        # helper, which folds in the §3.7 runtime check.
+        # ConfigFile dispatch — consumes the preflight cache built
+        # before the dir-mapping mutation. COMPLETE skips (idempotent);
+        # UNTOUCHED re-extracts from the journal's live_path via the
+        # registry-validated helper, which folds in the §3.7 runtime
+        # check. AMBIGUOUS was already refused at preflight time
+        # (no entry would land in the cache with that state).
         for cf_entry in record.config_file_mappings:
-            state = classify_config_file_mapping(cf_entry, profile_dir)
-            if state is ConfigFileDiskState.AMBIGUOUS:
-                raise OpLogCorruptError(
-                    f"interrupted init: config_file snapshot for tool "
-                    f"{cf_entry.tool_id!r} at "
-                    f"{profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
-                    f"on-disk state is ambiguous; manual recovery "
-                    f"required — see docs/RELEASE.md"
-                )
-        for cf_entry in record.config_file_mappings:
-            state = classify_config_file_mapping(cf_entry, profile_dir)
+            state = cf_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
             if state is ConfigFileDiskState.COMPLETE:
                 continue
             if state is ConfigFileDiskState.UNTOUCHED:
@@ -2302,6 +2315,27 @@ class ProfileService:
                     )
             states[i] = state
 
+        # ConfigFile preflight — hoisted BEFORE the dir-mapping
+        # mutation pass so an AMBIGUOUS snapshot raises before any
+        # live-side restoration runs. Pre-hoist, the AMBIGUOUS refusal
+        # sat after the mutation pass; corrupt snapshots would leave
+        # ``init --abort`` half-applied with dirs already restored and
+        # the journal still open (CR pass-PR-5 major).
+        cf_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
+        for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init abort: config_file snapshot for "
+                    f"tool {cf_entry.tool_id!r} is in an ambiguous "
+                    f"state at "
+                    f"{profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}; "
+                    f"manual recovery required."
+                )
+            cf_states[(cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)] = (
+                state
+            )
+
         # MUTATION pass. Every mapping cleared validation; safe to mutate.
         for i, intent in enumerate(record.mappings):
             state = states[i]
@@ -2330,33 +2364,18 @@ class ProfileService:
                     # (race / external removal). CR pass-10 nit.
                     shutil.rmtree(target)
 
-        # ConfigFile abort (spec §3.7). Validation pass first — refuse
-        # on any AMBIGUOUS snapshot shape before any unlink runs (the
-        # validate-then-mutate discipline applies to snapshots the
-        # same way it does to dir mappings). Init never writes to
-        # live for ConfigFile (capture is read-only on live), so abort
-        # has no live-side restore to do — only the snapshot side.
-        #
-        # The profile-delete pass below would rmtree the whole profile
-        # dir and take the snapshots with it. The explicit unlink loop
-        # is defense in depth: it produces a tighter per-step audit
-        # trail, surfaces an unexpected per-snapshot failure as a
-        # localized error rather than buried inside rmtree's
-        # ignore_errors behaviour, and keeps init's abort shape
-        # symmetric with --into rescan abort (which preserves the
-        # profile dir and depends on per-snapshot unlink for cleanup).
+        # ConfigFile dispatch — consume the preflight cache.
+        # Init never writes to live for ConfigFile (capture is
+        # read-only on live), so abort has no live-side restore to do
+        # — only the snapshot side. The profile-delete pass below
+        # would rmtree the whole profile dir and take the snapshots
+        # with it; the explicit unlink loop is defense in depth, with
+        # a tighter per-step audit trail. AMBIGUOUS was already
+        # refused at preflight time.
         for cf_entry in record.config_file_mappings:
-            state = classify_config_file_mapping(cf_entry, profile_dir)
-            if state is ConfigFileDiskState.AMBIGUOUS:
-                raise OpLogCorruptError(
-                    f"interrupted init abort: config_file snapshot for "
-                    f"tool {cf_entry.tool_id!r} is in an ambiguous "
-                    f"state at "
-                    f"{profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}; "
-                    f"manual recovery required."
-                )
-        for cf_entry in record.config_file_mappings:
-            state = classify_config_file_mapping(cf_entry, profile_dir)
+            state = cf_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
             if state is ConfigFileDiskState.COMPLETE:
                 self._store.config_file_snapshot_path(
                     record.profile_name,
@@ -2878,6 +2897,40 @@ class ProfileService:
                     f"docs/RELEASE.md"
                 )
 
+        # ConfigFile preflight — hoisted BEFORE the dir-mapping
+        # mutation pass below so an AMBIGUOUS snapshot raises before
+        # ``move_or_seed_dir`` / ``swap_link`` runs. Pre-hoist, the
+        # AMBIGUOUS refusal sat after the mutation pass; a corrupt
+        # snapshot would leave ``rescan --continue`` half-applied with
+        # live dirs already mutated and the journal still open
+        # (CR pass-PR-5 major). States cache here is consumed by the
+        # dispatch loop after dir mutation completes. Per-tool
+        # tool_id → target_profile resolution is part of validation
+        # (a corrupt journal with no target_profiles entry surfaces
+        # here, before any mutation).
+        cf_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
+        for cf_entry in record.config_file_mappings:
+            cf_profile_name = record.target_profiles.get(cf_entry.tool_id)
+            if cf_profile_name is None:
+                raise OpLogCorruptError(
+                    f"interrupted rescan continue: config_file mapping "
+                    f"references tool_id {cf_entry.tool_id!r} without a "
+                    f"target_profiles entry; manual recovery required"
+                )
+            cf_profile_dir = self._store.profile_dir(cf_profile_name)
+            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted rescan: config_file snapshot for tool "
+                    f"{cf_entry.tool_id!r} at "
+                    f"{cf_profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
+                    f"on-disk state is ambiguous; manual recovery "
+                    f"required — see docs/RELEASE.md"
+                )
+            cf_states[(cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)] = (
+                state
+            )
+
         # Deferred profile-dir create. The earliest crash window leaves
         # a target profile dir absent — recreate via store.create AFTER
         # validation cleared every mapping. In fresh-profile mode the
@@ -2920,39 +2973,21 @@ class ProfileService:
                 continue
             raise AssertionError(f"unhandled mapping state {state}")
 
-        # ConfigFile replay (spec §3.7). Same two-pass discipline as
-        # the init-continue counterpart: validate every entry for
-        # AMBIGUOUS shape first, then dispatch per-state. The
-        # registry runtime check rides inside
-        # ``_extract_and_write_config_file_snapshot`` so a registry
-        # that no longer carries the journaled
+        # ConfigFile dispatch — consume the preflight cache built
+        # before the dir-mapping mutation. AMBIGUOUS was already
+        # refused at preflight time; the registry runtime check
+        # rides inside ``_extract_and_write_config_file_snapshot``
+        # so a registry that no longer carries the journaled
         # ``(profile_subdir, profile_filename)`` pair surfaces as
         # OpLogCorruptError rather than a silent extract-everything.
         for cf_entry in record.config_file_mappings:
-            cf_profile_name = record.target_profiles.get(cf_entry.tool_id)
-            if cf_profile_name is None:
-                raise OpLogCorruptError(
-                    f"interrupted rescan continue: config_file mapping "
-                    f"references tool_id {cf_entry.tool_id!r} without a "
-                    f"target_profiles entry; manual recovery required"
-                )
-            cf_profile_dir = self._store.profile_dir(cf_profile_name)
-            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
-            if state is ConfigFileDiskState.AMBIGUOUS:
-                raise OpLogCorruptError(
-                    f"interrupted rescan: config_file snapshot for tool "
-                    f"{cf_entry.tool_id!r} at "
-                    f"{cf_profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
-                    f"on-disk state is ambiguous; manual recovery "
-                    f"required — see docs/RELEASE.md"
-                )
-        for cf_entry in record.config_file_mappings:
-            cf_profile_name = record.target_profiles[cf_entry.tool_id]
-            cf_profile_dir = self._store.profile_dir(cf_profile_name)
-            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            state = cf_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
             if state is ConfigFileDiskState.COMPLETE:
                 continue
             if state is ConfigFileDiskState.UNTOUCHED:
+                cf_profile_name = record.target_profiles[cf_entry.tool_id]
                 self._extract_and_write_config_file_snapshot(
                     profile_name=cf_profile_name,
                     live_path=Path(cf_entry.live_path),
@@ -3160,6 +3195,41 @@ class ProfileService:
                 )
             states[i] = state
 
+        # ConfigFile preflight — hoisted BEFORE the dir-mapping
+        # mutation pass so an AMBIGUOUS snapshot raises before any
+        # live-side restoration runs. Pre-hoist, a corrupt snapshot
+        # would leave ``rescan --abort`` half-applied with dirs
+        # already restored and the journal still open (CR pass-PR-5
+        # major). For --into mode this is especially important — the
+        # post-mutation cleanup preserves the profile dir, so an
+        # AMBIGUOUS state at the snapshot would otherwise survive
+        # the abort and trip the snapshot-collision pre-flight on
+        # the next retry. Resolves the tool_id → target_profile
+        # mapping at validation time so a corrupt journal also
+        # surfaces here, before any mutation.
+        cf_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
+        for cf_entry in record.config_file_mappings:
+            cf_profile_name = record.target_profiles.get(cf_entry.tool_id)
+            if cf_profile_name is None:
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: config_file mapping "
+                    f"references tool_id {cf_entry.tool_id!r} without a "
+                    f"target_profiles entry; manual recovery required"
+                )
+            cf_profile_dir = self._store.profile_dir(cf_profile_name)
+            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: config_file snapshot for "
+                    f"tool {cf_entry.tool_id!r} is in an ambiguous state "
+                    f"at "
+                    f"{cf_profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}; "
+                    f"manual recovery required."
+                )
+            cf_states[(cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)] = (
+                state
+            )
+
         # Mutation pass. Every mapping cleared validation.
         for i, intent in enumerate(record.mappings):
             state = states[i]
@@ -3181,8 +3251,7 @@ class ProfileService:
                 elif intent.original_kind == "missing" and target.exists():
                     shutil.rmtree(target)
 
-        # ConfigFile abort (spec §3.7). Validate every entry first
-        # (AMBIGUOUS refusal), then unlink COMPLETE snapshots. For
+        # ConfigFile dispatch — consume the preflight cache. For
         # fresh-profile mode the cleanup loop below rmtree's the
         # profile dir and would take the snapshots with it; for
         # --into mode the profile dir is preserved, so per-snapshot
@@ -3191,28 +3260,11 @@ class ProfileService:
         # added in Task 10 even though the snapshot is no longer
         # journal-owned.
         for cf_entry in record.config_file_mappings:
-            cf_profile_name = record.target_profiles.get(cf_entry.tool_id)
-            if cf_profile_name is None:
-                raise OpLogCorruptError(
-                    f"interrupted rescan abort: config_file mapping "
-                    f"references tool_id {cf_entry.tool_id!r} without a "
-                    f"target_profiles entry; manual recovery required"
-                )
-            cf_profile_dir = self._store.profile_dir(cf_profile_name)
-            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
-            if state is ConfigFileDiskState.AMBIGUOUS:
-                raise OpLogCorruptError(
-                    f"interrupted rescan abort: config_file snapshot for "
-                    f"tool {cf_entry.tool_id!r} is in an ambiguous state "
-                    f"at "
-                    f"{cf_profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}; "
-                    f"manual recovery required."
-                )
-        for cf_entry in record.config_file_mappings:
-            cf_profile_name = record.target_profiles[cf_entry.tool_id]
-            cf_profile_dir = self._store.profile_dir(cf_profile_name)
-            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            state = cf_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
             if state is ConfigFileDiskState.COMPLETE:
+                cf_profile_name = record.target_profiles[cf_entry.tool_id]
                 self._store.config_file_snapshot_path(
                     cf_profile_name,
                     cf_entry.profile_subdir,
