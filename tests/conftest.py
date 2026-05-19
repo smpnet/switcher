@@ -17,19 +17,36 @@ from pathlib import Path
 
 import pytest
 
+from switcher.registry import load_builtin_tools
+
 IS_WINDOWS = sys.platform == "win32"
 
 
 @pytest.fixture
-def tmp_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def clear_builtin_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear every registered builtin's env_override env var.
+
+    Derives the list from `load_builtin_tools()` so adding a new builtin
+    with an env_override auto-extends fixture hermeticity. A developer
+    shell with CODEX_HOME / CLAUDE_CONFIG_DIR / <future-builtin>_HOME set
+    can't escape the temp home or detect a non-temp live config. Hosted
+    CI runners don't typically have these set; this hardens against
+    developer-local test runs.
+    """
+    for tool in load_builtin_tools():
+        for dm in tool.config_dirs:
+            if dm.env_override:
+                monkeypatch.delenv(dm.env_override, raising=False)
+
+
+@pytest.fixture
+def tmp_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clear_builtin_env_overrides: None,
+) -> Path:
     home = tmp_path / "home"
     home.mkdir()
-    # Clear every builtin's env_override so a developer shell with
-    # e.g. CODEX_HOME set can't escape the temp home or detect a
-    # non-temp live config. Hosted CI runners don't typically have
-    # these set; this hardens against developer-local test runs.
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.delenv("CODEX_HOME", raising=False)
     if IS_WINDOWS:
         monkeypatch.setenv("USERPROFILE", str(home))
         monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))

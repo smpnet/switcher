@@ -17,7 +17,11 @@ runner = CliRunner()
 
 
 @pytest.fixture
-def tmp_home_no_copilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def tmp_home_no_copilot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clear_builtin_env_overrides: None,
+) -> Path:
     """Like `tmp_home` but seeds only claude — no copilot, no codex.
 
     Used by tests that need --only/--skip to surface "requested but not
@@ -29,10 +33,6 @@ def tmp_home_no_copilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     """
     home = tmp_path / "home"
     home.mkdir()
-    # Mirror tmp_home: clear every builtin's env_override so a developer
-    # shell can't make tests escape the temp home.
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.delenv("CODEX_HOME", raising=False)
     if IS_WINDOWS:
         monkeypatch.setenv("USERPROFILE", str(home))
         monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
@@ -302,7 +302,10 @@ def test_init_interactive_eof_exits_cleanly(
 
 
 def test_init_interactive_zero_detected_distinct_wording(
-    tmp_path: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    tmp_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clear_builtin_env_overrides: None,
 ) -> None:
     """Hermes nit: when --interactive is invoked on a machine with no
     installed tools, the error wording must NOT say 'every detected tool
@@ -310,12 +313,11 @@ def test_init_interactive_zero_detected_distinct_wording(
     distinguishes the zero-detected case with its own message.
     """
     # Empty home — no .claude, no .copilot, no github-copilot.
+    # `clear_builtin_env_overrides` (registry-driven) ensures the
+    # deliberately-empty home survives a developer shell with any
+    # CODEX_HOME / CLAUDE_CONFIG_DIR / future-builtin override set.
     home = tmp_path / "home"
     home.mkdir()
-    # Clear env_overrides so the deliberately-empty home survives a
-    # developer shell with CODEX_HOME / CLAUDE_CONFIG_DIR set.
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.delenv("CODEX_HOME", raising=False)
     if IS_WINDOWS:
         monkeypatch.setenv("USERPROFILE", str(home))
         monkeypatch.setenv("LOCALAPPDATA", str(home / "AppData" / "Local"))
