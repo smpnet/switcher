@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from switcher.errors import ProfileExistsError, StorageError, UnknownProfileError
+from switcher.links import snapshot_ancestor_link
 from switcher.models import Profile, validate_safe_name
 
 
@@ -96,17 +97,35 @@ class FileProfileStore:
     ) -> Path:
         # Single source of truth for the .switcher/config_files/<subdir>/<filename>
         # layout. Every caller — save, use, init, create, rescan, op-log
-        # classifier, compensation — routes through here so the layout doesn't
-        # drift the first time someone adds a seventh call site. validate_safe_name
+        # compensation — routes through here so the layout doesn't drift the
+        # first time someone adds a seventh call site. validate_safe_name
         # rejects leading dots, so no tool's profile_subdir can collide with
         # the reserved .switcher subtree.
-        return (
-            self.profile_dir(profile_name)
-            / ".switcher"
-            / "config_files"
-            / validate_safe_name(profile_subdir)
-            / validate_safe_name(profile_filename)
-        )
+        pdir = self.profile_dir(profile_name)
+        subdir = validate_safe_name(profile_subdir)
+        filename = validate_safe_name(profile_filename)
+        # Reject any link/junction in the reserved snapshot subtree before
+        # handing the path back. Without this guard every read/write site
+        # only checks the leaf for ``is_symlink``, which follows a
+        # link-shaped ancestor and reports a healthy regular file even
+        # though the underlying inode lives outside the state store.
+        # ``classify_config_file_mapping`` would then return COMPLETE
+        # and recovery / use / save / init --continue / rescan --continue
+        # would read or write attacker-controlled paths while the
+        # journal believes the subtree is clean (Hermes pass-PR-6 blocker).
+        # Path construction is the single chokepoint every IO call site
+        # routes through, so anchoring the guard here keeps the leaf-only
+        # ``is_symlink`` checks from being load-bearing on their own.
+        bad = snapshot_ancestor_link(pdir, subdir)
+        if bad is not None:
+            raise StorageError(
+                f"refusing snapshot path for {profile_name!r}: reserved "
+                f"ancestor {bad} is a link or junction; this would "
+                f"redirect snapshot I/O outside the state store. Resolve "
+                f"the link (or remove it so the reserved subtree is a "
+                f"real directory) and re-run."
+            )
+        return pdir / ".switcher" / "config_files" / subdir / filename
 
     def _profiles_dir(self) -> Path:
         return self._state_dir / "profiles"

@@ -385,3 +385,46 @@ def atomic_write_file(target: Path, content: bytes) -> None:
     except Exception:
         tmppath.unlink(missing_ok=True)
         raise
+
+
+def snapshot_ancestor_link(profile_dir: Path, profile_subdir: str) -> Path | None:
+    """Return the first link/junction ancestor of the reserved snapshot
+    subtree, or None if every existing reserved ancestor is a real
+    directory.
+
+    ConfigFile snapshots live at
+    ``profile_dir/.switcher/config_files/<profile_subdir>/<filename>``.
+    Every read/write/classify site already rejects a leaf symlink, but
+    a symlink/junction at ``.switcher``, ``.switcher/config_files``, or
+    ``.switcher/config_files/<profile_subdir>`` silently redirects
+    snapshot I/O outside the state store — the leaf's
+    ``is_symlink()``/``is_file()`` check follows the redirection and
+    reports a healthy regular file even though the underlying inode
+    lives elsewhere (Hermes pass-PR-6 blocker).
+
+    Pure observation; never mutates the filesystem. Missing ancestors
+    are fine (``atomic_write_file`` materializes them via
+    ``mkdir(parents=True, exist_ok=True)`` on the next write) — once
+    the chain hits an absent ancestor, nothing below it can be link-
+    shaped yet either, so the scan terminates without surfacing
+    anything. Only the link/junction shape is rejected; a real
+    directory passes silently.
+    """
+    chain = (
+        profile_dir / ".switcher",
+        profile_dir / ".switcher" / "config_files",
+        profile_dir / ".switcher" / "config_files" / profile_subdir,
+    )
+    for ancestor in chain:
+        # ``is_symlink`` returns True for both healthy and broken
+        # symlinks on POSIX and Windows; ``os.path.isjunction`` adds
+        # Windows directory junctions, which ``is_symlink`` reports
+        # False for. Both shapes redirect I/O regardless of whether
+        # the link target exists, so both must surface here.
+        if ancestor.is_symlink():
+            return ancestor
+        if os.name == "nt" and os.path.isjunction(str(ancestor)):
+            return ancestor
+        if not ancestor.exists():
+            return None
+    return None

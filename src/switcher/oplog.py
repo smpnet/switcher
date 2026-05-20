@@ -48,6 +48,7 @@ from switcher.json_paths import (
     parse_owned_path,
     validate_snapshot_against_owned_paths,
 )
+from switcher.links import snapshot_ancestor_link
 from switcher.models import validate_absolute_path, validate_safe_name
 
 # StrictStr blocks str/int/bool coercion; Field(min_length=1) rejects
@@ -831,6 +832,18 @@ def classify_config_file_mapping(
     snap_path = (
         profile_dir / ".switcher" / "config_files" / entry.profile_subdir / entry.profile_filename
     )
+    # Surface ancestor-link redirection BEFORE the leaf checks below. A
+    # symlink/junction at ``.switcher`` / ``config_files`` / ``<subdir>``
+    # transparently redirects ``snap_path.is_symlink``/``is_file``/
+    # ``read_text`` to whatever the link points at — without this guard
+    # an external file would be classified COMPLETE and recovery would
+    # read or unlink attacker-controlled paths under the assumption the
+    # subtree is reserved (Hermes pass-PR-6 blocker). AMBIGUOUS keeps
+    # the classifier's pure-read contract (no raise) and slots into the
+    # existing "preflight refuses, surface to user" disposition every
+    # compensation path already encodes.
+    if snapshot_ancestor_link(profile_dir, entry.profile_subdir) is not None:
+        return ConfigFileDiskState.AMBIGUOUS
     # `Path.exists()` returns False for a broken symlink; `Path.is_symlink()`
     # returns True. Combine both to distinguish "absent" from "present in
     # a corrupt shape". Without the is_symlink check, a broken-symlink

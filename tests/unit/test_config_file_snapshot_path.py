@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
+from switcher.errors import StorageError
 from switcher.store import FileProfileStore
+
+IS_WINDOWS = sys.platform == "win32"
 
 
 def test_snapshot_path_under_dot_switcher(tmp_path: Path) -> None:
@@ -46,3 +50,59 @@ def test_snapshot_path_does_not_create_dirs(tmp_path: Path) -> None:
     # (atomic_write_file handles it).
     assert not p.exists()
     assert not p.parent.exists()
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+@pytest.mark.parametrize(
+    "ancestor_rel",
+    [".switcher", ".switcher/config_files", ".switcher/config_files/claude"],
+    ids=["dot-switcher", "config-files", "subdir"],
+)
+def test_snapshot_path_rejects_link_at_reserved_ancestor(tmp_path: Path, ancestor_rel: str) -> None:
+    """Hermes pass-PR-6: a symlink at any reserved ancestor under
+    ``.switcher/config_files/<subdir>`` silently redirects snapshot
+    I/O outside the state store — the leaf's ``is_symlink`` check
+    follows the redirection and reports a healthy regular file.
+    The path builder is the single chokepoint every IO call site
+    routes through, so it must refuse when any reserved ancestor
+    is link/junction-shaped.
+    """
+    store = FileProfileStore(tmp_path)
+    profile_dir = tmp_path / "profiles" / "workA"
+    ancestor = profile_dir / ancestor_rel
+    ancestor.parent.mkdir(parents=True, exist_ok=True)
+    external = tmp_path / "outside"
+    external.mkdir()
+    ancestor.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(StorageError, match="link or junction"):
+        store.config_file_snapshot_path("workA", "claude", "claude.json")
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_snapshot_path_rejects_broken_link_at_reserved_ancestor(
+    tmp_path: Path,
+) -> None:
+    """Broken (dangling) link/junction is still a redirection
+    primitive; ``Path.exists()`` returns False but ``is_symlink()``
+    returns True, so the builder must surface it before any IO."""
+    store = FileProfileStore(tmp_path)
+    profile_dir = tmp_path / "profiles" / "workA"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / ".switcher").symlink_to(tmp_path / "does-not-exist", target_is_directory=True)
+
+    with pytest.raises(StorageError, match="link or junction"):
+        store.config_file_snapshot_path("workA", "claude", "claude.json")
+
+
+def test_snapshot_path_allows_real_reserved_ancestors(tmp_path: Path) -> None:
+    """Pre-existing reserved subtree as real directories must NOT
+    trip the ancestor check — second snapshot writes onto an existing
+    ``.switcher/config_files/<subdir>`` tree are the normal flow.
+    """
+    store = FileProfileStore(tmp_path)
+    profile_dir = tmp_path / "profiles" / "workA"
+    (profile_dir / ".switcher" / "config_files" / "claude").mkdir(parents=True)
+
+    p = store.config_file_snapshot_path("workA", "claude", "claude.json")
+    assert p == profile_dir / ".switcher" / "config_files" / "claude" / "claude.json"

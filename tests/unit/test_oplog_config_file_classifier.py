@@ -169,3 +169,48 @@ def test_classifier_pure_read_no_mutations(tmp_path: Path) -> None:
 
     assert snap.read_text() == before
     assert sorted(snap.parent.iterdir()) == parent_listing_before
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+@pytest.mark.parametrize(
+    "ancestor_rel",
+    [".switcher", ".switcher/config_files", ".switcher/config_files/claude"],
+    ids=["dot-switcher", "config-files", "subdir"],
+)
+def test_classifier_ambiguous_when_reserved_ancestor_is_symlink(
+    tmp_path: Path, ancestor_rel: str
+) -> None:
+    """Hermes pass-PR-6: a symlink at ``.switcher``, ``config_files``,
+    or the per-tool ``<subdir>`` redirects the snapshot leaf out of
+    the state store. The leaf's ``is_symlink``/``is_file``/``read_text``
+    follow the redirection — pre-fix the classifier returned COMPLETE
+    for a snapshot whose real bytes lived in an external directory
+    the user did not own. Surface AMBIGUOUS at the classifier so
+    compensation refuses instead of treating attacker-controlled
+    bytes as healthy state.
+    """
+    # Lay down a real JSON object at the redirection target so the
+    # leaf reads (after symlink-following) WOULD succeed; only the
+    # ancestor-link check prevents misclassification.
+    external = tmp_path / "outside"
+    external.mkdir()
+    (external / "claude.json").write_text(json.dumps({"mcpServers": {}}))
+
+    ancestor = tmp_path / ancestor_rel
+    ancestor.parent.mkdir(parents=True, exist_ok=True)
+    if ancestor_rel == ".switcher/config_files/claude":
+        ancestor.symlink_to(external, target_is_directory=True)
+    elif ancestor_rel == ".switcher/config_files":
+        # Make the redirection still land at a "claude/claude.json"
+        # leaf so a naive leaf-only check would pass.
+        (external / "claude").mkdir()
+        (external / "claude" / "claude.json").write_text(json.dumps({"mcpServers": {}}))
+        ancestor.symlink_to(external, target_is_directory=True)
+    else:  # ".switcher"
+        (external / "config_files" / "claude").mkdir(parents=True)
+        (external / "config_files" / "claude" / "claude.json").write_text(
+            json.dumps({"mcpServers": {}})
+        )
+        ancestor.symlink_to(external, target_is_directory=True)
+
+    assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.AMBIGUOUS

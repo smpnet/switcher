@@ -675,6 +675,32 @@ def test_use_raises_storage_error_when_snapshot_has_non_object_at_iter(
     assert claude_dir.resolve() == before
 
 
+def test_use_validates_snapshot_shape_before_merge(service: ProfileService, tmp_home: Path) -> None:
+    """CR pass-PR-6: ``_plan_config_file_applies`` runs
+    ``validate_snapshot_against_owned_paths`` BEFORE
+    ``apply_owned_paths``, so a shape-incompatible snapshot fails at
+    the planner boundary with a dedicated message instead of being
+    deflected through the merge walker. The boundary message is the
+    user-visible contract — lock it in so future refactors can't
+    silently swap to a "merge failed" message that obscures the fact
+    that the snapshot itself was the corruption.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {}, "projects": {}}))
+    service.init(["claude"])
+    service.save("profA")
+
+    snap = service._store.config_file_snapshot_path("profA", "claude", "claude.json")
+    snap.write_text(json.dumps({"projects": [], "mcpServers": {}}))
+
+    claude_dir = tmp_home / ".claude"
+    before = claude_dir.resolve()
+
+    with pytest.raises(StorageError, match="shape-incompatible with the tool"):
+        service.use("profA")
+    assert claude_dir.resolve() == before
+
+
 @pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
 def test_use_capture_does_not_clobber_source_snapshot_on_broken_symlink(
     service: ProfileService, tmp_home: Path

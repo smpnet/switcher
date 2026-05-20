@@ -465,6 +465,19 @@ class ProfileService:
                     raise StorageError(
                         f"owned path walks into a non-object value at {live_path}: {e}"
                     ) from e
+                except InvalidOwnedPathError as e:
+                    # Defense in depth: the Tool model parses every
+                    # owned_json_paths entry at registry-load time, so
+                    # this branch should be unreachable in normal flow.
+                    # A hand-edited registry that bypassed the validator
+                    # would surface the failure as a raw walker error
+                    # past the service boundary; normalize to
+                    # StorageError here so all three owned-path entry
+                    # points fail through the same contract
+                    # (CR pass-PR-6).
+                    raise StorageError(
+                        f"invalid owned_json_paths for {tool.id!r} at {live_path}: {e}"
+                    ) from e
             else:
                 snapshot = {}
 
@@ -588,6 +601,16 @@ class ProfileService:
             except UnsupportedWalkTargetError as e:
                 raise StorageError(
                     f"owned path walks into a non-object value at {live_path}: {e}"
+                ) from e
+            except InvalidOwnedPathError as e:
+                # Symmetric with ``_capture_config_files``: the journal
+                # carries ``owned_json_paths`` verbatim from the Tool
+                # model that already parsed them at registry-load time,
+                # so this is defense-in-depth against a hand-edited
+                # journal whose parsed contract drifted from the live
+                # walker (CR pass-PR-6).
+                raise StorageError(
+                    f"invalid owned_json_paths for {tool_id!r} at {live_path}: {e}"
                 ) from e
         else:
             snapshot = {}
@@ -716,6 +739,26 @@ class ProfileService:
                 ) from e
             if not isinstance(snapshot, dict):
                 raise StorageError(f"snapshot at {snap_path} is not a JSON object")
+            # Validate snapshot shape against the tool's owned_json_paths
+            # BEFORE the merge so a shape-incompatible snapshot
+            # (``{"projects": []}`` vs. owned path ``.projects[].mcpServers``)
+            # fails loud at the planner boundary instead of being
+            # silently merged into live as a destructive apply. The
+            # classifier already runs the same check at compensation
+            # time (oplog.classify_config_file_mapping); mirroring it
+            # here closes the symmetric gap for the regular ``use()``
+            # path (CR pass-PR-6).
+            try:
+                validate_snapshot_against_owned_paths(snapshot, cf.owned_json_paths)
+            except UnsupportedWalkTargetError as e:
+                raise StorageError(
+                    f"snapshot at {snap_path} is shape-incompatible with "
+                    f"the tool's owned_json_paths: {e}"
+                ) from e
+            except InvalidOwnedPathError as e:
+                raise StorageError(
+                    f"invalid owned_json_paths for {tool.id!r} at {snap_path}: {e}"
+                ) from e
 
             if live_path.exists() and not live_path.is_file():
                 # Mirrors the capture-side regular-file gate (abby r12):
@@ -752,6 +795,17 @@ class ProfileService:
                 raise StorageError(
                     f"owned path walks into a non-object value when "
                     f"applying snapshot {snap_path} onto {live_path}: {e}"
+                ) from e
+            except InvalidOwnedPathError as e:
+                # Defense in depth: same rationale as
+                # ``_capture_config_files`` / ``_extract_and_write_config_file_snapshot``
+                # — registry-time validation already runs, but a
+                # hand-edited registry could surface the failure as a
+                # raw walker error past the service boundary
+                # (CR pass-PR-6).
+                raise StorageError(
+                    f"invalid owned_json_paths for {tool.id!r} applying "
+                    f"snapshot {snap_path} onto {live_path}: {e}"
                 ) from e
             plans.append(
                 (

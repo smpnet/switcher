@@ -360,6 +360,60 @@ def test_tool_accepts_single_config_file() -> None:
     assert len(tool.config_files) == 1
 
 
+def test_tool_rejects_duplicate_config_dir_profile_subdir() -> None:
+    """Hermes pass-PR-6: two ``config_dirs`` entries that share a
+    ``profile_subdir`` both resolve to ``<profile>/<subdir>`` at
+    init/use time. The first ``move_or_seed_dir`` succeeds and
+    swaps the first live dir to a link; the second
+    deterministically trips ``ProfileTargetExistsError`` AFTER live
+    has already been mutated. Catch at registry-load time so the
+    malformed entry surfaces immediately instead of mid-init.
+    """
+    with pytest.raises(ValidationError, match="duplicate config_dirs profile_subdir"):
+        Tool.model_validate(
+            {
+                "id": "dupdirs",
+                "name": "Dup Dirs",
+                "config_dirs": [
+                    {
+                        "posix_path": "~/.a",
+                        "windows_path": "%USERPROFILE%\\a",
+                        "profile_subdir": "same",
+                    },
+                    {
+                        "posix_path": "~/.b",
+                        "windows_path": "%USERPROFILE%\\b",
+                        "profile_subdir": "same",
+                    },
+                ],
+            }
+        )
+
+
+def test_tool_rejects_duplicate_config_dir_profile_subdir_case_insensitive() -> None:
+    """Matches the case-insensitive storage semantics on macOS / Windows:
+    ``Same`` and ``SAME`` would land at the same on-disk dir."""
+    with pytest.raises(ValidationError, match="duplicate config_dirs profile_subdir"):
+        Tool.model_validate(
+            {
+                "id": "dupdirs",
+                "name": "Dup Dirs",
+                "config_dirs": [
+                    {
+                        "posix_path": "~/.a",
+                        "windows_path": "%USERPROFILE%\\a",
+                        "profile_subdir": "Same",
+                    },
+                    {
+                        "posix_path": "~/.b",
+                        "windows_path": "%USERPROFILE%\\b",
+                        "profile_subdir": "SAME",
+                    },
+                ],
+            }
+        )
+
+
 def test_tool_credential_must_reference_known_config_dir() -> None:
     with pytest.raises(ValidationError, match="unknown config_dir"):
         Tool(

@@ -439,6 +439,26 @@ class Tool(BaseModel):
 
     @model_validator(mode="after")
     def _validate_credential_dirs(self) -> Tool:
+        # Two config_dirs entries sharing a profile_subdir both resolve
+        # to ``<profile>/<subdir>`` at init/use time, so the first
+        # ``move_or_seed_dir`` succeeds and the second deterministically
+        # trips ``ProfileTargetExistsError`` AFTER the first live dir has
+        # already been swapped to a link. Catch at registry-load time so
+        # the malformed entry surfaces immediately instead of at
+        # init/use (Hermes pass-PR-6 blocker). Comparison is case-
+        # insensitive to match the storage backend's case-folding on
+        # macOS / Windows; ``foo`` and ``Foo`` would still collide.
+        seen_subdirs: set[str] = set()
+        for d in self.config_dirs:
+            key = d.profile_subdir.casefold()
+            if key in seen_subdirs:
+                raise ValueError(
+                    f"duplicate config_dirs profile_subdir "
+                    f"{d.profile_subdir!r}; each on-disk dir must map "
+                    "to a distinct profile subdir (comparison is "
+                    "case-insensitive)."
+                )
+            seen_subdirs.add(key)
         valid = {d.profile_subdir for d in self.config_dirs}
         for c in self.credentials:
             if c.config_dir not in valid:
