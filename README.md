@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/hero.webp" alt="switcher" width="640">
+</p>
+
 # switcher
 
 Switch between AI-agent configuration profiles in one command.
