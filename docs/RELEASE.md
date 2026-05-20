@@ -4,6 +4,48 @@ Operational doc for cutting a release. Recipe-first; rationale below.
 
 ## Release notes
 
+### v0.1.6 — 2026-05-20
+
+**Added**
+
+- Profile-isolated `~/.claude.json`. Claude Code keeps MCP servers (`.mcpServers`, `.projects[].mcpServers`) and the OAuth account (`.oauthAccount`) in a single JSON file alongside `~/.claude/`; switcher now isolates those subtrees per profile while leaving everything else (lastSessionId, onboarding flags, telemetry counters) machine-global. Switching profiles no longer leaks MCPs across personas, and a fresh-cloned machine restores per-project MCP registrations through the same flow.
+  - New `ConfigFile` registry entry on the bundled `claude` tool declares the owned JSON subtrees and the on-disk snapshot location (`<profile>/.switcher/config_files/claude/claude.json`).
+  - `save` / `use` / `init` / `rescan` capture the owned subtrees on save and overlay them on use via a narrow jq-ish walker (`.key`, `[]` over JSON objects, composition); never-extracted live keys are preserved as machine-global.
+  - Missing snapshot ⇒ warn-and-skip on apply (lets older v0.1.5 profiles roll forward without wiping live state on the first `use`; run `switcher save` to materialize a snapshot for an existing profile).
+  - Op-log compensation extended: `init --continue` / `init --abort` / `rescan --continue` / `rescan --abort` recover ConfigFile snapshots alongside the existing dir mappings, driven from a journaled `_ConfigFileMappingIntent` so registry drift between intent-write and recovery doesn't change the captured shape.
+- Coverage gate in CI: 85% total line coverage + 90% diff-cover patch coverage (excludes `*cli.py`). Regressions on either dimension fail the `Coverage (pytest + diff-cover)` check before merge.
+- README hero image (`docs/hero.webp`).
+
+**Changed**
+
+- README rewritten as a user journey (install → init → switch → save → maintain). Reference material (full command list, flags, schema) moved to `docs/MANUAL.md`. The README now answers "what is this and how do I start" inside one screen.
+- `ProfileService.detect_installed()` reports a tool installed when EITHER its first `config_dir` exists OR any of its `config_files` live paths exist. A Claude Code user whose machine carries only `~/.claude.json` (no `~/.claude/` directory yet) now goes through the normal `init` / `rescan` flow instead of being silently filtered out.
+- `init()` runs a pure-read ConfigFile preflight (symlink rejection, regular-file gate, UTF-8 + JSON-object parse, owned-path walker against live) BEFORE any dir mutation. A deterministic ConfigFile validation failure aborts cleanly instead of leaving the dated profile persisted, live dirs flipped to managed links, and an in-flight oplog record behind.
+- The bundled `claude` builtin now declares its `ConfigFile` entry pointing at `~/.claude.json` (POSIX) / `%USERPROFILE%\.claude.json` (Windows) with `owned_json_paths = [".mcpServers", ".projects[].mcpServers", ".oauthAccount"]`.
+
+**Fixed**
+
+- ConfigFile snapshot containment hardening: a symlink/junction at any reserved ancestor (`<state>/profiles/<name>`, `.switcher`, `.switcher/config_files`, `.switcher/config_files/<subdir>`) is rejected at the path-builder chokepoint (`FileProfileStore.config_file_snapshot_path`) and surfaced as `AMBIGUOUS` by the op-log classifier. Closes a class of "snapshot I/O escapes the state store via redirected ancestor" reproductions that the leaf-only `is_symlink` check missed.
+- `Tool` model rejects duplicate `config_dirs[*].profile_subdir` within a tool. Pre-fix, two dir mappings sharing a `profile_subdir` deterministically tripped `ProfileTargetExistsError` mid-init AFTER the first live dir had already been swapped to a link.
+- Cross-tool ConfigFile uniqueness uses the same expansion semantics as `PathResolver.expand` (`~`, `~/...`, `~\...`, `$HOME/...`, `${HOME}/...`, `%USERPROFILE%\...`) so two tools can't silently co-manage the same `~/.claude.json` through different spellings.
+- POSIX `canonicalize_path_for_uniqueness` only folds the leading separator after `~`, not arbitrary backslashes inside the path body. Pre-fix, `/tmp/foo\bar.json` and `/tmp/foo/bar.json` collapsed to the same uniqueness key on POSIX despite resolving to different live files.
+
+**Internal**
+
+- New `src/switcher/json_paths.py`: the owned-path grammar parser, `extract_owned_paths`, `apply_owned_paths`, and `validate_snapshot_against_owned_paths` (used at every owned-path entry point so shape-incompatible snapshots fail at the validation boundary rather than mid-merge).
+- `src/switcher/links.py` gains `atomic_write_file` (tmp-file + `rename` with mode preservation + symlink rejection) and `snapshot_ancestor_link` (the reserved-ancestor containment helper).
+- `src/switcher/oplog.py`: new `ConfigFileDiskState` three-state classifier (`COMPLETE` / `UNTOUCHED` / `AMBIGUOUS`) and `_ConfigFileMappingIntent` model journaled into `_InitOp` / `_RescanOp` records.
+- Service boundary catches `UnsupportedWalkTargetError` AND `InvalidOwnedPathError` at every walker entry point (`_capture_config_files`, `_extract_and_write_config_file_snapshot`, `_plan_config_file_applies`); normalized to `StorageError` with file context.
+- Removed `docs/v0.1.3.md` from git tracking (file no longer used; was leftover from the v0.1.3 release flow).
+
+**Schema**
+
+- New reserved subtree per profile: `<state_dir>/profiles/<name>/.switcher/config_files/<subdir>/<filename>`. `validate_safe_name` rejects leading dots, so no tool's `profile_subdir` can collide. Existing v0.1.5 profiles have no `.switcher/` subdir; `use` warns and preserves live for those profiles until a `save` materializes the snapshot.
+- `oplog.json` records (`_InitOp`, `_RescanOp`) gain an optional `config_file_mappings: list[_ConfigFileMappingIntent]` field. Empty list is the v0.1.5-equivalent shape; older switcher versions reading the file ignore the unknown key. Forward-compat is preserved.
+- `config.json` unchanged.
+
+---
+
 ### v0.1.5 — 2026-05-15
 
 **Added**
