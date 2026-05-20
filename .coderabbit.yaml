@@ -48,18 +48,18 @@ reviews:
 
   suggested_labels: true
   labeling_instructions:
-    - label: "docs"
+    - label: "bug"
       instructions: >
-        Apply when the diff only touches docs/ or README.md
-        (no src/ or tests/).
-    - label: "infrastructure"
+        Apply when the PR fixes broken behavior (vs. refactor or feature).
+        Closes a `bug`-labeled Issue.
+    - label: "enhancement"
       instructions: >
-        Apply when the diff touches CI (.github/), pyproject.toml, pixi.toml,
-        pixi.lock, .coderabbit.yaml, .gitignore, or other repo-level config
-        (not source code under src/ or tests/).
-    - label: "tests"
+        Apply when the PR adds a command, flag, or capability.
+        Closes an `enhancement`-labeled Issue.
+    - label: "documentation"
       instructions: >
-        Apply when the diff only touches tests/ (no src/).
+        Apply when the PR only changes docs (README, MANUAL, RELEASE,
+        CONTRIBUTING). Closes a `documentation`-labeled Issue.
   auto_apply_labels: false
 
   suggested_reviewers: true
@@ -98,6 +98,21 @@ reviews:
           active[tid] = new for every tid in affected_ids -- including
           tool ids not present in the registry (orphans). The link-fixup
           loop is registry-dependent, but the active-map update is NOT.
+      - name: "new builtin requires CLI test inventory update"
+        mode: error
+        instructions: >-
+          This check applies only when the PR adds a new file under
+          src/switcher/builtins/*.toml. If no new builtin TOML is added,
+          the check passes automatically.
+
+          When a new builtin TOML lands, the diff MUST also touch
+          tests/unit/test_cli_init_flags.py,
+          tests/unit/test_cli_tools_columns.py, and
+          tests/unit/test_cli_rescan_interactive.py. These tests
+          hardcode the builtin inventory positionally (prompt counts,
+          column order, default-Y answers), so adding a builtin without
+          updating them breaks CI in non-obvious ways. Failure mode is
+          typically exit-130 EOF on an unexpected prompt.
 
   path_filters:
     - "!.pixi/**"
@@ -187,6 +202,16 @@ reviews:
         Builtin tool definitions. Each must round-trip through
         Tool.model_validate() — keep credential_files shorthand or
         explicit [[credentials]] consistent with the model contract.
+    - path: ".github/ISSUE_TEMPLATE/{bug,feature_request,docs}.yml"
+      instructions: >
+        GitHub Issue form templates. Require valid YAML form syntax,
+        a `title:` prefix, `labels:` matching a real repo label, and
+        validations.required on critical fields.
+    - path: ".github/ISSUE_TEMPLATE/config.yml"
+      instructions: >
+        Form chooser config (not an Issue form — different schema).
+        Carries blank_issues_enabled (bool) and contact_links (list)
+        only; no body fields. Do NOT apply Issue-form rules here.
 
   auto_review:
     enabled: true
