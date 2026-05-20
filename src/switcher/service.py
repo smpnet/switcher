@@ -199,8 +199,18 @@ class ProfileService:
             return False
         if self._resolver.exists(self._resolver.tool_dir(tool, 0)):
             return True
+        # ``resolver.exists`` treats a broken (dangling) symlink as
+        # present — same semantics applied here so a corrupt
+        # ``~/.claude.json`` symlink surfaces as "installed" and the
+        # downstream ``_validate_config_files_live`` preflight can
+        # refuse it loudly. Plain ``Path.exists()`` returns False for
+        # broken symlinks and would silently classify the tool as
+        # not-installed, hiding corruption from ``init`` / ``rescan``
+        # (Hermes pass-PR-8.5 #2).
         return any(
-            self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path).exists()
+            self._resolver.exists(
+                self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
+            )
             for cf in tool.config_files
         )
 
@@ -3575,6 +3585,21 @@ class ProfileService:
         for tid, tool in resolved:
             source = active.get(tid)
             if not source:
+                continue
+            # No ConfigFile on this tool → nothing to capture. Skip the
+            # drift dispatch below: its sole purpose is to choose which
+            # profile's CF snapshot to write into, and a tool with no
+            # ``config_files`` would just no-op through
+            # ``_capture_config_files``. Pre-fix, dir-only tools (e.g.
+            # the bundled ``copilot``) tripped the case-4 "match
+            # neither source nor destination" gate whenever their
+            # live symlink was simply missing (deleted by the user,
+            # broken by an external rename, etc.), regressing the
+            # pre-v0.1.6 ``use()`` flow where ``swap_link`` would
+            # restore the link. The dispatch's contract is about
+            # ConfigFile state and shouldn't be load-bearing on
+            # dir-only flows (Hermes pass-PR-8.5 #1).
+            if not tool.config_files:
                 continue
             # Four-way dispatch on where the live config_dirs symlinks
             # actually point (CR pass-PR-3 major + dangling-symlink

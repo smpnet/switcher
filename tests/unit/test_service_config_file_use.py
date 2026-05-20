@@ -461,10 +461,14 @@ def test_use_refuses_when_one_link_dangles_but_another_resolves_elsewhere(
     — the resolves-elsewhere half could carry user data, and skipping
     capture would let apply silently overwrite it.
 
-    Exercised with a two-dir copilot override (the project's standard
-    pattern for multi-dir tools in tests) so the helper has more than
-    one ``config_dirs`` entry to scan.
+    The dispatch is only load-bearing for tools that carry
+    ``config_files`` (Hermes pass-PR-8.5 #1 — dir-only tools no longer
+    trip case-4 on dangling live state), so the override below
+    augments the two-dir copilot with a ConfigFile entry. That keeps
+    the multi-dir mixed-state scenario this test was written to
+    exercise while honoring the post-fix scope of the dispatch.
     """
+    from switcher.models import ConfigFile
     from switcher.paths import PathResolver
     from switcher.registry import build_registry
     from switcher.service import ProfileService
@@ -473,10 +477,29 @@ def test_use_refuses_when_one_link_dangles_but_another_resolves_elsewhere(
 
     install_two_dir_copilot_override(tmp_state)
     base = build_registry(tmp_state / "registry.d")
+    augmented = tuple(
+        t.model_copy(
+            update={
+                "config_files": (
+                    ConfigFile(
+                        posix_path="~/.copilot.json",
+                        windows_path="%USERPROFILE%\\.copilot.json",
+                        profile_subdir="copilot-config",
+                        profile_filename="copilot.json",
+                        merge_strategy="json_subtree_merge",
+                        owned_json_paths=(".mcpServers",),
+                    ),
+                )
+            }
+        )
+        if t.id == "copilot"
+        else t
+        for t in base
+    )
     svc = ProfileService(
         FileProfileStore(tmp_state),
         PathResolver(home=tmp_home),
-        base,
+        augmented,
     )
     svc.init()
     svc.save("profA")
