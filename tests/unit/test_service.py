@@ -274,19 +274,26 @@ def test_use_restores_missing_live_link_for_dir_only_tool(
     Restoring the link via ``swap_link`` is the pre-v0.1.6 behavior
     and the contract dir-only consumers rely on.
     """
+    from switcher.links import remove_link
+
     service.init()
     service.save("profA")
     service.save("profB")
-    # Delete the live link the init created. Copilot has no
-    # config_files, so the capture dispatch should skip it entirely
-    # and let swap_link below restore the link.
+    # Delete the live link the init created. Copilot is link-managed
+    # via a symlink on POSIX and a junction on Windows; use the
+    # link-aware probe + helper so the assertion and the teardown
+    # both work cross-platform. ``Path.is_symlink`` returns False for
+    # Windows junctions, so a bare ``.is_symlink()`` check would
+    # fail-noisy on Windows CI even though the link is real.
     copilot_live = tmp_home / ".copilot"
-    assert copilot_live.is_symlink()
-    copilot_live.unlink()
+    resolver = PathResolver(home=tmp_home)
+    assert resolver.is_link(copilot_live)
+    remove_link(copilot_live)
+    assert not resolver.is_link(copilot_live)
 
     # Pre-fix: raises StorageError. Post-fix: succeeds, link restored.
     service.use("profB", only=["copilot"])
-    assert copilot_live.is_symlink()
+    assert resolver.is_link(copilot_live)
     active = FileProfileStore(tmp_state).get_active()
     assert active["copilot"] == "profB"
 

@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from switcher.errors import RescanCaptureError
+from switcher.errors import RescanCaptureError, StorageError
 from switcher.models import ConfigFile, Tool
 from switcher.paths import PathResolver
 from switcher.registry import build_registry
@@ -84,6 +84,48 @@ def _suppress_claude(tmp_home: Path) -> None:
     rescan time) without rewriting the conftest fixture.
     """
     shutil.rmtree(tmp_home / ".claude", ignore_errors=True)
+
+
+def test_rescan_preflight_aborts_before_oplog_append_on_cf_malformed(
+    service: ProfileService,
+    tmp_home: Path,
+    tmp_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermes pass-PR-9: ``rescan()`` must validate ConfigFile live
+    state BEFORE ``oplog.append_record(intent)``. Pre-fix, the intent
+    was journaled first and only canceled for ``ProfileExistsError``,
+    so a deterministic CF capture failure on the first tool
+    (malformed / non-UTF-8 / symlinked ~/.claude.json) fully rolled
+    the filesystem back but left the in-flight rescan record behind,
+    forcing the next command down ``--continue`` / ``--abort``
+    recovery even though there was nothing to recover.
+    """
+    _freeze_now(monkeypatch)
+    _suppress_claude(tmp_home)
+    service.init()  # captures copilot only
+
+    # Install claude post-init with a CORRUPT ~/.claude.json so the
+    # CF preflight fires AFTER detection accepts the tool. Walker
+    # rejects a list at the iter target.
+    (tmp_home / ".claude").mkdir()
+    live = tmp_home / ".claude.json"
+    live.write_text("not valid json {")
+
+    with pytest.raises(StorageError, match="malformed JSON"):
+        service.rescan(only=["claude"])
+
+    # Pre-mutation refusal: no rescan profile persisted, no in-flight
+    # oplog record left behind.
+    profile_names = [p.name for p in service._store.list()]
+    assert not any(name.endswith("-rescan-1") for name in profile_names)
+    oplog_path = tmp_state / "oplog.json"
+    if oplog_path.exists():
+        records = json.loads(oplog_path.read_text())
+        # The init record from earlier in the test may still be
+        # present (completed); the rescan we just aborted must not.
+        rescan_records = [r for r in records if r.get("op") == "rescan"]
+        assert rescan_records == []
 
 
 def test_rescan_detects_tool_via_config_file_only(

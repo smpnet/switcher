@@ -4754,6 +4754,19 @@ class ProfileService:
                     raise AlreadyLinkedError(f"{live} is already a link")
                 if live.exists() and not live.is_dir():
                     raise PathNotADirectoryError(f"{live} exists but is not a directory")
+        # ConfigFile live-path preflight — pure read. Symmetric to the
+        # init() preflight added in Hermes pass-PR-7 13:04Z: detection
+        # treats a ConfigFile-only install as "installed", so a
+        # deterministic CF validation failure (symlink, non-regular
+        # file, non-UTF-8, malformed JSON, non-object JSON, owned-path
+        # shape mismatch) must surface BEFORE ``oplog.append_record``.
+        # Pre-fix, the intent was journaled first and only canceled
+        # for ``ProfileExistsError``; a CF capture failure on the
+        # first tool fully rolled the filesystem back but left the
+        # in-flight rescan record behind, forcing the next command
+        # down ``--continue`` / ``--abort`` recovery even though
+        # nothing was left to recover (Hermes pass-PR-9).
+        self._validate_config_files_live(candidates)
 
         # Resolve target profile name(s).
         if into is not None:
