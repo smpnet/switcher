@@ -414,6 +414,69 @@ class ProfileService:
                 return False
         return True
 
+    def _validate_config_files_live(self, tools: Sequence[Tool]) -> None:
+        """Pure-read preflight for ConfigFile live paths.
+
+        Validates each tool's ``config_files`` live shape using the
+        same rules ``_capture_config_files`` applies (symlink rejection,
+        regular-file gate, UTF-8 + JSON-object parse, owned-path walker
+        runs against live so a shape mismatch surfaces). Runs BEFORE
+        any FS mutation in ``init()`` so deterministic CF validation
+        failures abort cleanly instead of leaving the dated profile
+        persisted, ``~/.claude`` flipped to a managed link, and an
+        in-flight oplog record behind (Hermes pass-PR-7 #2 — same
+        validation-after-mutation class the ``use()`` preflight closed
+        in abby r4). Live missing is fine here — capture treats absent
+        live as ``snapshot = {}``, and a fresh-machine init must
+        succeed before the user has launched the tool once.
+        """
+        for tool in tools:
+            for cf in tool.config_files:
+                live_path = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
+                if live_path.is_symlink():
+                    raise StorageError(
+                        f"refusing to capture ConfigFile through symlink at "
+                        f"{live_path}; a broken symlink would otherwise be "
+                        f"read as 'missing' and silently overwrite the "
+                        f"snapshot with {{}}. Resolve the symlink (or remove "
+                        f"it so the underlying path is read/writable) and "
+                        f"re-run."
+                    )
+                if live_path.exists() and not live_path.is_file():
+                    kind = "directory" if live_path.is_dir() else "non-regular file"
+                    raise StorageError(f"expected regular file at {live_path}, got {kind}")
+                if not live_path.exists():
+                    continue
+                try:
+                    live_text = live_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError as e:
+                    raise StorageError(f"non-UTF-8 bytes at {live_path}: {e}") from e
+                try:
+                    live_data = json.loads(live_text)
+                except json.JSONDecodeError as e:
+                    raise StorageError(
+                        f"malformed JSON at {live_path}: {e.msg} (line {e.lineno})"
+                    ) from e
+                if not isinstance(live_data, dict):
+                    raise StorageError(
+                        f"expected JSON object at {live_path}, got {type(live_data).__name__}"
+                    )
+                # Run the walker so an owned-path-vs-live shape mismatch
+                # (live ``{"projects": []}`` against owned
+                # ``.projects[].mcpServers``) surfaces here, not at the
+                # mid-init capture call. Result discarded — this is a
+                # pure validation pass.
+                try:
+                    extract_owned_paths(live_data, cf.owned_json_paths)
+                except UnsupportedWalkTargetError as e:
+                    raise StorageError(
+                        f"owned path walks into a non-object value at {live_path}: {e}"
+                    ) from e
+                except InvalidOwnedPathError as e:
+                    raise StorageError(
+                        f"invalid owned_json_paths for {tool.id!r} at {live_path}: {e}"
+                    ) from e
+
     def _capture_config_files(self, profile_name: str, tool: Tool) -> None:
         """Extract a tool's owned JSON subtrees from live and snapshot them.
 
@@ -1553,6 +1616,22 @@ class ProfileService:
                     raise PathNotADirectoryError(
                         f"{live} exists but is not a directory; cannot initialize"
                     )
+        # ConfigFile live-path preflight — pure read. Detection now
+        # treats a ConfigFile-only install as "installed" (Hermes
+        # pass-PR-7 #2), so a deterministic CF validation failure
+        # (symlink, non-regular file, non-UTF-8, malformed JSON,
+        # non-object JSON, owned-path shape mismatch) must abort
+        # BEFORE ``_store.create()`` and ``_capture_tool()`` mutate
+        # disk + journal. Pre-fix, ``init([...])`` could swap
+        # ``~/.claude`` to a managed symlink, persist the dated
+        # profile, append an in-flight oplog record, and THEN raise
+        # from ``_capture_config_files`` on the corrupt
+        # ``~/.claude.json`` — leaving the same validation-after-
+        # mutation half-applied class the ``use()`` preflight already
+        # closed (Hermes pass-PR-7 13:04 blocker). Mirrors the dir
+        # preflight above in shape and in being a pure observation of
+        # the live filesystem before mutation begins.
+        self._validate_config_files_live(installed)
         current_name = now().strftime("%Y-%m-%d") + "-current"
 
         # v0.1.5: build the intent record BEFORE any FS mutation. live_path

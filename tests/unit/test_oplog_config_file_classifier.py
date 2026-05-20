@@ -214,3 +214,30 @@ def test_classifier_ambiguous_when_reserved_ancestor_is_symlink(
         ancestor.symlink_to(external, target_is_directory=True)
 
     assert classify_config_file_mapping(_entry(), tmp_path) == ConfigFileDiskState.AMBIGUOUS
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_classifier_ambiguous_when_profile_dir_is_symlink(tmp_path: Path) -> None:
+    """Hermes pass-PR-7 #1: the ancestor-link scan must include the
+    profile root, not just the reserved subtree underneath. A
+    symlinked ``profile_dir`` lets the derived snap path resolve into
+    an external directory; ``snap_path.is_file()`` / ``read_text``
+    follow the redirection and report a healthy regular file. The
+    classifier must surface AMBIGUOUS for that shape, mirroring the
+    write-side rejection in
+    ``FileProfileStore.config_file_snapshot_path``.
+    """
+    external = tmp_path / "outside"
+    external.mkdir()
+    # Lay real bytes at the redirection target so the leaf-following
+    # read WOULD succeed; only the profile_dir-link check prevents
+    # COMPLETE misclassification.
+    (external / ".switcher" / "config_files" / "claude").mkdir(parents=True)
+    (external / ".switcher" / "config_files" / "claude" / "claude.json").write_text(
+        json.dumps({"mcpServers": {}})
+    )
+
+    fake_profile = tmp_path / "linked-profile"
+    fake_profile.symlink_to(external, target_is_directory=True)
+
+    assert classify_config_file_mapping(_entry(), fake_profile) == ConfigFileDiskState.AMBIGUOUS
