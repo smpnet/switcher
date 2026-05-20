@@ -81,7 +81,7 @@ def _create_junction(target: Path, link_path: Path) -> None:
     )
 
 
-def _force_remove(path: Path) -> None:
+def force_remove(path: Path) -> None:
     """Remove a path regardless of what kind of entry it is.
 
     Junctions are reparse-pointed *directory* entries on Windows: the
@@ -113,7 +113,7 @@ def remove_link(link_path: Path) -> None:
     invokes `RemoveDirectory`, which accepts them. POSIX symlinks always
     go through `unlink`. Anything that's not a link (real dir, regular
     file, missing) raises `PathNotADirectoryError` — callers that need
-    "remove anything" should use `_force_remove` instead.
+    "remove anything" should use `force_remove` instead.
     """
     if IS_WINDOWS and os.path.isjunction(link_path):
         link_path.rmdir()
@@ -180,7 +180,7 @@ def swap_link(target: Path, link_path: Path) -> None:
         # the old symlink or the new one, never a missing entry.
         tmp = link_path.with_name(link_path.name + ".tmp")
         if tmp.exists() or tmp.is_symlink():
-            _force_remove(tmp)
+            force_remove(tmp)
         link_dir(target, tmp)
         tmp.replace(link_path)
 

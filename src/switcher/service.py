@@ -53,6 +53,7 @@ from switcher.json_paths import (
 )
 from switcher.links import (
     atomic_write_file,
+    force_remove,
     move_or_seed_dir,
     remove_link,
     restore_real_dir,
@@ -5174,8 +5175,8 @@ class ProfileService:
                     f"(still lists tool {tool.id!r}): {meta_err}"
                 )
 
-        # Unlink any ConfigFile snapshots written into the --into target
-        # for this tool. The inner snapshot cleanup in
+        # Remove any ConfigFile snapshot debris written into the
+        # --into target for this tool. The inner cleanup in
         # ``_capture_tool_for_rescan`` only fires when
         # ``_capture_config_files`` itself raises; if that succeeds and
         # the LATER ``update_profile_tools`` (or ``set_active_state`` in
@@ -5184,15 +5185,20 @@ class ProfileService:
         # the snapshot would leak under
         # ``<target>/.switcher/config_files/...`` and trip the
         # ``rescan --into`` collision pre-flight on the next retry
-        # (Hermes pass-PR-2). Cleanup is link-aware so a corrupt
-        # snapshot-path shape also gets removed.
+        # (Hermes pass-PR-2 / pass-PR-9.5). ``force_remove`` handles
+        # every shape (file / symlink / junction / directory) the path
+        # could have taken between capture and rollback — a previous
+        # ``unlink(missing_ok=True)`` would have silently failed on a
+        # directory-shaped snapshot path and wedged the next retry
+        # because ``snap.exists()`` would still be True at the
+        # collision check.
         for cf in tool.config_files:
             snap_path = self._store.config_file_snapshot_path(
                 target, cf.profile_subdir, cf.profile_filename
             )
             if snap_path.is_symlink() or snap_path.exists():
                 with contextlib.suppress(Exception):
-                    snap_path.unlink(missing_ok=True)
+                    force_remove(snap_path)
         for i, dm in enumerate(tool.config_dirs):
             live = self._resolver.tool_dir(tool, i)
             if self._resolver.is_link(live):

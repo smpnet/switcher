@@ -64,12 +64,17 @@ def test_load_user_tools_raises_on_malformed(tmp_path: Path) -> None:
 
 
 def test_build_registry_merges_builtins_and_user(tmp_path: Path) -> None:
+    """Subset assertion so future builtins don't trip this on
+    legitimate growth — we only care that the user tool merged in
+    alongside the day-one builtins (matches the policy
+    ``test_load_builtins_includes_claude_and_copilot`` documents).
+    """
     rd = tmp_path / "registry.d"
     rd.mkdir()
     (rd / "gemini.toml").write_text(USER_TOOL, encoding="utf-8")
     tools = build_registry(rd)
-    ids = sorted(t.id for t in tools)
-    assert ids == ["claude", "copilot", "gemini"]
+    ids = {t.id for t in tools}
+    assert {"claude", "copilot", "gemini"} <= ids
 
 
 def test_build_registry_user_overrides_builtin(

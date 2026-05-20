@@ -339,3 +339,62 @@ def test_rescan_into_rollback_unlinks_orphan_snapshot(
         "rescan --into rollback failed to unlink the orphan ConfigFile "
         "snapshot under the target profile"
     )
+
+
+def test_rescan_into_rollback_force_removes_directory_shaped_snapshot(
+    service: ProfileService,
+    tmp_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermes pass-PR-9.5: ``_rollback_partial_rescan`` --into path
+    must remove ANY shape at the snapshot path, not just a regular
+    file. If something (external mutation, TOCTOU corruption, etc.)
+    replaces the snapshot with a directory between capture and
+    rollback, a bare ``unlink(missing_ok=True)`` raises
+    ``IsADirectoryError`` (silently swallowed by ``contextlib.suppress``)
+    and leaves the directory behind. The next ``rescan --into`` retry
+    then deterministically fails the snapshot-collision pre-flight
+    at ``service.py``'s ``snap.exists()`` check — recovery wedges
+    permanently. ``force_remove`` handles file / symlink / junction /
+    directory uniformly so the rollback can always reach a clean
+    target.
+    """
+    _freeze_now(monkeypatch)
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"original": {}}}))
+    service.init(["claude"])
+    service.save("target_profile")
+    service.unmanage("claude")
+    target_dir = service._store.profile_dir("target_profile")
+    shutil.rmtree(target_dir / "claude")
+    snap_pre = service._store.config_file_snapshot_path("target_profile", "claude", "claude.json")
+    snap_pre.unlink()
+
+    # Mid-rescan: replace the just-written snapshot with a directory
+    # to simulate the corrupted post-capture shape Hermes flagged.
+    from switcher import store as store_mod
+
+    def replace_snapshot_with_dir_then_fail(
+        self: FileProfileStore, *args: object, **kwargs: object
+    ) -> None:
+        snap = service._store.config_file_snapshot_path("target_profile", "claude", "claude.json")
+        snap.unlink()
+        snap.mkdir()
+        # Plant a file inside so a naive rmdir would also fail —
+        # rules out "rmdir but no rmtree" as a half-fix.
+        (snap / "inside.txt").write_text("debris")
+        raise OSError("simulated post-snapshot failure")
+
+    monkeypatch.setattr(
+        store_mod.FileProfileStore, "set_active_state", replace_snapshot_with_dir_then_fail
+    )
+
+    with pytest.raises(RescanCaptureError):
+        service.rescan(into="target_profile", only=["claude"])
+
+    snap_post = service._store.config_file_snapshot_path("target_profile", "claude", "claude.json")
+    assert not snap_post.exists(), (
+        "rescan --into rollback failed to force-remove a directory-shaped "
+        "ConfigFile snapshot under the target profile; next --into retry "
+        "would wedge on the collision pre-flight"
+    )
