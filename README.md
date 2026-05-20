@@ -129,6 +129,17 @@ only swaps Claude's symlinks.
 
 ---
 
+## One caveat: don't switch profiles while a tool is running
+
+`switcher use` rewrites a global symlink that every process on your machine
+shares. If you swap profiles while a managed tool is in a live session (e.g.
+Claude Code open in another terminal), the running process can quietly end up
+writing to both profiles. **Treat profile switching as something you do
+between runs of a tool, not during one.** Full mechanism in
+[Hot-swap hazards](docs/MANUAL.md#hot-swap-hazards).
+
+---
+
 ## Walking back
 
 Three escape hatches, least to most aggressive.
