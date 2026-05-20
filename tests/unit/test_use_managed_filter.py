@@ -22,8 +22,10 @@ from switcher.store import FileProfileStore
 def service_with_both_tools(tmp_home: Path, tmp_state: Path) -> ProfileService:
     """Build a service against the conftest tmp_home/tmp_state, then init.
 
-    After init both claude and copilot are managed and pointed at the
-    dated-current profile; vanilla also exists.
+    After init every registered builtin is managed and pointed at the
+    dated-current profile; vanilla also exists. (Fixture name is kept
+    for git-blame stability; "both" is a historical artifact of when
+    there were exactly two builtins.)
     """
     store = FileProfileStore(tmp_state)
     service = ProfileService(
@@ -96,8 +98,8 @@ def test_use_with_profile_containing_no_managed_tools_raises(
     service = service_with_both_tools
     _unmanage_claude(service)
 
-    # Build a profile whose tools dict has ONLY claude. Intersect with
-    # active = {copilot} → empty target_ids.
+    # Build a profile whose tools dict has ONLY claude. Intersect with the
+    # remaining active map (claude unmanaged → no overlap) → empty target_ids.
     service._store.create("claude-only", {"claude": True})
 
     with pytest.raises(NoToolsManagedError):

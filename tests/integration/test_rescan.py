@@ -95,7 +95,9 @@ def _freeze_now(monkeypatch: pytest.MonkeyPatch) -> datetime:
 def test_rescan_default_creates_fresh_profile_per_new_tool(
     tmp_state: Path, tmp_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Init claude only, then drop a copilot dir, then rescan → fresh profile for copilot."""
+    """tmp_home seeds claude + codex; this test suppresses copilot pre-init so
+    init captures claude + codex (not copilot). Then it materializes copilot
+    dirs and rescans → fresh profile mints for copilot."""
     frozen = _freeze_now(monkeypatch)
     s = _service(tmp_state, tmp_home)
     # Pretend copilot wasn't installed at init time.
@@ -655,3 +657,70 @@ def test_rescan_already_linked_raises(tmp_state: Path, tmp_home: Path) -> None:
         (tmp_home / COPILOT_SECOND_DIR).symlink_to(foreign, target_is_directory=True)
     with pytest.raises(AlreadyLinkedError):
         s.rescan(only=["copilot"])
+
+
+# --- CODEX_HOME end-to-end ---------------------------------------------------
+#
+# tests/unit/test_paths.py:221 proves PathResolver.tool_dir respects
+# CODEX_HOME. The release notes additionally promise that `switcher init`
+# and `switcher rescan --only codex` honor the override end-to-end. These
+# integration tests lock down that the service-level capture flow actually
+# routes through PathResolver for the codex builtin, not through a direct
+# walk of registry config_dirs that would bypass the env-override hook.
+
+
+def test_init_captures_codex_from_codex_home_override(
+    tmp_state: Path, tmp_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: CODEX_HOME set to a path OUTSIDE HOME redirects init's
+    capture to that location. Sentinel content in the override path proves
+    the profile snapshot came from $CODEX_HOME, not from ~/.codex."""
+    # Drop the conftest-seeded ~/.codex so there is no fallback path init
+    # could silently use if PathResolver were bypassed.
+    _remove_path(tmp_home / ".codex")
+    external_codex = tmp_path / "external-codex"
+    external_codex.mkdir()
+    (external_codex / "auth.json").write_text('{"sentinel": "codex-home"}')
+    monkeypatch.setenv("CODEX_HOME", str(external_codex))
+
+    s = _service(tmp_state, tmp_home)
+    s.init()
+
+    assert "codex" in s._store.get_active()
+    profile_name = s._store.get_active()["codex"]
+    captured_auth = s._store.profile_dir(profile_name) / "codex" / "auth.json"
+    assert captured_auth.is_file()
+    assert "codex-home" in captured_auth.read_text(), (
+        "captured auth.json does not contain the CODEX_HOME sentinel — "
+        "init is capturing from a path other than $CODEX_HOME"
+    )
+
+
+def test_rescan_only_codex_captures_from_codex_home_override(
+    tmp_state: Path, tmp_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rescan counterpart: an already-initialized store that lacked codex
+    at init time can adopt codex from $CODEX_HOME later via
+    `rescan --only codex`."""
+    # Suppress codex at init time (no ~/.codex, no CODEX_HOME yet).
+    _remove_path(tmp_home / ".codex")
+    s = _service(tmp_state, tmp_home)
+    s.init()
+    assert "codex" not in s._store.get_active()
+
+    # User then sets CODEX_HOME and populates it.
+    external_codex = tmp_path / "external-codex"
+    external_codex.mkdir()
+    (external_codex / "auth.json").write_text('{"sentinel": "codex-home"}')
+    monkeypatch.setenv("CODEX_HOME", str(external_codex))
+
+    s.rescan(only=["codex"])
+
+    assert "codex" in s._store.get_active()
+    profile_name = s._store.get_active()["codex"]
+    captured_auth = s._store.profile_dir(profile_name) / "codex" / "auth.json"
+    assert captured_auth.is_file()
+    assert "codex-home" in captured_auth.read_text(), (
+        "captured auth.json does not contain the CODEX_HOME sentinel — "
+        "rescan is capturing from a path other than $CODEX_HOME"
+    )

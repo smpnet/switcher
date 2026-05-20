@@ -12,9 +12,9 @@ hooks for personal projects, a vanilla one when you're debugging. `switcher`
 lets you snapshot, swap between, and recover from those configurations without
 re-authenticating each time you switch.
 
-**Day-one tools:** Claude Code and GitHub Copilot CLI ship as built-in registry
-entries. Tools are user-extensible via TOML in `<state_dir>/registry.d/` — see
-[`docs/MANUAL.md`](docs/MANUAL.md#adding-a-tool).
+**Day-one tools:** Claude Code, GitHub Copilot CLI, and OpenAI Codex CLI ship
+as built-in registry entries. Tools are user-extensible via TOML in
+`<state_dir>/registry.d/` — see [`docs/MANUAL.md`](docs/MANUAL.md#adding-a-tool).
 
 **Supported OSes:** macOS, Linux, Windows.
 

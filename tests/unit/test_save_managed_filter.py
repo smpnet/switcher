@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from switcher.errors import NoToolsManagedError
+from switcher.links import remove_link
 from switcher.paths import PathResolver
 from switcher.registry import build_registry
 from switcher.service import ProfileService
@@ -27,9 +28,12 @@ def service_with_both_tools(tmp_home: Path, tmp_state: Path) -> ProfileService:
 
 
 @pytest.fixture
-def service_with_both_tools_then_unmanage_claude(
+def service_with_claude_unmanaged(
     service_with_both_tools: ProfileService,
 ) -> ProfileService:
+    """Init every registered builtin, then unmanage claude. The remaining
+    active map carries codex and copilot; both will participate in any
+    subsequent save."""
     service = service_with_both_tools
     active = service._store.get_active()
     cache = service.get_active_live_paths()
@@ -40,10 +44,18 @@ def service_with_both_tools_then_unmanage_claude(
 
 
 def test_save_snapshots_only_managed_tools(
-    service_with_both_tools_then_unmanage_claude: ProfileService,
+    service_with_claude_unmanaged: ProfileService,
 ) -> None:
-    """active = {copilot}, both still installed → save captures only copilot."""
-    service = service_with_both_tools_then_unmanage_claude
+    """active = registry minus claude, every tool still installed →
+    save captures every managed tool (codex, copilot); claude is absent.
+
+    The assertion intentionally does NOT enumerate every managed tool —
+    `test_full_lifecycle` already validates per-tool save behavior for
+    every registered builtin. This test specifically validates the
+    claude-unmanage filtering; extending it to assert codex's presence
+    would re-encode coverage that lives in the generic lifecycle test.
+    """
+    service = service_with_claude_unmanaged
     service.save("test-snap")
 
     profile_dir = service._store.profile_dir("test-snap")
@@ -70,12 +82,19 @@ def test_save_when_no_managed_tools_are_installed_raises(
     failure mode §3.5 closes off for the empty-active-map case.
     Reachable via external uninstall of every managed tool or a
     registry reshuffle that drops every managed tool id.
+
+    Iterates active_live_paths instead of hardcoding tool names so
+    every registered builtin's live path gets removed — adding a new
+    builtin must not require updating this test.
     """
     service = service_with_both_tools
-    # Remove every live symlink init() installed. detect_installed() now
+    # Remove every live link init() installed. detect_installed() now
     # returns [], so the managed-filter intersection is empty.
-    (tmp_home / ".claude").unlink()
-    (tmp_home / ".copilot").unlink()
+    for paths in service.get_active_live_paths().values():
+        for raw_path in paths:
+            live = Path(raw_path)
+            if service._resolver.is_link(live):
+                remove_link(live)
     assert service._store.get_active(), "active map should still be populated"
     with pytest.raises(NoToolsManagedError):
         service.save("would-be-empty")

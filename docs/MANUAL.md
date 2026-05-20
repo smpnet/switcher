@@ -147,8 +147,9 @@ This is an exceptional manual procedure with multiple failure modes, not a
 routine operation. **You will lose every saved profile, your live tool config,
 AND any user-added tool registry entries if you do not back up the entire
 `<state_dir>` first.** The `<dated>-current` profile is where your real
-Claude/Copilot config lives after `init` (the live `~/.claude` etc. are just
-symlinks into it); `<state_dir>/registry.d/` holds user-added tool definitions;
+Claude / Copilot / Codex config lives after `init` (the live `~/.claude`,
+`~/.copilot`, `~/.codex`, etc. are just symlinks into it);
+`<state_dir>/registry.d/` holds user-added tool definitions;
 `<state_dir>/profiles/` holds every saved profile. Read the whole procedure
 before running any of the steps.
 

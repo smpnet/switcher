@@ -57,6 +57,7 @@ def test_uninstall_default_restores_real_dirs_and_clears_active(
     # Every live path is now a real dir (no longer a link).
     for live in [
         tmp_home / ".claude",
+        tmp_home / ".codex",
         tmp_home / ".copilot",
         tmp_home / ".config" / "github-copilot",
     ]:
@@ -543,3 +544,41 @@ def test_uninstall_resume_after_partial_uninstall_and_registry_drift(
     shrunk.uninstall()
     assert (tmp_home / ".copilot").is_dir() and not _is_link(tmp_home / ".copilot")
     assert legacy_link.is_dir() and not _is_link(legacy_link)
+
+
+def test_uninstall_restores_real_dir_at_codex_home_not_default_path(
+    tmp_state: Path, tmp_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """uninstall must restore the live dir at $CODEX_HOME (the override path
+    actually managed by init), NOT at ~/.codex (the registry default). A
+    regression where uninstall walks raw config_dirs from the TOML instead
+    of consulting PathResolver / the cached live_paths would restore at
+    ~/.codex and leave the real managed dir under $CODEX_HOME stranded as
+    a dangling symlink target.
+
+    Companion to test_init_captures_codex_from_codex_home_override —
+    same end-to-end env-override risk, destructive side."""
+    # Drop the conftest-seeded ~/.codex so it can't act as a silent fallback.
+    shutil.rmtree(tmp_home / ".codex")
+    external_codex = tmp_path / "external-codex"
+    external_codex.mkdir()
+    (external_codex / "auth.json").write_text('{"sentinel": "codex-home"}')
+    monkeypatch.setenv("CODEX_HOME", str(external_codex))
+
+    s = _service(tmp_state, tmp_home)
+    s.init()
+    # Pre-uninstall: $CODEX_HOME is a link, ~/.codex doesn't exist.
+    assert _is_link(external_codex)
+    assert not (tmp_home / ".codex").exists()
+
+    s.uninstall()
+
+    # $CODEX_HOME restored as a real directory with the sentinel intact.
+    assert external_codex.is_dir() and not _is_link(external_codex)
+    restored_auth = external_codex / "auth.json"
+    assert restored_auth.is_file()
+    assert "codex-home" in restored_auth.read_text()
+    # ~/.codex must NOT have been re-created by uninstall.
+    assert not (tmp_home / ".codex").exists(), (
+        "uninstall created ~/.codex — it should have restored at $CODEX_HOME instead"
+    )

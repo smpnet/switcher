@@ -4,6 +4,22 @@ Operational doc for cutting a release. Recipe-first; rationale below.
 
 ## Release notes
 
+### v0.1.7 — 2026-05-20
+
+**Added**
+
+- OpenAI Codex CLI as a built-in tool. `switcher init` on a fresh state-store now detects `~/.codex` automatically — or the path indicated by `CODEX_HOME` if it is set in the user's environment, matching codex's own upstream resolution (the same pattern switcher already uses for `CLAUDE_CONFIG_DIR`). Existing initialized state-stores can bring codex under management with `switcher rescan --only codex`.
+
+**Internal**
+
+- `tests/conftest.py` `tmp_home` fixture seeds `~/.codex` so `test_full_lifecycle` covers the new builtin generically (see CONTRIBUTING §"Adding a built-in tool" step 3 carve-out).
+
+**Schema**
+
+- **No state-file schema change.** v0.1.7 reads and writes the v0.1.6 shape unchanged. Codex's TOML uses only `config_dirs`; the `config_files` schema added in v0.1.6 is not exercised by this builtin.
+
+---
+
 ### v0.1.6 — 2026-05-20
 
 **Added**

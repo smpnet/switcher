@@ -10,6 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from switcher.cli import app
+from switcher.registry import load_builtin_tools
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -17,13 +18,19 @@ runner = CliRunner()
 
 
 @pytest.fixture
-def tmp_home_no_copilot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Like `tmp_home` but with no Copilot live dirs seeded.
+def tmp_home_no_copilot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clear_builtin_env_overrides: None,
+) -> Path:
+    """Like `tmp_home` but seeds only claude — no copilot, no codex.
 
     Used by tests that need --only/--skip to surface "requested but not
-    detected" for copilot. The post-T4 builtin only references
-    ~/.copilot (or %USERPROFILE%\\.copilot on Windows); not creating
-    that dir is sufficient to make detect_installed() miss copilot.
+    detected" for tools other than claude, or that need claude to be the
+    sole detected tool for an "every detected tool" repro. Seeds whatever
+    happens to be required by the consumers in this module — do NOT add
+    more builtin dirs here without checking every consumer test for
+    detection-count assumptions.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -140,7 +147,7 @@ def test_init_returns_init_report(tmp_home: Path, tmp_state: Path) -> None:
     report = deps.service.init()
     assert isinstance(report, InitReport)
     assert report.profile_name.endswith("-current")
-    assert set(report.captured) == {"claude", "copilot"}
+    assert set(report.captured) == {t.id for t in load_builtin_tools()}
     assert report.requested_but_not_installed == []
     assert report.skipped_via_skip_flag == []
     assert report.skipped_via_interactive == []
@@ -183,28 +190,32 @@ def test_init_interactive_default_yes_captures_all(
 ) -> None:
     """Empty input lines accept the default-Y; all tools captured."""
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["init", "--interactive"], input="\n\n")
+    all_ids = {t.id for t in load_builtin_tools()}
+    result = runner.invoke(app, ["init", "--interactive"], input="\n" * len(all_ids))
     assert result.exit_code == 0, _combined(result)
     from switcher.cli import get_deps
 
     active = get_deps().store.get_active()
-    assert "claude" in active and "copilot" in active
+    assert set(active.keys()) == all_ids
 
 
 def test_init_interactive_all_no_raises_nothing_to_initialize(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["init", "--interactive"], input="n\nn\n")
+    all_ids = [t.id for t in load_builtin_tools()]
+    result = runner.invoke(app, ["init", "--interactive"], input="n\n" * len(all_ids))
     assert result.exit_code != 0
     out = _combined(result).lower()
     assert "nothing to initialize" in out or "every detected tool was skipped" in out
 
 
 def test_init_skip_excludes_every_registered_tool_errors(tmp_home: Path, tmp_state: Path) -> None:
-    """abby review: --skip claude,copilot leaves the target set empty; the
-    error must reflect 'skipped everything', not 'requested not installed'."""
-    result = runner.invoke(app, ["init", "--skip", "claude,copilot"])
+    """abby review: --skip <every registered builtin> leaves the target set
+    empty; the error must reflect 'skipped everything', not 'requested not
+    installed'."""
+    every_id = ",".join(t.id for t in load_builtin_tools())
+    result = runner.invoke(app, ["init", "--skip", every_id])
     assert result.exit_code != 0
     out = _combined(result).lower()
     assert "every registered tool" in out or "excluded every" in out
@@ -215,14 +226,24 @@ def test_init_skip_excludes_every_registered_tool_errors(tmp_home: Path, tmp_sta
 def test_init_interactive_some_no_surfaces_skipped(
     tmp_home: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Y for claude, N for copilot: report shows skipped_via_interactive."""
+    """Default-Y every builtin except copilot, which is declined; the report
+    must surface copilot under skipped_via_interactive (and the captured list
+    must be every other builtin in registry order).
+
+    Prompt order is registry order (alphabetical-by-filename). Each accepted
+    builtin gets a `\\n` (default-Y); the declined builtin gets `n\\n`.
+    """
     monkeypatch.setattr("switcher.cli._stdin_is_tty", lambda: True)
-    result = runner.invoke(app, ["init", "--interactive"], input="\nn\n")
+    all_ids = [t.id for t in load_builtin_tools()]
+    declined = "copilot"
+    captured = [tid for tid in all_ids if tid != declined]
+    input_str = "".join("n\n" if tid == declined else "\n" for tid in all_ids)
+    result = runner.invoke(app, ["init", "--interactive"], input=input_str)
     assert result.exit_code == 0, _combined(result)
     out = _combined(result)
-    assert "Captured: claude" in out
-    assert "Skipped (via interactive): copilot" in out
-    assert "switcher rescan --only copilot" in out
+    assert f"Captured: {', '.join(captured)}" in out
+    assert f"Skipped (via interactive): {declined}" in out
+    assert f"switcher rescan --only {declined}" in out
 
 
 def test_init_skip_excludes_every_detected_tool_errors(
@@ -291,7 +312,10 @@ def test_init_interactive_eof_exits_cleanly(
 
 
 def test_init_interactive_zero_detected_distinct_wording(
-    tmp_path: Path, tmp_state: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    tmp_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clear_builtin_env_overrides: None,
 ) -> None:
     """Hermes nit: when --interactive is invoked on a machine with no
     installed tools, the error wording must NOT say 'every detected tool
@@ -299,6 +323,9 @@ def test_init_interactive_zero_detected_distinct_wording(
     distinguishes the zero-detected case with its own message.
     """
     # Empty home — no .claude, no .copilot, no github-copilot.
+    # `clear_builtin_env_overrides` (registry-driven) ensures the
+    # deliberately-empty home survives a developer shell with any
+    # CODEX_HOME / CLAUDE_CONFIG_DIR / future-builtin override set.
     home = tmp_path / "home"
     home.mkdir()
     if IS_WINDOWS:

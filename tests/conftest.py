@@ -17,11 +17,34 @@ from pathlib import Path
 
 import pytest
 
+from switcher.registry import load_builtin_tools
+
 IS_WINDOWS = sys.platform == "win32"
 
 
 @pytest.fixture
-def tmp_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def clear_builtin_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear every registered builtin's env_override env var.
+
+    Derives the list from `load_builtin_tools()` so adding a new builtin
+    with an env_override auto-extends fixture hermeticity. A developer
+    shell with CODEX_HOME / CLAUDE_CONFIG_DIR / <future-builtin>_HOME set
+    can't escape the temp home or detect a non-temp live config. Hosted
+    CI runners don't typically have these set; this hardens against
+    developer-local test runs.
+    """
+    for tool in load_builtin_tools():
+        for dm in tool.config_dirs:
+            if dm.env_override:
+                monkeypatch.delenv(dm.env_override, raising=False)
+
+
+@pytest.fixture
+def tmp_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clear_builtin_env_overrides: None,
+) -> Path:
     home = tmp_path / "home"
     home.mkdir()
     if IS_WINDOWS:
@@ -30,6 +53,7 @@ def tmp_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         (home / ".claude").mkdir()
         (home / "AppData" / "Local" / "github-copilot").mkdir(parents=True)
         (home / ".copilot").mkdir()
+        (home / ".codex").mkdir()
     else:
         monkeypatch.setenv("HOME", str(home))
         # On POSIX `Path.home()` reads HOME first; clear XDG_CONFIG_HOME so
@@ -38,6 +62,7 @@ def tmp_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         (home / ".claude").mkdir()
         (home / ".config" / "github-copilot").mkdir(parents=True)
         (home / ".copilot").mkdir()
+        (home / ".codex").mkdir()
     return home
 
 

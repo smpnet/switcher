@@ -1,0 +1,9 @@
+id = "codex"
+name = "OpenAI Codex CLI"
+credential_files = ["auth.json"]   # shorthand → first config_dir
+
+[[config_dirs]]
+posix_path = "~/.codex"
+windows_path = "%USERPROFILE%\\.codex"
+profile_subdir = "codex"
+env_override = "CODEX_HOME"

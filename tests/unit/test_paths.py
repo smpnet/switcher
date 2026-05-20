@@ -7,6 +7,7 @@ import pytest
 
 from switcher.models import DirMapping, Tool
 from switcher.paths import IS_WINDOWS, PathResolver
+from switcher.registry import find_tool, load_builtin_tools
 
 
 @pytest.fixture
@@ -215,3 +216,19 @@ def test_tool_dir_treats_empty_env_override_as_unset(
         assert resolver.tool_dir(_two_dir_tool(), 0) == home / "github-copilot"
     else:
         assert resolver.tool_dir(_two_dir_tool(), 0) == home / ".config" / "github-copilot"
+
+
+def test_codex_builtin_env_override_resolves_to_custom_path(
+    resolver: PathResolver, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end: codex.toml declares env_override = "CODEX_HOME", and
+    setting that env var must redirect the resolved tool_dir to the
+    custom location, not ~/.codex. Guards codex's TOML wiring specifically
+    — the generic env-override mechanism is covered above with a synthetic
+    tool, but a typo in codex.toml (wrong field name, wrong var name)
+    would slip past the generic tests."""
+    custom = tmp_path / "custom-codex"
+    monkeypatch.setenv("CODEX_HOME", str(custom))
+    codex = find_tool(load_builtin_tools(), "codex")
+    assert codex is not None
+    assert resolver.tool_dir(codex, 0) == custom

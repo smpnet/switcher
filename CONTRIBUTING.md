@@ -171,8 +171,8 @@ user-local TOMLs under `<state_dir>/registry.d/`. A built-in tool
 ships as part of the package and is auto-detected on `init`.
 
 Built-in treatment makes sense for **broadly-adopted CLIs with a
-stable config-dir contract** (e.g. Claude Code, GitHub Copilot CLI).
-Niche or evolving tools should stay user-local.
+stable config-dir contract** (e.g. Claude Code, GitHub Copilot CLI,
+OpenAI Codex CLI). Niche or evolving tools should stay user-local.
 
 To add a builtin:
 
@@ -186,7 +186,20 @@ To add a builtin:
 3. **Add an integration test** in `tests/integration/` asserting
    the full capture/restore cycle: init detects the tool, profile
    dir gets the right subdir, `use` swaps the symlink correctly,
-   uninstall restores the real directory.
+   uninstall restores the real directory. *Exception:* if the
+   builtin introduces no new behavioral surface (single-`config_dirs`
+   entry, no credentials shorthand variation, no env-override edge
+   case beyond what existing builtins exercise), seed its first live
+   dir in `tests/conftest.py`'s `tmp_home` fixture instead. Most of
+   the lifecycle (init / use / save / create / delete / rename) is
+   then picked up automatically by
+   `tests/integration/test_lifecycle.py::test_full_lifecycle`, which
+   iterates `for tool in registry`. Uninstall is **not** in
+   `test_full_lifecycle`'s sequence — add the new tool's live path
+   to the assertion list in
+   `tests/integration/test_uninstall.py::test_uninstall_default_restores_real_dirs_and_clears_active`
+   so uninstall regressions surface for the new tool too. Codex is
+   the worked example.
 4. **Add the tool to `scripts/verify_windows_paths.py`** if its
    Windows path uses an environment variable that needs expansion.
 5. **For deprecated upstream variants** (e.g. `gh copilot` ext vs

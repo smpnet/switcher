@@ -157,7 +157,7 @@ def test_init_populates_active_live_paths(tmp_state: Path, tmp_home: Path) -> No
     active = store.get_active()
     assert set(cache) == set(active)
     for tool_id, paths in cache.items():
-        # Copilot has 2 DirMappings, claude has 1 — both shapes work.
+        # DirMapping counts are registry-driven; the assertion shape handles any count.
         tool = find_tool(registry, tool_id)
         assert tool is not None
         assert len(paths) == len(tool.config_dirs)

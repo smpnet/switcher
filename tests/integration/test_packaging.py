@@ -38,9 +38,10 @@ def test_wheel_bundles_builtin_tomls(tmp_path: Path) -> None:
     assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
     with zipfile.ZipFile(wheels[0]) as zf:
         names = zf.namelist()
-    # Both day-one builtins must be in the wheel — otherwise an installed
+    # Every day-one builtin must be in the wheel — otherwise an installed
     # switcher would crash at first use of `load_builtin_tools()`.
     assert "switcher/builtins/claude.toml" in names
+    assert "switcher/builtins/codex.toml" in names
     assert "switcher/builtins/copilot.toml" in names
     # No duplicate entries: a redundant force-include alongside the
     # `packages` directive used to ship every builtin twice. Hatch warns
@@ -76,4 +77,5 @@ def test_sdist_bundles_builtin_tomls(tmp_path: Path) -> None:
     # sdists prefix entries with the project-version directory; match by suffix.
     suffixes = {n.split("/", 1)[1] if "/" in n else n for n in names}
     assert "src/switcher/builtins/claude.toml" in suffixes
+    assert "src/switcher/builtins/codex.toml" in suffixes
     assert "src/switcher/builtins/copilot.toml" in suffixes
