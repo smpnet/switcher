@@ -64,6 +64,83 @@ def test_detect_installed_skips_missing(
     assert "claude" not in ids
 
 
+def test_detect_installed_finds_tool_via_config_file_only(
+    tmp_home: Path,
+    tmp_state: Path,
+    registry: tuple[Tool, ...],
+) -> None:
+    """Hermes pass-PR-7 #2: a tool whose first ``config_dir`` does not
+    exist on disk but whose ``config_files`` live path does is still
+    installed. Without this, a Claude Code user who only has
+    ``~/.claude.json`` (no ``~/.claude/`` directory) was reported "not
+    installed" and ``init(['claude'])`` raised ``NothingToInitializeError``,
+    blocking the new ConfigFile isolation path from activating for a
+    valid live-state shape.
+    """
+    # Tear down the dir signal; leave only the JSON file behind so
+    # detect must rely on the config_files probe.
+    shutil.rmtree(tmp_home / ".claude")
+    (tmp_home / ".claude.json").write_text("{}")
+
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, registry)
+    ids = {t.id for t in service.detect_installed()}
+    assert "claude" in ids
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_detect_installed_finds_tool_via_broken_config_file_symlink(
+    tmp_home: Path,
+    tmp_state: Path,
+    registry: tuple[Tool, ...],
+) -> None:
+    """Hermes pass-PR-8.5 #2: a broken/dangling ConfigFile live path
+    symlink is still install evidence — corruption that needs to
+    surface, not hide. ``Path.exists()`` returns False for broken
+    symlinks; the dir-side detection uses ``resolver.exists()``
+    (``p.exists() or p.is_symlink()``) and the ConfigFile branch
+    must match. Pre-fix, a dangling ``~/.claude.json`` made
+    ``detect_installed()`` return ``[]`` and ``init(['claude'])``
+    raise ``NothingToInitializeError`` instead of the validating
+    preflight refusing the broken-symlink shape.
+    """
+    shutil.rmtree(tmp_home / ".claude")
+    json_path = tmp_home / ".claude.json"
+    if json_path.exists() or json_path.is_symlink():
+        json_path.unlink()
+    json_path.symlink_to(tmp_home / ".does-not-exist.json")
+    assert json_path.is_symlink() and not json_path.exists()
+
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, registry)
+    ids = {t.id for t in service.detect_installed()}
+    assert "claude" in ids
+
+
+def test_detect_installed_excludes_tool_with_neither_dir_nor_file(
+    tmp_home: Path,
+    tmp_state: Path,
+    registry: tuple[Tool, ...],
+) -> None:
+    """Symmetric to the above: with both the dir AND the JSON file
+    absent, claude must NOT surface — adding the config_files probe
+    must not relax the "no signal at all" exclusion.
+    """
+    shutil.rmtree(tmp_home / ".claude")
+    # Belt-and-suspenders: ensure the JSON file doesn't exist either.
+    json_path = tmp_home / ".claude.json"
+    if json_path.exists():
+        json_path.unlink()
+
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, registry)
+    ids = {t.id for t in service.detect_installed()}
+    assert "claude" not in ids
+
+
 # ---------------- init ----------------
 
 
@@ -182,6 +259,43 @@ def test_use_only_with_tool_not_in_profile_raises(service: ProfileService) -> No
 def test_use_before_init_raises(service: ProfileService) -> None:
     with pytest.raises(StateNotInitializedError):
         service.use("vanilla")
+
+
+def test_use_restores_missing_live_link_for_dir_only_tool(
+    service: ProfileService, tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes pass-PR-8.5 #1 regression: ``use()``'s new ConfigFile
+    capture-phase drift dispatch must NOT fire for tools with no
+    ``config_files``. Pre-fix, deleting the live symlink for a
+    dir-only tool (e.g. ``copilot``, no ``config_files``) made the
+    next ``use()`` raise ``StorageError("match neither active source
+    nor destination")`` — the four-way dispatch's case-4 gate was
+    load-bearing on dir-only flows it had no business judging.
+    Restoring the link via ``swap_link`` is the pre-v0.1.6 behavior
+    and the contract dir-only consumers rely on.
+    """
+    from switcher.links import remove_link
+
+    service.init()
+    service.save("profA")
+    service.save("profB")
+    # Delete the live link the init created. Copilot is link-managed
+    # via a symlink on POSIX and a junction on Windows; use the
+    # link-aware probe + helper so the assertion and the teardown
+    # both work cross-platform. ``Path.is_symlink`` returns False for
+    # Windows junctions, so a bare ``.is_symlink()`` check would
+    # fail-noisy on Windows CI even though the link is real.
+    copilot_live = tmp_home / ".copilot"
+    resolver = PathResolver(home=tmp_home)
+    assert resolver.is_link(copilot_live)
+    remove_link(copilot_live)
+    assert not resolver.is_link(copilot_live)
+
+    # Pre-fix: raises StorageError. Post-fix: succeeds, link restored.
+    service.use("profB", only=["copilot"])
+    assert resolver.is_link(copilot_live)
+    active = FileProfileStore(tmp_state).get_active()
+    assert active["copilot"] == "profB"
 
 
 def test_use_is_idempotent(service: ProfileService, tmp_state: Path) -> None:

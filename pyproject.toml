@@ -46,6 +46,11 @@ reportMissingTypeStubs = false
 reportUnknownParameterType = "none"  # too noisy for typer/pydantic
 reportUnknownMemberType = "none"
 reportUnknownVariableType = "none"
+# ConfigFile snapshot work (v0.1.6) routes `dict[str, Any]` payloads
+# from `json.loads` through walker helpers; argument types are partially
+# unknown by construction. Consistent with the other Unknown-* reports
+# already disabled for the same dynamic-typing reason.
+reportUnknownArgumentType = "none"
 
 [tool.pytest.ini_options]
 markers = [
