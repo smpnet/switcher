@@ -1,0 +1,58 @@
+name: Feature request
+description: A new command, flag, or capability — or a change to how existing ones behave
+title: "Feature: <short description>"
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Before filling this out, please scan existing Issues with the `enhancement` label to see if it's already proposed. If it is, comment there instead of opening a duplicate.
+
+        For substantial feature requests with real design tradeoffs, the **Open questions** section below is where you flag what would need to be decided before this could ship. The more concrete the better.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What's the situation today? What does the user want to accomplish that they can't (or that's awkward)?
+      placeholder: "When a user adds a new tool to switcher after profiles already exist, they have no clean way to retrofit the tool into the legacy profiles. They have to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-behavior
+    attributes:
+      label: Proposed behavior
+      description: What should switcher do? Be concrete — name commands, flags, and outcomes.
+      placeholder: |
+        Add `switcher graft <tool> --from <src> --to <profile>[,<profile>...]` with semantics:
+        - ...
+        - ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other shapes you weighed and why they're worse than the proposed behavior.
+      placeholder: |
+        - `switcher rescan --into <profile>` repeated per profile: works but generates op-log churn.
+        - Manual filesystem edit: bypasses validation, brittle.
+
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: Open questions
+      description: What's unresolved? What would need a decision before this could ship?
+      placeholder: |
+        1. Should the default be opt-in or opt-out?
+        2. How does this interact with the vanilla profile?
+
+  - type: textarea
+    id: related
+    attributes:
+      label: Related
+      description: Links to related Issues, PRs, prior art, or external discussion.
+      placeholder: "- #N — ..."

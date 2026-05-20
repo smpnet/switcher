@@ -1,0 +1,68 @@
+name: Bug report
+description: Something switcher does that's wrong, broken, or surprises you in an unwelcome way
+title: "Bug: <short description>"
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Before filling this out, please scan existing Issues with the `bug` label to see if it's already filed. If it is, comment there with anything new you've observed instead of opening a duplicate.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the broken behavior. What did switcher do, and why is it wrong?
+      placeholder: "When I ran `switcher use exp1`, it did X. I expected it to do Y because..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: The exact sequence of commands or actions that triggers the bug. Smaller is better — strip away anything unrelated.
+      placeholder: |
+        1. `switcher init`
+        2. `switcher create exp1`
+        3. `switcher use exp1`
+        4. Observe: ...
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected vs. actual behavior
+      description: What did you expect to happen, and what actually happened?
+      placeholder: |
+        Expected: ~/.claude is a symlink into the exp1 profile's claude subdir.
+        Actual: ~/.claude is a real directory; the symlink was never created.
+    validations:
+      required: true
+
+  - type: input
+    id: switcher-version
+    attributes:
+      label: switcher version
+      description: The output of `switcher version`.
+      placeholder: "switcher v0.1.7"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: macOS / Linux / Windows, plus version if known.
+      placeholder: "macOS 14.5 (arm64)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Logs, screenshots, related Issues, or anything else that might help diagnose the bug.
