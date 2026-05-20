@@ -109,6 +109,24 @@ def test_snapshot_path_allows_real_reserved_ancestors(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
+def test_snapshot_path_rejects_link_at_profiles_parent(tmp_path: Path) -> None:
+    """Hermes pass-PR-8 #2: the ancestor scan must include
+    ``<state>/profiles`` itself, not just per-profile subtrees. A
+    symlinked profiles root lets EVERY profile's snapshot path
+    resolve into an external directory. Empirically verified pre-fix:
+    ``atomic_write_file`` on the returned path created the snapshot at
+    ``<external>/workA/.switcher/config_files/claude/claude.json``.
+    """
+    store = FileProfileStore(tmp_path)
+    external = tmp_path / "outside"
+    external.mkdir()
+    (tmp_path / "profiles").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(StorageError, match="link or junction"):
+        store.config_file_snapshot_path("workA", "claude", "claude.json")
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="symlinks require elevation on Windows")
 def test_snapshot_path_rejects_link_at_profile_dir(tmp_path: Path) -> None:
     """Hermes pass-PR-7 #1: the ancestor scan must include
     ``profile_dir`` itself, not just the reserved subtree underneath.

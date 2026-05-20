@@ -168,38 +168,50 @@ class ProfileService:
 
     # Helpers ---------------------------------------------------------------
 
+    def _is_tool_installed(self, tool: Tool) -> bool:
+        """Single predicate for the "is this tool installed?" question.
+
+        A tool is installed if EITHER its first ``config_dir`` exists
+        on disk OR any of its ``config_files`` live paths exist. The
+        dir-only heuristic predates ConfigFile support and missed
+        valid install shapes that ship a managed JSON file but no dir
+        yet (Hermes pass-PR-7 #2 / pass-PR-8 #1): a Claude Code user
+        whose live state is only ``~/.claude.json`` (no ``~/.claude/``
+        directory) was reported "not installed", which made
+        ``init(["claude"])`` raise ``NothingToInitializeError`` AND
+        ``rescan(only=["claude"])`` raise ``RescanCaptureError("not
+        detected at expected path")`` — blocking the very install
+        shape this PR is designed to manage.
+
+        Both ``detect_installed()`` and ``rescan()``'s candidate
+        builder route through this predicate so the two surfaces stay
+        in lockstep; drift between them was the original v0.1.6
+        rescan bug.
+
+        The Tool model requires every
+        ``ConfigFile.profile_subdir`` to reference one of the tool's
+        ``config_dirs``, so adding the JSON-file signal never produces
+        a tool with no config_dir to swap — the downstream
+        ``move_or_seed_dir`` already handles the "live dir missing"
+        case by seeding an empty profile target.
+        """
+        if not tool.config_dirs:
+            return False
+        if self._resolver.exists(self._resolver.tool_dir(tool, 0)):
+            return True
+        return any(
+            self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path).exists()
+            for cf in tool.config_files
+        )
+
     def detect_installed(self) -> list[Tool]:
         """Tools that appear installed on this machine.
 
-        A tool is reported installed if EITHER:
-          * its first ``config_dir`` exists on disk, OR
-          * any of its ``config_files`` live paths exist on disk.
-
-        The dir-only heuristic predates ConfigFile support and missed
-        valid install shapes that ship a managed JSON file but no dir
-        yet (Hermes pass-PR-7 #2): a Claude Code user whose live state
-        is only ``~/.claude.json`` (no ``~/.claude/`` directory) was
-        reported "not installed", which made ``init([\"claude\"])``
-        raise ``NothingToInitializeError`` and prevented the new
-        ConfigFile isolation path from activating at all. The Tool
-        model requires every ``ConfigFile.profile_subdir`` to reference
-        one of the tool's ``config_dirs``, so adding the JSON-file
-        signal never produces a tool with no config_dir to swap — the
-        downstream ``move_or_seed_dir`` already handles the "live dir
-        missing" case by seeding an empty profile target.
+        Routes through ``_is_tool_installed`` so detection stays in
+        lockstep with ``rescan()``'s candidate selection — see that
+        predicate's docstring for the dir-OR-config_file rule.
         """
-        installed: list[Tool] = []
-        for tool in self._registry:
-            if not tool.config_dirs:
-                continue
-            has_dir = self._resolver.exists(self._resolver.tool_dir(tool, 0))
-            has_file = any(
-                self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path).exists()
-                for cf in tool.config_files
-            )
-            if has_dir or has_file:
-                installed.append(tool)
-        return installed
+        return [tool for tool in self._registry if self._is_tool_installed(tool)]
 
     def all_live_paths_present(self, tool: Tool) -> bool:
         """True iff EVERY config_dir's resolved live path exists on disk.
@@ -4677,17 +4689,17 @@ class ProfileService:
         self._require_initialized()
         active = self._store.get_active()
 
-        # Detection: tool in registry, not in active, first config dir exists at live.
-        candidates: list[Tool] = []
-        for tool in self._registry:
-            if tool.id in active:
-                continue
-            if not tool.config_dirs:
-                continue
-            first_live = self._resolver.tool_dir(tool, 0)
-            if not self._resolver.exists(first_live):
-                continue
-            candidates.append(tool)
+        # Detection: tool in registry, not in active, AND installed by
+        # the shared predicate (first config_dir on disk OR any
+        # config_files live path on disk — see _is_tool_installed).
+        # Reusing the predicate keeps rescan and detect_installed in
+        # lockstep; the v0.1.6 dir-only check missed Claude installs
+        # that only carry ``~/.claude.json`` (Hermes pass-PR-8 #1).
+        candidates: list[Tool] = [
+            tool
+            for tool in self._registry
+            if tool.id not in active and self._is_tool_installed(tool)
+        ]
 
         if only is not None:
             if not only:

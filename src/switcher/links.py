@@ -395,21 +395,26 @@ def snapshot_ancestor_link(profile_dir: Path, profile_subdir: str) -> Path | Non
     ConfigFile snapshots live at
     ``profile_dir/.switcher/config_files/<profile_subdir>/<filename>``.
     Every read/write/classify site already rejects a leaf symlink, but
-    a symlink/junction at ``profile_dir``, ``.switcher``,
-    ``.switcher/config_files``, or
+    a symlink/junction at ``<state>/profiles``, ``profile_dir``,
+    ``.switcher``, ``.switcher/config_files``, or
     ``.switcher/config_files/<profile_subdir>`` silently redirects
     snapshot I/O outside the state store — the leaf's
     ``is_symlink()``/``is_file()`` check follows the redirection and
     reports a healthy regular file even though the underlying inode
-    lives elsewhere (Hermes pass-PR-6 / pass-PR-7 #1 blockers).
+    lives elsewhere (Hermes pass-PR-6 / pass-PR-7 #1 / pass-PR-8 #2
+    blockers).
 
-    The scan includes ``profile_dir`` itself because a symlinked
-    profile root compromises the *entire* reserved subtree, not just
-    the snapshot path: every ConfigFile call site routes through
-    ``FileProfileStore.config_file_snapshot_path`` (which routes
-    through this helper), so anchoring the check at the profile root
-    closes the escape regardless of which subdirectory the caller is
-    targeting.
+    The scan includes ``<state>/profiles`` and ``profile_dir`` itself
+    because a symlinked ancestor compromises the *entire* reserved
+    subtree, not just the snapshot path: every ConfigFile call site
+    routes through ``FileProfileStore.config_file_snapshot_path``
+    (which routes through this helper), so anchoring the check at the
+    state-store profiles root closes the escape regardless of which
+    profile or subdirectory the caller is targeting. ``state_dir``
+    itself is NOT scanned — users may legitimately point
+    ``SWITCHER_STATE_DIR`` at a symlink to relocate the state store,
+    whereas the internal ``profiles/`` directory layout is switcher-
+    owned and a link there is always tampering.
 
     Pure observation; never mutates the filesystem. Missing ancestors
     are fine (``atomic_write_file`` materializes them via
@@ -420,6 +425,7 @@ def snapshot_ancestor_link(profile_dir: Path, profile_subdir: str) -> Path | Non
     directory passes silently.
     """
     chain = (
+        profile_dir.parent,
         profile_dir,
         profile_dir / ".switcher",
         profile_dir / ".switcher" / "config_files",

@@ -86,6 +86,39 @@ def _suppress_claude(tmp_home: Path) -> None:
     shutil.rmtree(tmp_home / ".claude", ignore_errors=True)
 
 
+def test_rescan_detects_tool_via_config_file_only(
+    service: ProfileService,
+    tmp_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermes pass-PR-8 #1: ``rescan(only=['claude'])`` must succeed
+    when the live state is *only* ``~/.claude.json`` (no
+    ``~/.claude/`` directory yet). Pre-fix, ``rescan``'s candidate
+    builder filtered on ``first config_dir exists`` while
+    ``detect_installed`` had been updated to also consider
+    ``config_files`` live paths — the predicate drift meant the new
+    install shape this PR is designed to manage could be detected by
+    ``status`` / ``tools`` but never adopted via ``rescan``.
+    """
+    _freeze_now(monkeypatch)
+    _suppress_claude(tmp_home)
+    service.init()  # captures copilot only
+
+    # Install signal is the JSON file ONLY; ~/.claude/ stays absent.
+    live = tmp_home / ".claude.json"
+    live.write_text(json.dumps({"mcpServers": {"only-json": {"command": "y"}}}))
+    assert not (tmp_home / ".claude").exists()
+
+    service.rescan(only=["claude"])
+
+    active = service._store.get_active()
+    assert "claude" in active
+    profile_name = active["claude"]
+    snap = service._store.config_file_snapshot_path(profile_name, "claude", "claude.json")
+    assert snap.exists()
+    assert json.loads(snap.read_text()) == {"mcpServers": {"only-json": {"command": "y"}}}
+
+
 def test_rescan_fresh_captures_config_file_into_new_profile(
     service: ProfileService,
     tmp_home: Path,
