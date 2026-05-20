@@ -48,18 +48,6 @@ reviews:
 
   suggested_labels: true
   labeling_instructions:
-    - label: "docs"
-      instructions: >
-        Apply when the diff only touches docs/ or README.md
-        (no src/ or tests/).
-    - label: "infrastructure"
-      instructions: >
-        Apply when the diff touches CI (.github/), pyproject.toml, pixi.toml,
-        pixi.lock, .coderabbit.yaml, .gitignore, or other repo-level config
-        (not source code under src/ or tests/).
-    - label: "tests"
-      instructions: >
-        Apply when the diff only touches tests/ (no src/).
     - label: "bug"
       instructions: >
         Apply when the PR fixes broken behavior (vs. refactor or feature).
