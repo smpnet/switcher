@@ -214,12 +214,16 @@ reviews:
         Builtin tool definitions. Each must round-trip through
         Tool.model_validate() — keep credential_files shorthand or
         explicit [[credentials]] consistent with the model contract.
-    - path: ".github/ISSUE_TEMPLATE/*.yml"
+    - path: ".github/ISSUE_TEMPLATE/{bug,feature_request,docs}.yml"
       instructions: >
         GitHub Issue form templates. Require valid YAML form syntax,
         a `title:` prefix, `labels:` matching a real repo label, and
-        validations.required on critical fields. config.yml carries
-        blank_issues_enabled + contact_links only.
+        validations.required on critical fields.
+    - path: ".github/ISSUE_TEMPLATE/config.yml"
+      instructions: >
+        Form chooser config (not an Issue form — different schema).
+        Carries blank_issues_enabled (bool) and contact_links (list)
+        only; no body fields. Do NOT apply Issue-form rules here.
 
   auto_review:
     enabled: true
