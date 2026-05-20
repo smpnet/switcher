@@ -64,6 +64,53 @@ def test_detect_installed_skips_missing(
     assert "claude" not in ids
 
 
+def test_detect_installed_finds_tool_via_config_file_only(
+    tmp_home: Path,
+    tmp_state: Path,
+    registry: tuple[Tool, ...],
+) -> None:
+    """Hermes pass-PR-7 #2: a tool whose first ``config_dir`` does not
+    exist on disk but whose ``config_files`` live path does is still
+    installed. Without this, a Claude Code user who only has
+    ``~/.claude.json`` (no ``~/.claude/`` directory) was reported "not
+    installed" and ``init(['claude'])`` raised ``NothingToInitializeError``,
+    blocking the new ConfigFile isolation path from activating for a
+    valid live-state shape.
+    """
+    # Tear down the dir signal; leave only the JSON file behind so
+    # detect must rely on the config_files probe.
+    shutil.rmtree(tmp_home / ".claude")
+    (tmp_home / ".claude.json").write_text("{}")
+
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, registry)
+    ids = {t.id for t in service.detect_installed()}
+    assert "claude" in ids
+
+
+def test_detect_installed_excludes_tool_with_neither_dir_nor_file(
+    tmp_home: Path,
+    tmp_state: Path,
+    registry: tuple[Tool, ...],
+) -> None:
+    """Symmetric to the above: with both the dir AND the JSON file
+    absent, claude must NOT surface — adding the config_files probe
+    must not relax the "no signal at all" exclusion.
+    """
+    shutil.rmtree(tmp_home / ".claude")
+    # Belt-and-suspenders: ensure the JSON file doesn't exist either.
+    json_path = tmp_home / ".claude.json"
+    if json_path.exists():
+        json_path.unlink()
+
+    store = FileProfileStore(tmp_state)
+    resolver = PathResolver(home=tmp_home)
+    service = ProfileService(store, resolver, registry)
+    ids = {t.id for t in service.detect_installed()}
+    assert "claude" not in ids
+
+
 # ---------------- init ----------------
 
 

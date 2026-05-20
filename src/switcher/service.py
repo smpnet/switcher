@@ -169,13 +169,35 @@ class ProfileService:
     # Helpers ---------------------------------------------------------------
 
     def detect_installed(self) -> list[Tool]:
-        """Tools whose **first** config dir exists on disk."""
+        """Tools that appear installed on this machine.
+
+        A tool is reported installed if EITHER:
+          * its first ``config_dir`` exists on disk, OR
+          * any of its ``config_files`` live paths exist on disk.
+
+        The dir-only heuristic predates ConfigFile support and missed
+        valid install shapes that ship a managed JSON file but no dir
+        yet (Hermes pass-PR-7 #2): a Claude Code user whose live state
+        is only ``~/.claude.json`` (no ``~/.claude/`` directory) was
+        reported "not installed", which made ``init([\"claude\"])``
+        raise ``NothingToInitializeError`` and prevented the new
+        ConfigFile isolation path from activating at all. The Tool
+        model requires every ``ConfigFile.profile_subdir`` to reference
+        one of the tool's ``config_dirs``, so adding the JSON-file
+        signal never produces a tool with no config_dir to swap — the
+        downstream ``move_or_seed_dir`` already handles the "live dir
+        missing" case by seeding an empty profile target.
+        """
         installed: list[Tool] = []
         for tool in self._registry:
             if not tool.config_dirs:
                 continue
-            first_dir = self._resolver.tool_dir(tool, 0)
-            if self._resolver.exists(first_dir):
+            has_dir = self._resolver.exists(self._resolver.tool_dir(tool, 0))
+            has_file = any(
+                self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path).exists()
+                for cf in tool.config_files
+            )
+            if has_dir or has_file:
                 installed.append(tool)
         return installed
 
