@@ -1,0 +1,56 @@
+name: Documentation
+description: Something in the docs is missing, wrong, or unclear — or a new doc that should exist
+title: "Docs: <short description>"
+labels:
+  - documentation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the doc feedback! Before filling this out, please scan existing Issues with the `documentation` label to see if it's already filed.
+
+        Switcher's docs surface today: `README.md` (user journey), `docs/MANUAL.md` (reference), `docs/RELEASE.md` (version notes), `CONTRIBUTING.md` (dev setup).
+
+  - type: textarea
+    id: gap
+    attributes:
+      label: What's missing or unclear?
+      description: What did you look for, and what did you find (or fail to find)? If the existing docs are misleading, quote the specific passage.
+      placeholder: "I tried to figure out how `switcher unmanage` interacts with the profile's data after the unmanage runs — the MANUAL says the live path is restored but doesn't say whether the profile copy is preserved or deleted..."
+    validations:
+      required: true
+
+  - type: input
+    id: location
+    attributes:
+      label: Where should it live?
+      description: README, MANUAL, RELEASE, CONTRIBUTING, a new doc — your best guess. The maintainer may reroute.
+      placeholder: "docs/MANUAL.md, under 'Stop managing one tool'"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: audience
+    attributes:
+      label: Target audience
+      description: Who's the primary reader of the new/fixed doc?
+      options:
+        - End user (running switcher to manage their tools)
+        - Contributor (modifying switcher's code or docs)
+        - AI agent (using switcher on behalf of a user)
+        - Other / mixed
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggested-content
+    attributes:
+      label: Suggested content
+      description: If you have a concrete idea of what the doc should say, sketch it here. Not required — a question or pointer is fine too.
+
+  - type: textarea
+    id: related
+    attributes:
+      label: Related
+      description: Links to related Issues, PRs, code, or external discussion.
+      placeholder: "- #N — ..."
