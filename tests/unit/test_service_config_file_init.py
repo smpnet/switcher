@@ -190,3 +190,57 @@ def test_init_preflight_aborts_before_mutation_on_cf_non_object(
 
     assert not claude_dir.is_symlink()
     assert service._store.list() == []
+
+
+def test_init_preflight_rejects_directory_at_cf_live_path(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """Live path exists but is a directory, not a regular file —
+    preflight's regular-file gate must surface the shape before
+    capture would otherwise raise IsADirectoryError mid-init.
+    """
+    live = tmp_home / ".claude.json"
+    live.mkdir()
+
+    with pytest.raises(StorageError, match="expected regular file"):
+        service.init(["claude"])
+
+    assert not (tmp_home / ".claude").is_symlink()
+    assert service._store.list() == []
+
+
+def test_init_preflight_rejects_non_utf8_cf_live(service: ProfileService, tmp_home: Path) -> None:
+    """Live file isn't valid UTF-8 — preflight's encoding gate must
+    surface the failure as StorageError before any dir-side mutation.
+    """
+    live = tmp_home / ".claude.json"
+    live.write_bytes(b"\xff\xfe\x00\x00invalid utf-8")
+
+    with pytest.raises(StorageError, match="non-UTF-8"):
+        service.init(["claude"])
+
+    assert not (tmp_home / ".claude").is_symlink()
+    assert service._store.list() == []
+
+
+def test_init_preflight_rejects_owned_path_shape_mismatch(
+    service: ProfileService, tmp_home: Path
+) -> None:
+    """Live JSON is structurally object-shaped but the walker hits a
+    non-object at an ``iter`` segment (e.g. ``{"projects": []}`` with
+    owned path ``.projects[].mcpServers``) — preflight's walker must
+    surface UnsupportedWalkTargetError as StorageError BEFORE capture
+    runs the same walk against a half-mutated profile (Hermes
+    pass-PR-7 13:04 — same validation-after-mutation class as the
+    symlink and malformed-JSON cases).
+    """
+    live = tmp_home / ".claude.json"
+    # `projects` as an empty list — owned path `.projects[].mcpServers`
+    # cannot iterate, so the walker raises at the iter segment.
+    live.write_text(json.dumps({"projects": []}))
+
+    with pytest.raises(StorageError, match="non-object value"):
+        service.init(["claude"])
+
+    assert not (tmp_home / ".claude").is_symlink()
+    assert service._store.list() == []
