@@ -72,6 +72,29 @@ def _shipped_tool_ids() -> list[str]:
 _TOOL_IDS = _shipped_tool_ids()
 assert _TOOL_IDS, f"no builtin TOMLs discovered under {_BUILTINS_DIR}"
 
+
+def _shipped_env_overrides() -> list[str]:
+    """Discover env_override names from shipped builtin TOMLs.
+
+    Walks the same TOMLs `_shipped_tool_ids` does so adding a new
+    builtin with an env_override auto-extends the subprocess
+    hermeticity in `_run`. Kept distinct from `switcher.registry`
+    on purpose: the e2e suite intentionally treats switcher as a
+    black box (no `from switcher.*` imports — see module docstring).
+    """
+    names: list[str] = []
+    for toml_path in sorted(_BUILTINS_DIR.glob("*.toml")):
+        with toml_path.open("rb") as f:
+            data = tomllib.load(f)
+        for cd in data.get("config_dirs", []):
+            override = cd.get("env_override")
+            if isinstance(override, str) and override:
+                names.append(override)
+    return names
+
+
+_BUILTIN_ENV_OVERRIDES = _shipped_env_overrides()
+
 # Split on whitespace AND table border glyphs so a tool ID can be checked
 # as a discrete token rather than a substring. Without this, an assertion
 # like `"claude" in r.stdout` would match a hypothetical future
@@ -111,6 +134,17 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
     caller pulled in.
     """
     env = os.environ.copy()
+    # Belt-and-suspenders: clear builtin env_overrides (CLAUDE_CONFIG_DIR,
+    # CODEX_HOME, ...) so a developer shell with any of these set can't
+    # leak into the subprocess. tmp_home's clear_builtin_env_overrides
+    # fixture already removes them from os.environ before subprocess.run
+    # inherits via os.environ.copy(), but making this explicit in _run
+    # defends future subprocess tests that might forget to depend on
+    # tmp_home. Without this, `switcher init` in the subprocess could
+    # resolve a managed tool against the developer's real external dir
+    # and (worst case) move that real config into the test's tmp_state.
+    for name in _BUILTIN_ENV_OVERRIDES:
+        env.pop(name, None)
     # Force ANSI-free output so the tokenizer in `_tokens` works regardless of
     # what the runner does with FORCE_COLOR / TTY detection. NO_COLOR is the
     # cross-tool standard (Rich, Click, Typer all honor it). Without this,

@@ -47,7 +47,7 @@ import pytest
 import switcher
 from switcher.oplog import OpLogIO, _InitOp, _RenameOp, _RescanOp
 from switcher.paths import IS_WINDOWS
-from switcher.registry import build_registry, find_tool
+from switcher.registry import build_registry, find_tool, load_builtin_tools
 from switcher.service import ProfileService
 from switcher.store import FileProfileStore
 
@@ -107,6 +107,19 @@ def _run(args: list[str], home: Path, state: Path) -> subprocess.CompletedProces
     above proves the pytest process's import is correct; PYTHONPATH
     extends the same guarantee to the subprocess."""
     env = os.environ.copy()
+    # Belt-and-suspenders: clear builtin env_overrides (CLAUDE_CONFIG_DIR,
+    # CODEX_HOME, ...) so a developer shell with any of these set can't
+    # leak into the subprocess. tmp_home's clear_builtin_env_overrides
+    # fixture already removes them from os.environ before subprocess.run
+    # inherits via os.environ.copy(), but making this explicit in _run
+    # defends future subprocess tests that might forget to depend on
+    # tmp_home. Without this, `switcher init` in the subprocess could
+    # resolve a managed tool against the developer's real external dir
+    # and (worst case) move that real config into the test's tmp_state.
+    for tool in load_builtin_tools():
+        for dm in tool.config_dirs:
+            if dm.env_override:
+                env.pop(dm.env_override, None)
     env["NO_COLOR"] = "1"
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = (
