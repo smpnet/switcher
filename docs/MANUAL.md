@@ -18,6 +18,7 @@ guided journey, then come back here when you need the details.
   - [Destructive recovery (last resort)](#if-everything-else-fails-destructive-recovery)
   - [Migrating from the legacy two-dir Copilot builtin](#migrating-from-the-legacy-two-dir-copilot-builtin)
 - [How it works](#how-it-works)
+- [Hot-swap hazards](#hot-swap-hazards)
 - [Adding a tool](#adding-a-tool)
 - [Upgrading switcher](#upgrading-switcher)
 
@@ -33,6 +34,11 @@ switcher use vanilla --only claude    # one tool only
 `use` switches **only currently-managed tools**. Tools removed via `unmanage`
 stay removed across `use` calls — the durability invariant added in v0.1.4.
 To bring a tool back under management, run `switcher rescan --only <tool>`.
+
+> **⚠ Don't run `switcher use` while a managed tool has a live session open.**
+> The swap is global, not shell-scoped — running tools see the symlink change
+> and end up with state split across both profiles, silently. See
+> [Hot-swap hazards](#hot-swap-hazards) below.
 
 ---
 
@@ -324,6 +330,63 @@ hooks, settings, history) is profile-specific from the start.
 | Windows | `%LOCALAPPDATA%\switcher` |
 
 Override with `SWITCHER_STATE_DIR=<path>`.
+
+---
+
+## Hot-swap hazards
+
+`switcher use` rewrites a single global symlink per managed tool. That symlink
+is process-global — every shell, every running tool, every process on your
+account shares it. There is no per-terminal or per-session scoping.
+
+If a managed tool has a live session running when you call `switcher use`,
+the running process does not switch cleanly. It ends up in **split-brain**:
+
+| Process behavior at the time of swap | Where the I/O lands afterward |
+|---|---|
+| Open file descriptors (sqlite, session logs, transcripts) | Original profile — fds are inode-pinned at open time |
+| Path-resolved syscalls under the tool's config dir (`mkdir`, `open`, `stat`) | New profile — symlink re-resolves on every call |
+| In-memory cached config | Original profile |
+| Fresh config reads from disk | New profile |
+
+The running process gets a mix of "original" and "new" state with **no error
+signal** — no `database is locked`, no crash, no warning. The session keeps
+working; it just silently writes some things to the wrong place.
+
+This is **not specific to any one tool.** Any switcher-managed tool whose
+running session does path-based file operations under its config dir will
+behave this way — Codex skills writing memory files, Claude Code skills /
+hooks / MCP-config reloads, Copilot mid-session config refreshes, and so on.
+
+**Practical rule.** Switch profiles between runs of a tool, not during. The
+supported flow is:
+
+```
+switcher use baseline
+codex                  # do work
+# exit codex
+switcher use exp1
+codex                  # do exp1 work
+```
+
+The unsupported flow (silent corruption):
+
+```
+# terminal A
+switcher use baseline
+codex                  # working on baseline
+
+# terminal B (while codex still running)
+switcher use exp1
+codex                  # running concurrently — terminal A is now split-brain
+```
+
+You cannot run two profiles side by side, cannot leave a tool open across a
+profile switch, and cannot switch profiles in one shell while the same tool
+is doing work in another. Each violation is silent. This is an inherent
+property of the symlink-swap model, not a bug — the same model is what
+keeps switcher invisible to the tools themselves (they never need to know
+the dir is symlinked).
 
 ---
 
