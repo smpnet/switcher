@@ -8,6 +8,7 @@ without reaching inside the service.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import sys
@@ -43,7 +44,21 @@ from switcher.errors import (
     UnknownProfileError,
     UnknownToolError,
 )
-from switcher.links import move_or_seed_dir, remove_link, restore_real_dir, swap_link
+from switcher.json_paths import (
+    InvalidOwnedPathError,
+    UnsupportedWalkTargetError,
+    apply_owned_paths,
+    extract_owned_paths,
+    validate_snapshot_against_owned_paths,
+)
+from switcher.links import (
+    atomic_write_file,
+    force_remove,
+    move_or_seed_dir,
+    remove_link,
+    restore_real_dir,
+    swap_link,
+)
 from switcher.models import Profile, Tool
 
 # Op-log record classes are namespace-private to oplog.py (the underscore marks
@@ -51,12 +66,15 @@ from switcher.models import Profile, Tool
 # legitimate cross-module consumer that builds and dispatches them; the
 # per-line suppression keeps the convention without leaking module-wide.
 from switcher.oplog import (
+    ConfigFileDiskState,
     MappingDiskState,
     OpLogIO,
+    _ConfigFileMappingIntent,  # pyright: ignore[reportPrivateUsage]
     _InitOp,  # pyright: ignore[reportPrivateUsage]
     _MappingIntent,  # pyright: ignore[reportPrivateUsage]
     _RenameOp,  # pyright: ignore[reportPrivateUsage]
     _RescanOp,  # pyright: ignore[reportPrivateUsage]
+    classify_config_file_mapping,
     classify_mapping,
 )
 from switcher.paths import IS_WINDOWS, PathResolver
@@ -151,16 +169,60 @@ class ProfileService:
 
     # Helpers ---------------------------------------------------------------
 
+    def _is_tool_installed(self, tool: Tool) -> bool:
+        """Single predicate for the "is this tool installed?" question.
+
+        A tool is installed if EITHER its first ``config_dir`` exists
+        on disk OR any of its ``config_files`` live paths exist. The
+        dir-only heuristic predates ConfigFile support and missed
+        valid install shapes that ship a managed JSON file but no dir
+        yet (Hermes pass-PR-7 #2 / pass-PR-8 #1): a Claude Code user
+        whose live state is only ``~/.claude.json`` (no ``~/.claude/``
+        directory) was reported "not installed", which made
+        ``init(["claude"])`` raise ``NothingToInitializeError`` AND
+        ``rescan(only=["claude"])`` raise ``RescanCaptureError("not
+        detected at expected path")`` — blocking the very install
+        shape this PR is designed to manage.
+
+        Both ``detect_installed()`` and ``rescan()``'s candidate
+        builder route through this predicate so the two surfaces stay
+        in lockstep; drift between them was the original v0.1.6
+        rescan bug.
+
+        The Tool model requires every
+        ``ConfigFile.profile_subdir`` to reference one of the tool's
+        ``config_dirs``, so adding the JSON-file signal never produces
+        a tool with no config_dir to swap — the downstream
+        ``move_or_seed_dir`` already handles the "live dir missing"
+        case by seeding an empty profile target.
+        """
+        if not tool.config_dirs:
+            return False
+        if self._resolver.exists(self._resolver.tool_dir(tool, 0)):
+            return True
+        # ``resolver.exists`` treats a broken (dangling) symlink as
+        # present — same semantics applied here so a corrupt
+        # ``~/.claude.json`` symlink surfaces as "installed" and the
+        # downstream ``_validate_config_files_live`` preflight can
+        # refuse it loudly. Plain ``Path.exists()`` returns False for
+        # broken symlinks and would silently classify the tool as
+        # not-installed, hiding corruption from ``init`` / ``rescan``
+        # (Hermes pass-PR-8.5 #2).
+        return any(
+            self._resolver.exists(
+                self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
+            )
+            for cf in tool.config_files
+        )
+
     def detect_installed(self) -> list[Tool]:
-        """Tools whose **first** config dir exists on disk."""
-        installed: list[Tool] = []
-        for tool in self._registry:
-            if not tool.config_dirs:
-                continue
-            first_dir = self._resolver.tool_dir(tool, 0)
-            if self._resolver.exists(first_dir):
-                installed.append(tool)
-        return installed
+        """Tools that appear installed on this machine.
+
+        Routes through ``_is_tool_installed`` so detection stays in
+        lockstep with ``rescan()``'s candidate selection — see that
+        predicate's docstring for the dir-OR-config_file rule.
+        """
+        return [tool for tool in self._registry if self._is_tool_installed(tool)]
 
     def all_live_paths_present(self, tool: Tool) -> bool:
         """True iff EVERY config_dir's resolved live path exists on disk.
@@ -211,6 +273,655 @@ class ProfileService:
             if src.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
+
+    def _seed_config_files(self, src_profile: str, dst_profile: str, tool: Tool) -> None:
+        """Copy a tool's ConfigFile snapshots from src_profile into dst_profile.
+
+        Mirrors ``_seed_credentials``: a state-store data copy, not a live
+        capture. Without this, the first ``switcher use`` on a newly-created
+        profile would hit snapshot-missing for every ConfigFile-equipped
+        tool — warn-and-skip at best, silent live-data loss at worst if a
+        future caller drops the warn guard.
+
+        Silently skips a missing source snapshot — the source profile
+        pre-dates this feature and the user can repair via
+        ``switcher rescan --only <tool>`` (spec §3.6 migration path).
+        Without this skip, every create() from a legacy profile would
+        block on ``FileNotFoundError`` from ``shutil.copy2``.
+
+        Source-snapshot shape validation matches the apply / classifier
+        side: any link shape at the source snapshot path is corruption
+        (the snapshot writer always uses atomic rename, never link
+        creation), and a non-regular file is the same. Refuse loudly
+        rather than copy through a link or silently treat a dangling
+        symlink as "missing" — the latter would propagate corruption
+        into the new profile and surface only as warn-and-skip at the
+        next ``use``, defeating the corruption boundary the apply path
+        already enforces (Hermes pass-PR-2).
+        """
+        for cf in tool.config_files:
+            src = self._store.config_file_snapshot_path(
+                src_profile, cf.profile_subdir, cf.profile_filename
+            )
+            dst = self._store.config_file_snapshot_path(
+                dst_profile, cf.profile_subdir, cf.profile_filename
+            )
+            if src.is_symlink():
+                raise StorageError(
+                    f"refusing to seed ConfigFile snapshot through symlink at "
+                    f"{src}; resolve the symlink (or remove it so the underlying "
+                    f"path is readable) and re-run."
+                )
+            if not src.exists():
+                continue
+            if not src.is_file():
+                # Directory / FIFO / device at the snapshot path. Switcher
+                # owns this subtree, so the case shouldn't arise from
+                # normal use; external tampering or a partial init/rescan
+                # could create it. Same rejection rule as
+                # ``_plan_config_file_applies`` on the apply side.
+                kind = "directory" if src.is_dir() else "non-regular file"
+                raise StorageError(f"expected regular file at snapshot {src}, got {kind}")
+            # Validate JSON-object shape at the corruption boundary. A regular
+            # file that fails to parse as a JSON object is still corrupt —
+            # blindly copy2-ing it would propagate the corruption into the
+            # child profile and defer the failure to the first ``use`` of
+            # that child. ``.switcher/config_files/...`` is switcher-owned
+            # state; refuse non-object snapshots loudly here the same way
+            # the apply / classifier paths do (Hermes pass-PR-3 blocker).
+            try:
+                src_text = src.read_text(encoding="utf-8")
+            except UnicodeDecodeError as e:
+                raise StorageError(f"non-UTF-8 bytes at snapshot {src}: {e}") from e
+            try:
+                src_data = json.loads(src_text)
+            except json.JSONDecodeError as e:
+                raise StorageError(
+                    f"malformed snapshot JSON at {src}: {e.msg} (line {e.lineno})"
+                ) from e
+            if not isinstance(src_data, dict):
+                raise StorageError(f"snapshot at {src} is not a JSON object")
+            # Validate the source snapshot's shape against the tool's
+            # current owned_json_paths. Pre-fix, ``_seed_config_files``
+            # only checked "is a dict" — a structurally-invalid object
+            # (e.g., ``{"projects": []}`` against ``.projects[].mcpServers``)
+            # would pass and get cloned into the child profile, with the
+            # failure deferred to the first ``use`` of that child. The
+            # apply/walker boundary already rejects shape-mismatched
+            # snapshots; mirror it at the seed boundary so corruption
+            # doesn't multiply across profiles (Hermes pass-PR-5).
+            try:
+                validate_snapshot_against_owned_paths(src_data, cf.owned_json_paths)
+            except (UnsupportedWalkTargetError, InvalidOwnedPathError) as e:
+                raise StorageError(
+                    f"snapshot at {src} is shape-incompatible with the tool's owned_json_paths: {e}"
+                ) from e
+            # Write the already-validated bytes via atomic_write_file
+            # instead of re-reading ``src`` through ``shutil.copy2``.
+            # ``copy2`` would reopen the source file AFTER the
+            # symlink/shape/JSON checks above; a concurrent external
+            # rewrite of ``src`` between the validation read and the
+            # copy could let unvalidated bytes through. Reusing
+            # ``src_text`` closes that TOCTOU window (CR pass-PR-3
+            # minor) and routes the write through the same
+            # tmp-then-rename helper every other snapshot write uses.
+            atomic_write_file(dst, src_text.encode("utf-8"))
+
+    def _all_live_dirs_dangling(self, tool: Tool) -> bool:
+        """True iff EVERY one of ``tool``'s config_dirs live paths is a
+        dangling link (symlink / Windows junction that doesn't resolve).
+
+        Used by ``use()``'s capture-loop divergence dispatch to identify
+        the "safe to skip capture" fallback when live links match
+        neither source nor destination:
+
+          - All dangling: typical post-failed-rename recovery
+            (store.rename moved the target dir, swap_link failed to
+            retarget). No live data behind any dangling link to
+            capture or destroy, so capture-skip is safe and the apply
+            phase below cleans up by re-pointing the links at the
+            destination.
+          - Mixed dangling + resolves-elsewhere: a multi-dir tool with
+            one dangling link AND another link pointing at a third
+            profile / external dir is STILL ambiguous — the
+            resolves-elsewhere half could be carrying user data. The
+            "any-dangling" predicate would let this case slip through
+            into capture-skip and the apply phase would silently
+            overwrite that other half. Require ALL dirs to be dangling
+            (CR pass-PR-4 major).
+          - No links at all (e.g. only-non-link paths): would not be
+            the recovery shape we're protecting; return False so the
+            ambiguous-state refusal fires.
+        """
+        saw_link = False
+        for i in range(len(tool.config_dirs)):
+            live_dir = self._resolver.tool_dir(tool, i)
+            if not self._resolver.is_link(live_dir):
+                return False
+            saw_link = True
+            try:
+                live_dir.resolve(strict=True)
+            except OSError:
+                continue
+            # Link that resolves successfully → not dangling, so the
+            # tool's set isn't uniformly dangling.
+            return False
+        return saw_link
+
+    def _symlink_matches_active_source(self, tool: Tool, source_profile: str) -> bool:
+        """True iff every config_dirs symlink for ``tool`` resolves to
+        ``source_profile``'s expected subdir.
+
+        Used by ``use()`` to detect post-partial-commit drift before the
+        capture phase runs (abby r11). If a prior ``use()`` flushed the
+        per-tool symlink swap + ConfigFile write but raised before
+        ``set_active_state`` persisted, the on-disk active map still
+        reports the *source* profile while the filesystem has moved to
+        the *destination*. Capturing through live in that state would
+        read destination content into the source profile's snapshot,
+        silently corrupting it.
+
+        Conservative: any ``OSError`` (broken target, dangling link,
+        cross-FS resolve issue) is treated as divergence — same intent
+        as "if we can't prove alignment, don't risk overwriting source."
+        """
+        expected_dir = self._store.profile_dir(source_profile)
+        for i, dm in enumerate(tool.config_dirs):
+            live_dir = self._resolver.tool_dir(tool, i)
+            try:
+                target = live_dir.resolve(strict=True)
+                expected = (expected_dir / dm.profile_subdir).resolve(strict=True)
+            except OSError:
+                return False
+            if target != expected:
+                return False
+        return True
+
+    def _validate_config_files_live(self, tools: Sequence[Tool]) -> None:
+        """Pure-read preflight for ConfigFile live paths.
+
+        Validates each tool's ``config_files`` live shape using the
+        same rules ``_capture_config_files`` applies (symlink rejection,
+        regular-file gate, UTF-8 + JSON-object parse, owned-path walker
+        runs against live so a shape mismatch surfaces). Runs BEFORE
+        any FS mutation in ``init()`` so deterministic CF validation
+        failures abort cleanly instead of leaving the dated profile
+        persisted, ``~/.claude`` flipped to a managed link, and an
+        in-flight oplog record behind (Hermes pass-PR-7 #2 — same
+        validation-after-mutation class the ``use()`` preflight closed
+        in abby r4). Live missing is fine here — capture treats absent
+        live as ``snapshot = {}``, and a fresh-machine init must
+        succeed before the user has launched the tool once.
+        """
+        for tool in tools:
+            for cf in tool.config_files:
+                live_path = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
+                if live_path.is_symlink():
+                    raise StorageError(
+                        f"refusing to capture ConfigFile through symlink at "
+                        f"{live_path}; a broken symlink would otherwise be "
+                        f"read as 'missing' and silently overwrite the "
+                        f"snapshot with {{}}. Resolve the symlink (or remove "
+                        f"it so the underlying path is read/writable) and "
+                        f"re-run."
+                    )
+                if live_path.exists() and not live_path.is_file():
+                    kind = "directory" if live_path.is_dir() else "non-regular file"
+                    raise StorageError(f"expected regular file at {live_path}, got {kind}")
+                if not live_path.exists():
+                    continue
+                try:
+                    live_text = live_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError as e:
+                    raise StorageError(f"non-UTF-8 bytes at {live_path}: {e}") from e
+                try:
+                    live_data = json.loads(live_text)
+                except json.JSONDecodeError as e:
+                    raise StorageError(
+                        f"malformed JSON at {live_path}: {e.msg} (line {e.lineno})"
+                    ) from e
+                if not isinstance(live_data, dict):
+                    raise StorageError(
+                        f"expected JSON object at {live_path}, got {type(live_data).__name__}"
+                    )
+                # Run the walker so an owned-path-vs-live shape mismatch
+                # (live ``{"projects": []}`` against owned
+                # ``.projects[].mcpServers``) surfaces here, not at the
+                # mid-init capture call. Result discarded — this is a
+                # pure validation pass.
+                try:
+                    extract_owned_paths(live_data, cf.owned_json_paths)
+                except UnsupportedWalkTargetError as e:
+                    raise StorageError(
+                        f"owned path walks into a non-object value at {live_path}: {e}"
+                    ) from e
+                except InvalidOwnedPathError as e:
+                    raise StorageError(
+                        f"invalid owned_json_paths for {tool.id!r} at {live_path}: {e}"
+                    ) from e
+
+    def _capture_config_files(self, profile_name: str, tool: Tool) -> None:
+        """Extract a tool's owned JSON subtrees from live and snapshot them.
+
+        For each ConfigFile on ``tool``: read the live JSON, project the
+        ``owned_json_paths`` subtrees via the walker, and atomic-write the
+        result under the profile's reserved ``.switcher/config_files/...``
+        path. No-op if the tool has no ``config_files``.
+
+        Used by ``save()`` and (later) ``init()`` — both capture from current
+        live into a fresh profile snapshot.
+
+        Edge cases (spec §3.6 "missing or malformed live"):
+          * Live missing (true non-existence) → snapshot is ``{}``. Refusing
+            here would block init on a fresh machine before the user has
+            launched the tool once.
+          * Live malformed JSON or non-object → ``StorageError`` before any
+            mutation. Capturing garbage would silently propagate to the
+            apply side of the next ``use()``.
+          * Live is a symlink (broken or otherwise) → ``StorageError``.
+            ``Path.exists()`` returns False for a broken symlink, so without
+            this guard a broken link would be indistinguishable from genuine
+            absence and we'd silently overwrite the source profile's last-
+            good snapshot with ``{}`` (abby r6). Even for a non-broken
+            symlink, capturing through the link and then applying back
+            atomic-renames the link into a regular file — the same shape
+            ``_plan_config_file_applies`` rejects on the apply side.
+        """
+        for cf in tool.config_files:
+            live_path = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
+            if live_path.is_symlink():
+                raise StorageError(
+                    f"refusing to capture ConfigFile through symlink at "
+                    f"{live_path}; a broken symlink would otherwise be read "
+                    f"as 'missing' and silently overwrite the snapshot with "
+                    f"{{}}. Resolve the symlink (or remove it so the "
+                    f"underlying path is read/writable) and re-run."
+                )
+            if live_path.exists() and not live_path.is_file():
+                # Directory / FIFO / device at the configured live path —
+                # read_text() would raise IsADirectoryError or similar
+                # past the service boundary (abby r12). Reject explicitly.
+                kind = "directory" if live_path.is_dir() else "non-regular file"
+                raise StorageError(f"expected regular file at {live_path}, got {kind}")
+            if live_path.exists():
+                try:
+                    live_text = live_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError as e:
+                    # Catch alongside JSONDecodeError below: bad encoding is
+                    # as realistic as bad JSON for user-controlled live files
+                    # and must surface as StorageError, not a raw decode
+                    # traceback (abby r10).
+                    raise StorageError(f"non-UTF-8 bytes at {live_path}: {e}") from e
+                try:
+                    live_data = json.loads(live_text)
+                except json.JSONDecodeError as e:
+                    raise StorageError(
+                        f"malformed JSON at {live_path}: {e.msg} (line {e.lineno})"
+                    ) from e
+                if not isinstance(live_data, dict):
+                    raise StorageError(
+                        f"expected JSON object at {live_path}, got {type(live_data).__name__}"
+                    )
+                try:
+                    snapshot = extract_owned_paths(live_data, cf.owned_json_paths)
+                except UnsupportedWalkTargetError as e:
+                    # e.g., live has {"projects": []} but owned path is
+                    # ``.projects[].mcpServers`` — iter expects a JSON object,
+                    # gets a list. This is live-data drift, not a registry
+                    # config bug, so surface it consistently with the other
+                    # live-validation errors above (abby r9).
+                    raise StorageError(
+                        f"owned path walks into a non-object value at {live_path}: {e}"
+                    ) from e
+                except InvalidOwnedPathError as e:
+                    # Defense in depth: the Tool model parses every
+                    # owned_json_paths entry at registry-load time, so
+                    # this branch should be unreachable in normal flow.
+                    # A hand-edited registry that bypassed the validator
+                    # would surface the failure as a raw walker error
+                    # past the service boundary; normalize to
+                    # StorageError here so all three owned-path entry
+                    # points fail through the same contract
+                    # (CR pass-PR-6).
+                    raise StorageError(
+                        f"invalid owned_json_paths for {tool.id!r} at {live_path}: {e}"
+                    ) from e
+            else:
+                snapshot = {}
+
+            snap_path = self._store.config_file_snapshot_path(
+                profile_name, cf.profile_subdir, cf.profile_filename
+            )
+            atomic_write_file(
+                snap_path,
+                json.dumps(snapshot, indent=2, sort_keys=True).encode("utf-8"),
+            )
+
+    def _extract_and_write_config_file_snapshot(
+        self,
+        *,
+        profile_name: str,
+        live_path: Path,
+        profile_subdir: str,
+        profile_filename: str,
+        tool_id: str,
+        owned_json_paths: tuple[str, ...],
+    ) -> None:
+        """Compensation-path counterpart to ``_capture_config_files``.
+
+        Re-extracts a single ConfigFile snapshot during op-log
+        ``--continue`` replay. Three differences from the capture path:
+
+        (a) ``live_path`` is the journal record's stored value, not
+            the registry-derived path. The journal is the authoritative
+            source for "which file was the op going to read" — if the
+            registry path changed between intent-write and recovery,
+            the rescan/init that the user is finishing should still
+            read the same file it intended.
+
+        (b) ``owned_json_paths`` comes from the journal too (passed in
+            by the caller from ``_ConfigFileMappingIntent``). The
+            registry's current owned-paths list might have changed
+            between intent-write and recovery — switcher upgrade,
+            registry override edit — and using the current list would
+            silently extract a different shape than the original op
+            intended. abby r-batch4 blocker: idempotent recovery
+            requires the walker contract to come from the journal,
+            not from whatever the registry says today.
+
+        (c) Spec §3.7 runtime check: the tool's CURRENT registry must
+            still carry a ConfigFile entry whose
+            ``(profile_subdir, profile_filename)`` matches the journal.
+            Registry drift on the tuple identity surfaces here as
+            ``OpLogCorruptError`` — distinct from owned-paths drift
+            (handled by journaling, above) because a missing tuple
+            means the user removed the file from management entirely;
+            compensation can't reason about whether to extract,
+            unlink, or refuse without that anchor.
+
+        Live-side validation mirrors ``_capture_config_files`` byte-
+        for-byte. Keeping the rules identical means a clean init's
+        snapshot and a ``--continue`` replay's snapshot are
+        bit-identical for the same live state — exactly what idempotent
+        recovery needs.
+        """
+        tool = find_tool(self._registry, tool_id)
+        if tool is None:
+            raise OpLogCorruptError(
+                f"interrupted op continue: journal references unknown tool "
+                f"{tool_id!r}; restore the registry TOML or hand-edit the "
+                f"journal to remove the entry. Manual recovery required."
+            )
+        matching = [
+            cf
+            for cf in tool.config_files
+            if cf.profile_subdir == profile_subdir and cf.profile_filename == profile_filename
+        ]
+        if not matching:
+            raise OpLogCorruptError(
+                f"interrupted op continue: journal references config_file "
+                f"({profile_subdir!r}, {profile_filename!r}) for tool "
+                f"{tool_id!r}, but the current registry has no such mapping. "
+                f"Manual recovery required."
+            )
+        # v0.1.5: the Tool validator caps ``config_files`` at 1, so the
+        # match must be unique. A future cap lift (or a hand-edited
+        # registry that bypassed the validator) could let duplicates
+        # slip past — silently extracting against the first match
+        # would leave the "tuple anchor" ambiguous, and the journal's
+        # storage-path uniqueness contract would not be enforceable
+        # at the registry side. Defense in depth: refuse on any
+        # ambiguity rather than guess (abby r-batch4 round 4).
+        if len(matching) > 1:
+            raise OpLogCorruptError(
+                f"interrupted op continue: registry has {len(matching)} "
+                f"ConfigFile entries for tool {tool_id!r} matching "
+                f"({profile_subdir!r}, {profile_filename!r}); the tuple "
+                f"anchor must be unique. Manual recovery required."
+            )
+
+        if live_path.is_symlink():
+            raise StorageError(
+                f"refusing to recapture ConfigFile through symlink at "
+                f"{live_path}; resolve the symlink (or remove it so the "
+                f"underlying path is readable) and re-run."
+            )
+        if live_path.exists() and not live_path.is_file():
+            kind = "directory" if live_path.is_dir() else "non-regular file"
+            raise StorageError(f"expected regular file at {live_path}, got {kind}")
+        if live_path.exists():
+            try:
+                live_text = live_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as e:
+                raise StorageError(f"non-UTF-8 bytes at {live_path}: {e}") from e
+            try:
+                live_data = json.loads(live_text)
+            except json.JSONDecodeError as e:
+                raise StorageError(
+                    f"malformed JSON at {live_path}: {e.msg} (line {e.lineno})"
+                ) from e
+            if not isinstance(live_data, dict):
+                raise StorageError(
+                    f"expected JSON object at {live_path}, got {type(live_data).__name__}"
+                )
+            try:
+                snapshot = extract_owned_paths(live_data, owned_json_paths)
+            except UnsupportedWalkTargetError as e:
+                raise StorageError(
+                    f"owned path walks into a non-object value at {live_path}: {e}"
+                ) from e
+            except InvalidOwnedPathError as e:
+                # Symmetric with ``_capture_config_files``: the journal
+                # carries ``owned_json_paths`` verbatim from the Tool
+                # model that already parsed them at registry-load time,
+                # so this is defense-in-depth against a hand-edited
+                # journal whose parsed contract drifted from the live
+                # walker (CR pass-PR-6).
+                raise StorageError(
+                    f"invalid owned_json_paths for {tool_id!r} at {live_path}: {e}"
+                ) from e
+        else:
+            snapshot = {}
+
+        snap_path = self._store.config_file_snapshot_path(
+            profile_name, profile_subdir, profile_filename
+        )
+        atomic_write_file(
+            snap_path,
+            json.dumps(snapshot, indent=2, sort_keys=True).encode("utf-8"),
+        )
+
+    def _plan_config_file_applies(self, profile_name: str, tool: Tool) -> list[tuple[Path, bytes]]:
+        """Read-only: validate and plan each ConfigFile's apply.
+
+        Returns a list of ``(live_path, content_bytes)`` pairs the caller can
+        atomic-write to commit the apply. Pure reads + an in-memory walker;
+        does not touch the filesystem state on disk. Emits the snapshot-
+        missing warning during this phase (it's a non-fatal observation).
+
+        Raises ``StorageError`` on any of:
+          * malformed snapshot JSON / non-object snapshot
+          * malformed live JSON / non-object live
+          * symlink at live_path (atomic_write_file would refuse at commit
+            time, post-swap — see r5 fix)
+          * ``UnsupportedWalkTargetError`` from the walker (live or snapshot has
+            a shape — typically a JSON array — under an ``iter`` segment).
+            Re-raised as ``StorageError`` with file context (abby r9). The
+            unwalkable shape is a live-data or snapshot-data issue, not a
+            registry config bug; surfacing it as ``StorageError`` keeps
+            the service-boundary error contract consistent with the
+            other live-validation errors above.
+
+        Used by ``use()`` as a pre-flight ahead of any ``swap_link`` or
+        write, so a parse-time failure on any tool's ConfigFile aborts the
+        switch before the filesystem is mutated (abby r4 finding 1).
+
+        The Tool validator caps ``config_files`` at 1 in v0.1.5, so the
+        list this returns is 0 or 1 entries; the loop shape is kept general
+        for forward-compat with the future work that would lift the cap.
+
+        The read of live happens immediately before the atomic rename in
+        the caller — a concurrent Claude write between read and rename is
+        at worst a microsecond-wide race, and Claude does not touch owned
+        paths during routine session activity (spec §1).
+        """
+        plans: list[tuple[Path, bytes]] = []
+        for cf in tool.config_files:
+            live_path = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
+            snap_path = self._store.config_file_snapshot_path(
+                profile_name, cf.profile_subdir, cf.profile_filename
+            )
+
+            # Symlink at live_path is fatal: atomic_write_file would refuse
+            # the write at commit time, *after* swap_link had already flipped
+            # config_dirs (abby r5 concrete case: a broken symlink at
+            # ~/.claude.json passes the `live_path.exists()` check as False,
+            # so we synthesize a plan; then the commit fails post-swap).
+            # Reject here to keep "any post-swap commit failure" out of the
+            # mutation phase. atomic_write_file's own check stays as
+            # defense-in-depth for the TOCTOU window between pre-flight and
+            # commit.
+            if live_path.is_symlink():
+                raise StorageError(
+                    f"refusing to apply ConfigFile through symlink at "
+                    f"{live_path}; atomic rename would replace the link "
+                    f"with a regular file. Resolve the symlink (or remove "
+                    f"it so the underlying path is writable) and re-run."
+                )
+
+            # Refuse symlinks at the snapshot path BEFORE the missing-
+            # snapshot warn-and-skip. ``Path.exists()`` returns False for a
+            # broken (dangling) symlink, so without this guard a corrupted
+            # snapshot path with a stale symlink would degrade to "missing
+            # → warn-and-skip" and leave the previous profile's owned
+            # subtree in live AFTER the config_dirs swap_link had already
+            # flipped — half-switched state: ``active`` claims the new
+            # profile but ``~/.claude.json`` still carries the previous
+            # profile's data. The classifier already treats any snapshot-
+            # path link shape as AMBIGUOUS for the same reason; mirror
+            # that on the apply side so reserved-state corruption fails
+            # loud instead of degrading silently (Hermes + CR pass-PR-1).
+            if snap_path.is_symlink():
+                raise StorageError(
+                    f"refusing to read config_file snapshot through symlink at "
+                    f"{snap_path}; resolve the symlink (or remove it so the "
+                    f"underlying path is readable) and re-run."
+                )
+            if not snap_path.exists():
+                # Stderr matches the project's existing warning convention
+                # (see `_warn_migration`). caplog won't pick this up; tests
+                # use `capsys`.
+                #
+                # No remediation hint: in v0.1.5 PR4 the snapshot is created
+                # by `save()`, and the next switch onto the source profile's
+                # capture phase also creates one. The plan's init/rescan
+                # integration (later PRs) closes the legacy-profile case.
+                # Promising a specific command here would mis-direct users
+                # while those paths are still being landed.
+                print(
+                    f"warning: config_file snapshot missing for {tool.id!r} at "
+                    f"{snap_path}; skipping apply to preserve current live state.",
+                    file=sys.stderr,
+                )
+                continue
+            if not snap_path.is_file():
+                # Directory / FIFO / device at the snapshot path. Switcher
+                # owns this subtree so the case shouldn't arise from normal
+                # use, but external tampering could create it (abby r12).
+                kind = "directory" if snap_path.is_dir() else "non-regular file"
+                raise StorageError(f"expected regular file at snapshot {snap_path}, got {kind}")
+
+            try:
+                snap_text = snap_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as e:
+                # Snapshots are switcher-written and therefore always UTF-8
+                # in our normal flow; this branch only fires on concurrent
+                # external corruption of the snapshot file. Re-raise as
+                # StorageError to keep the boundary consistent (abby r10).
+                raise StorageError(f"non-UTF-8 bytes at snapshot {snap_path}: {e}") from e
+            try:
+                snapshot = json.loads(snap_text)
+            except json.JSONDecodeError as e:
+                raise StorageError(
+                    f"malformed snapshot JSON at {snap_path}: {e.msg} (line {e.lineno})"
+                ) from e
+            if not isinstance(snapshot, dict):
+                raise StorageError(f"snapshot at {snap_path} is not a JSON object")
+            # Validate snapshot shape against the tool's owned_json_paths
+            # BEFORE the merge so a shape-incompatible snapshot
+            # (``{"projects": []}`` vs. owned path ``.projects[].mcpServers``)
+            # fails loud at the planner boundary instead of being
+            # silently merged into live as a destructive apply. The
+            # classifier already runs the same check at compensation
+            # time (oplog.classify_config_file_mapping); mirroring it
+            # here closes the symmetric gap for the regular ``use()``
+            # path (CR pass-PR-6).
+            try:
+                validate_snapshot_against_owned_paths(snapshot, cf.owned_json_paths)
+            except UnsupportedWalkTargetError as e:
+                raise StorageError(
+                    f"snapshot at {snap_path} is shape-incompatible with "
+                    f"the tool's owned_json_paths: {e}"
+                ) from e
+            except InvalidOwnedPathError as e:
+                raise StorageError(
+                    f"invalid owned_json_paths for {tool.id!r} at {snap_path}: {e}"
+                ) from e
+
+            if live_path.exists() and not live_path.is_file():
+                # Mirrors the capture-side regular-file gate (abby r12):
+                # without this, read_text would raise IsADirectoryError or
+                # similar past the service boundary.
+                kind = "directory" if live_path.is_dir() else "non-regular file"
+                raise StorageError(f"expected regular file at {live_path}, got {kind}")
+            if live_path.exists():
+                try:
+                    live_text = live_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError as e:
+                    raise StorageError(f"non-UTF-8 bytes at {live_path}: {e}") from e
+                try:
+                    live_data = json.loads(live_text)
+                except json.JSONDecodeError as e:
+                    raise StorageError(
+                        f"malformed live JSON at {live_path}: {e.msg} (line {e.lineno})"
+                    ) from e
+                if not isinstance(live_data, dict):
+                    raise StorageError(f"live file at {live_path} is not a JSON object")
+            else:
+                live_data = {}
+
+            try:
+                merged = apply_owned_paths(live_data, snapshot, cf.owned_json_paths)
+            except UnsupportedWalkTargetError as e:
+                # e.g., snapshot or live has {"projects": []} but the owned
+                # path is ``.projects[].mcpServers`` — iter expects a JSON
+                # object, gets a list. The walker can't tell us which side
+                # (live vs. snapshot) is the problem, so cite both in the
+                # message for actionability. Re-raise as StorageError to
+                # keep the service-boundary contract consistent with the
+                # other live/snapshot-validation errors above (abby r9).
+                raise StorageError(
+                    f"owned path walks into a non-object value when "
+                    f"applying snapshot {snap_path} onto {live_path}: {e}"
+                ) from e
+            except InvalidOwnedPathError as e:
+                # Defense in depth: same rationale as
+                # ``_capture_config_files`` / ``_extract_and_write_config_file_snapshot``
+                # — registry-time validation already runs, but a
+                # hand-edited registry could surface the failure as a
+                # raw walker error past the service boundary
+                # (CR pass-PR-6).
+                raise StorageError(
+                    f"invalid owned_json_paths for {tool.id!r} applying "
+                    f"snapshot {snap_path} onto {live_path}: {e}"
+                ) from e
+            plans.append(
+                (
+                    live_path,
+                    json.dumps(merged, indent=2, sort_keys=True).encode("utf-8"),
+                )
+            )
+        return plans
 
     def _capture_tool(self, profile: str, tool: Tool) -> list[str]:
         """Move every live dir for `tool` into `profile`, then link back.
@@ -928,6 +1639,22 @@ class ProfileService:
                     raise PathNotADirectoryError(
                         f"{live} exists but is not a directory; cannot initialize"
                     )
+        # ConfigFile live-path preflight — pure read. Detection now
+        # treats a ConfigFile-only install as "installed" (Hermes
+        # pass-PR-7 #2), so a deterministic CF validation failure
+        # (symlink, non-regular file, non-UTF-8, malformed JSON,
+        # non-object JSON, owned-path shape mismatch) must abort
+        # BEFORE ``_store.create()`` and ``_capture_tool()`` mutate
+        # disk + journal. Pre-fix, ``init([...])`` could swap
+        # ``~/.claude`` to a managed symlink, persist the dated
+        # profile, append an in-flight oplog record, and THEN raise
+        # from ``_capture_config_files`` on the corrupt
+        # ``~/.claude.json`` — leaving the same validation-after-
+        # mutation half-applied class the ``use()`` preflight already
+        # closed (Hermes pass-PR-7 13:04 blocker). Mirrors the dir
+        # preflight above in shape and in being a pure observation of
+        # the live filesystem before mutation begins.
+        self._validate_config_files_live(installed)
         current_name = now().strftime("%Y-%m-%d") + "-current"
 
         # v0.1.5: build the intent record BEFORE any FS mutation. live_path
@@ -964,6 +1691,27 @@ class ProfileService:
                         }
                     )
                 )
+        # ConfigFile intents — same canonicalization story as the dir
+        # mappings above: ``expand()`` resolves ``~`` / env vars, then
+        # ``os.path.normpath`` folds out any ``..`` segments so the
+        # journal's ``AbsolutePath`` validator accepts the string. A
+        # registry-side path with ``..`` would otherwise pass capture
+        # and only surface as load-time corruption on the recovery pass.
+        config_file_mappings: list[_ConfigFileMappingIntent] = []
+        for tool in installed:
+            for cf in tool.config_files:
+                live_cf = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
+                config_file_mappings.append(
+                    _ConfigFileMappingIntent.model_validate(
+                        {
+                            "tool_id": tool.id,
+                            "profile_subdir": cf.profile_subdir,
+                            "profile_filename": cf.profile_filename,
+                            "live_path": os.path.normpath(str(live_cf)),
+                            "owned_json_paths": tuple(cf.owned_json_paths),
+                        }
+                    )
+                )
         intent = _InitOp.model_validate(
             {
                 "op": "init",
@@ -971,6 +1719,7 @@ class ProfileService:
                 "target_ids": [t.id for t in installed],
                 "profile_name": current_name,
                 "mappings": mappings,
+                "config_file_mappings": config_file_mappings,
             }
         )
         oplog.append_record(intent)
@@ -1021,9 +1770,33 @@ class ProfileService:
         live_paths_cache: dict[str, list[str]] = {}
         for tool in installed:
             live_paths_cache[tool.id] = self._capture_tool(current_name, tool)
+            # Mirror save()'s capture sequence so the initial profile owns
+            # the same data shape every later capture will produce — without
+            # this, the first `switcher use vanilla` would hit snapshot-
+            # missing on every tool that declares config_files. No-op for
+            # tools without config_files. Lives in the per-tool loop (not
+            # after) so a StorageError from the file capture is attributable
+            # to the same tool whose dir capture just succeeded.
+            self._capture_config_files(current_name, tool)
         self._store.create("vanilla", {t.id: True for t in installed})
         for tool in installed:
             self._seed_credentials(current_name, "vanilla", tool)
+            # vanilla represents factory-fresh state — write an empty
+            # owned-subtree snapshot for each ConfigFile so the first
+            # ``switcher use vanilla`` actually clears the owned
+            # subtrees on live (CR r-batch4 major). Without this,
+            # _plan_config_file_applies hits the snapshot-missing
+            # warn-and-skip branch and leaves the user's MCPs / oauth
+            # in live — silently defeating the isolation contract for
+            # the vanilla profile that the rest of init enforces.
+            for cf in tool.config_files:
+                snap_path = self._store.config_file_snapshot_path(
+                    "vanilla", cf.profile_subdir, cf.profile_filename
+                )
+                atomic_write_file(
+                    snap_path,
+                    json.dumps({}, indent=2, sort_keys=True).encode("utf-8"),
+                )
         # Single atomic write of both keys — never set_active then
         # set_active_live_paths separately (crash window).
         active = {t.id: current_name for t in installed}
@@ -1147,6 +1920,25 @@ class ProfileService:
         profile_dir = self._store.profile_dir(record.profile_name)
         for intent in record.mappings:
             if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
+                return False
+        # ConfigFile snapshots must also be COMPLETE for the dated-current
+        # AND vanilla profiles. Without both checks, a crash AFTER the
+        # active-map write but BEFORE one of the snapshot writes would
+        # leave the short-circuit firing — the journal would mark
+        # completed and the vanilla / current snapshot would remain
+        # missing (or AMBIGUOUS), defeating the isolation contract on
+        # the next ``switcher use`` (CR pass-PR-2 major).
+        for cf_entry in record.config_file_mappings:
+            if (
+                classify_config_file_mapping(cf_entry, profile_dir)
+                is not ConfigFileDiskState.COMPLETE
+            ):
+                return False
+            vanilla_dir = self._store.profile_dir("vanilla")
+            if (
+                classify_config_file_mapping(cf_entry, vanilla_dir)
+                is not ConfigFileDiskState.COMPLETE
+            ):
                 return False
         # Active invariant: dict equality, not subset. A clean init's
         # `set_active_state(active, ...)` REPLACES the active map with
@@ -1318,6 +2110,29 @@ class ProfileService:
                     f"required — see docs/RELEASE.md"
                 )
 
+        # ConfigFile preflight — hoisted BEFORE the dir-mapping
+        # mutation pass below so an AMBIGUOUS snapshot raises before
+        # any ``move_or_seed_dir`` / ``swap_link`` runs. Pre-hoist,
+        # the AMBIGUOUS refusal sat after the mutation pass; a
+        # corrupt snapshot would leave init --continue half-applied
+        # with live dirs already mutated and the journal still open
+        # (CR pass-PR-5 major). States cache here is consumed by
+        # the dispatch loop after dir mutation completes.
+        cf_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
+        for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init: config_file snapshot for tool "
+                    f"{cf_entry.tool_id!r} at "
+                    f"{profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
+                    f"on-disk state is ambiguous; manual recovery "
+                    f"required — see docs/RELEASE.md"
+                )
+            cf_states[(cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)] = (
+                state
+            )
+
         # Deferred profile-dir create (Hermes pass-PR-2 blocker):
         # the earliest crash window (intent landed, first _store.create
         # never ran) leaves profile_dir absent. Recreating BEFORE the
@@ -1350,6 +2165,30 @@ class ProfileService:
             # loudly rather than letting compensation continue against
             # an unknown state.
             raise AssertionError(f"unhandled mapping state {state}")
+
+        # ConfigFile dispatch — consumes the preflight cache built
+        # before the dir-mapping mutation. COMPLETE skips (idempotent);
+        # UNTOUCHED re-extracts from the journal's live_path via the
+        # registry-validated helper, which folds in the §3.7 runtime
+        # check. AMBIGUOUS was already refused at preflight time
+        # (no entry would land in the cache with that state).
+        for cf_entry in record.config_file_mappings:
+            state = cf_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
+            if state is ConfigFileDiskState.COMPLETE:
+                continue
+            if state is ConfigFileDiskState.UNTOUCHED:
+                self._extract_and_write_config_file_snapshot(
+                    profile_name=record.profile_name,
+                    live_path=Path(cf_entry.live_path),
+                    profile_subdir=cf_entry.profile_subdir,
+                    profile_filename=cf_entry.profile_filename,
+                    tool_id=cf_entry.tool_id,
+                    owned_json_paths=cf_entry.owned_json_paths,
+                )
+                continue
+            raise AssertionError(f"unhandled config_file state {state}")
 
         # Step 6: vanilla profile + credential seeding. Shape of
         # vanilla_dir was already validated in the first-pass scan; a
@@ -1414,6 +2253,61 @@ class ProfileService:
             if tool is None:
                 continue
             self._seed_credentials(record.profile_name, "vanilla", tool)
+
+        # Vanilla-snapshot write driven from the JOURNAL, not from the
+        # current registry (CR r-batch4 major + abby r-batch4 round 3
+        # follow-up). A registry edit between intent-write and recovery
+        # that removed the ``[[config_files]]`` block would otherwise
+        # let continue succeed without writing vanilla's snapshot —
+        # next ``switcher use vanilla`` falls into the snapshot-missing
+        # warn-and-skip branch and silently leaves user MCPs in live.
+        # Reading from ``record.config_file_mappings`` keeps recovery
+        # faithful to the interrupted init regardless of later
+        # registry drift.
+        #
+        # Vanilla content is structurally ``{}`` (factory-fresh: no
+        # MCPs, no oauth account, no per-project state), so no
+        # owned_json_paths walker is needed — only the (subdir,
+        # filename) location, which the journal carries.
+        #
+        # Two-pass classification + dispatch mirrors the dated-current
+        # vanilla-snapshot replay above:
+        #   1. AMBIGUOUS preflight — refuse on any non-regular-file
+        #      shape (symlink, directory, malformed JSON) BEFORE any
+        #      write runs. Without this gate, ``init --continue`` would
+        #      already have replayed dir mappings + reseeded credentials
+        #      before silently clobbering corrupt vanilla state on the
+        #      atomic_write_file line below, leaving recovery half-
+        #      applied with the journal still open (CR pass-PR-4 major).
+        #   2. Mutation pass — write ``{}`` only for UNTOUCHED entries.
+        #      COMPLETE skips (idempotent re-write would no-op anyway,
+        #      but skipping makes the audit trail clearer).
+        vanilla_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
+        for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, vanilla_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init continue: 'vanilla' config_file "
+                    f"snapshot for tool {cf_entry.tool_id!r} at "
+                    f"{vanilla_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
+                    f"on-disk state is ambiguous; manual recovery required."
+                )
+            vanilla_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ] = state
+        for cf_entry in record.config_file_mappings:
+            state = vanilla_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
+            if state is ConfigFileDiskState.COMPLETE:
+                continue
+            snap_path = self._store.config_file_snapshot_path(
+                "vanilla", cf_entry.profile_subdir, cf_entry.profile_filename
+            )
+            atomic_write_file(
+                snap_path,
+                json.dumps({}, indent=2, sort_keys=True).encode("utf-8"),
+            )
 
         # Step 7: active map + live-paths cache, one atomic write. Both
         # maps cover the SAME set — `record.target_ids` — so the
@@ -1599,6 +2493,27 @@ class ProfileService:
                     )
             states[i] = state
 
+        # ConfigFile preflight — hoisted BEFORE the dir-mapping
+        # mutation pass so an AMBIGUOUS snapshot raises before any
+        # live-side restoration runs. Pre-hoist, the AMBIGUOUS refusal
+        # sat after the mutation pass; corrupt snapshots would leave
+        # ``init --abort`` half-applied with dirs already restored and
+        # the journal still open (CR pass-PR-5 major).
+        cf_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
+        for cf_entry in record.config_file_mappings:
+            state = classify_config_file_mapping(cf_entry, profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted init abort: config_file snapshot for "
+                    f"tool {cf_entry.tool_id!r} is in an ambiguous "
+                    f"state at "
+                    f"{profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}; "
+                    f"manual recovery required."
+                )
+            cf_states[(cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)] = (
+                state
+            )
+
         # MUTATION pass. Every mapping cleared validation; safe to mutate.
         for i, intent in enumerate(record.mappings):
             state = states[i]
@@ -1626,6 +2541,25 @@ class ProfileService:
                     # disappearing between classification and mutation
                     # (race / external removal). CR pass-10 nit.
                     shutil.rmtree(target)
+
+        # ConfigFile dispatch — consume the preflight cache.
+        # Init never writes to live for ConfigFile (capture is
+        # read-only on live), so abort has no live-side restore to do
+        # — only the snapshot side. The profile-delete pass below
+        # would rmtree the whole profile dir and take the snapshots
+        # with it; the explicit unlink loop is defense in depth, with
+        # a tighter per-step audit trail. AMBIGUOUS was already
+        # refused at preflight time.
+        for cf_entry in record.config_file_mappings:
+            state = cf_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
+            if state is ConfigFileDiskState.COMPLETE:
+                self._store.config_file_snapshot_path(
+                    record.profile_name,
+                    cf_entry.profile_subdir,
+                    cf_entry.profile_filename,
+                ).unlink(missing_ok=True)
 
         # Profile-delete. Both dated-current and vanilla — init
         # pre-flight requires `_store.list()` to be empty, so any
@@ -1950,6 +2884,21 @@ class ProfileService:
                 return False
             if classify_mapping(intent, profile_dir) is not MappingDiskState.COMPLETE:
                 return False
+        # Per-ConfigFile snapshots must classify COMPLETE on the tool's
+        # target profile. Mirrors the init-side check: a crash AFTER
+        # set_active_state but BEFORE a snapshot landed would otherwise
+        # short-circuit, mark_completed, and leave a future ``switcher
+        # use`` on the rescan profile hitting snapshot-missing
+        # warn-and-skip (CR pass-PR-2 major).
+        for cf_entry in record.config_file_mappings:
+            cf_profile_dir = profile_dir_by_tool.get(cf_entry.tool_id)
+            if cf_profile_dir is None:
+                return False
+            if (
+                classify_config_file_mapping(cf_entry, cf_profile_dir)
+                is not ConfigFileDiskState.COMPLETE
+            ):
+                return False
         active = self._store.get_active()
         for tid, profile_name in record.target_profiles.items():
             if active.get(tid) != profile_name:
@@ -2126,6 +3075,40 @@ class ProfileService:
                     f"docs/RELEASE.md"
                 )
 
+        # ConfigFile preflight — hoisted BEFORE the dir-mapping
+        # mutation pass below so an AMBIGUOUS snapshot raises before
+        # ``move_or_seed_dir`` / ``swap_link`` runs. Pre-hoist, the
+        # AMBIGUOUS refusal sat after the mutation pass; a corrupt
+        # snapshot would leave ``rescan --continue`` half-applied with
+        # live dirs already mutated and the journal still open
+        # (CR pass-PR-5 major). States cache here is consumed by the
+        # dispatch loop after dir mutation completes. Per-tool
+        # tool_id → target_profile resolution is part of validation
+        # (a corrupt journal with no target_profiles entry surfaces
+        # here, before any mutation).
+        cf_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
+        for cf_entry in record.config_file_mappings:
+            cf_profile_name = record.target_profiles.get(cf_entry.tool_id)
+            if cf_profile_name is None:
+                raise OpLogCorruptError(
+                    f"interrupted rescan continue: config_file mapping "
+                    f"references tool_id {cf_entry.tool_id!r} without a "
+                    f"target_profiles entry; manual recovery required"
+                )
+            cf_profile_dir = self._store.profile_dir(cf_profile_name)
+            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted rescan: config_file snapshot for tool "
+                    f"{cf_entry.tool_id!r} at "
+                    f"{cf_profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}: "
+                    f"on-disk state is ambiguous; manual recovery "
+                    f"required — see docs/RELEASE.md"
+                )
+            cf_states[(cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)] = (
+                state
+            )
+
         # Deferred profile-dir create. The earliest crash window leaves
         # a target profile dir absent — recreate via store.create AFTER
         # validation cleared every mapping. In fresh-profile mode the
@@ -2167,6 +3150,32 @@ class ProfileService:
                 swap_link(target, live)
                 continue
             raise AssertionError(f"unhandled mapping state {state}")
+
+        # ConfigFile dispatch — consume the preflight cache built
+        # before the dir-mapping mutation. AMBIGUOUS was already
+        # refused at preflight time; the registry runtime check
+        # rides inside ``_extract_and_write_config_file_snapshot``
+        # so a registry that no longer carries the journaled
+        # ``(profile_subdir, profile_filename)`` pair surfaces as
+        # OpLogCorruptError rather than a silent extract-everything.
+        for cf_entry in record.config_file_mappings:
+            state = cf_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
+            if state is ConfigFileDiskState.COMPLETE:
+                continue
+            if state is ConfigFileDiskState.UNTOUCHED:
+                cf_profile_name = record.target_profiles[cf_entry.tool_id]
+                self._extract_and_write_config_file_snapshot(
+                    profile_name=cf_profile_name,
+                    live_path=Path(cf_entry.live_path),
+                    profile_subdir=cf_entry.profile_subdir,
+                    profile_filename=cf_entry.profile_filename,
+                    tool_id=cf_entry.tool_id,
+                    owned_json_paths=cf_entry.owned_json_paths,
+                )
+                continue
+            raise AssertionError(f"unhandled config_file state {state}")
 
         # Deferred metadata write for --into mode. Idempotent on the
         # post-write metadata shape; required when crash happened
@@ -2364,6 +3373,41 @@ class ProfileService:
                 )
             states[i] = state
 
+        # ConfigFile preflight — hoisted BEFORE the dir-mapping
+        # mutation pass so an AMBIGUOUS snapshot raises before any
+        # live-side restoration runs. Pre-hoist, a corrupt snapshot
+        # would leave ``rescan --abort`` half-applied with dirs
+        # already restored and the journal still open (CR pass-PR-5
+        # major). For --into mode this is especially important — the
+        # post-mutation cleanup preserves the profile dir, so an
+        # AMBIGUOUS state at the snapshot would otherwise survive
+        # the abort and trip the snapshot-collision pre-flight on
+        # the next retry. Resolves the tool_id → target_profile
+        # mapping at validation time so a corrupt journal also
+        # surfaces here, before any mutation.
+        cf_states: dict[tuple[str, str, str], ConfigFileDiskState] = {}
+        for cf_entry in record.config_file_mappings:
+            cf_profile_name = record.target_profiles.get(cf_entry.tool_id)
+            if cf_profile_name is None:
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: config_file mapping "
+                    f"references tool_id {cf_entry.tool_id!r} without a "
+                    f"target_profiles entry; manual recovery required"
+                )
+            cf_profile_dir = self._store.profile_dir(cf_profile_name)
+            state = classify_config_file_mapping(cf_entry, cf_profile_dir)
+            if state is ConfigFileDiskState.AMBIGUOUS:
+                raise OpLogCorruptError(
+                    f"interrupted rescan abort: config_file snapshot for "
+                    f"tool {cf_entry.tool_id!r} is in an ambiguous state "
+                    f"at "
+                    f"{cf_profile_dir / '.switcher' / 'config_files' / cf_entry.profile_subdir / cf_entry.profile_filename}; "
+                    f"manual recovery required."
+                )
+            cf_states[(cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)] = (
+                state
+            )
+
         # Mutation pass. Every mapping cleared validation.
         for i, intent in enumerate(record.mappings):
             state = states[i]
@@ -2384,6 +3428,26 @@ class ProfileService:
                     move_or_seed_dir(target, live)
                 elif intent.original_kind == "missing" and target.exists():
                     shutil.rmtree(target)
+
+        # ConfigFile dispatch — consume the preflight cache. For
+        # fresh-profile mode the cleanup loop below rmtree's the
+        # profile dir and would take the snapshots with it; for
+        # --into mode the profile dir is preserved, so per-snapshot
+        # unlink is load-bearing — without it, the next rescan into
+        # the same profile would trip the snapshot-collision check
+        # added in Task 10 even though the snapshot is no longer
+        # journal-owned.
+        for cf_entry in record.config_file_mappings:
+            state = cf_states[
+                (cf_entry.tool_id, cf_entry.profile_subdir, cf_entry.profile_filename)
+            ]
+            if state is ConfigFileDiskState.COMPLETE:
+                cf_profile_name = record.target_profiles[cf_entry.tool_id]
+                self._store.config_file_snapshot_path(
+                    cf_profile_name,
+                    cf_entry.profile_subdir,
+                    cf_entry.profile_filename,
+                ).unlink(missing_ok=True)
 
         # Per-profile cleanup. Fresh-profile mode deletes; --into mode
         # restores previous_tools.
@@ -2481,16 +3545,178 @@ class ProfileService:
         for tid, tool in resolved:
             for dm in tool.config_dirs:
                 target = self._store.profile_dir(profile_name) / dm.profile_subdir
+                # Reject link-shaped targets BEFORE the existence check:
+                # ``Path.is_dir()`` follows symlinks and Windows junctions,
+                # so a profile subdir replaced with a link to an external
+                # directory would pass the existence guard and
+                # ``swap_link(target, live)`` would then point ``live`` at
+                # the foreign location, effectively repointing the
+                # tool's config dir outside the state store. Mirror the
+                # link-shape refusal the recovery + classifier paths
+                # already apply to reserved state (Hermes pass-PR-4).
+                if self._resolver.is_link(target):
+                    raise PathNotADirectoryError(
+                        f"profile {profile_name!r} subdir {dm.profile_subdir!r} "
+                        f"for tool {tid!r} is a symlink or junction, not a "
+                        f"real directory; refusing to switch through a link "
+                        f"that could point outside the state store"
+                    )
                 if not target.is_dir():
                     raise PathNotADirectoryError(
                         f"profile {profile_name!r} is missing "
                         f"{dm.profile_subdir!r} for tool {tid!r}"
                     )
+        # Capture phase first: snapshot the *currently-active* live state
+        # into each tool's source profile before anything else. This must
+        # precede the plan phase below — for `switcher use <active>`, source
+        # and destination are the same profile, so plan needs to read the
+        # *post-capture* snapshot (otherwise an in-flight live edit is
+        # planned-away with the pre-capture content).
+        #
+        # Capture only writes to source profile's snapshot, never to live —
+        # so a failure here leaves live untouched. Source-snapshot updates
+        # are idempotent on retry (re-capturing current live overwrites with
+        # the same content); partial-tool capture is benign.
+        #
+        # No ``source != profile_name`` guard: `switcher use <active>` is a
+        # legitimate operation (reload-from-snapshot affordance), but with a
+        # guard the apply would overwrite live with the last-saved snapshot
+        # and silently discard any in-flight edits. With capture-then-apply,
+        # the same call captures-then-no-ops on live, which is data-safe.
         for tid, tool in resolved:
-            for i, dm in enumerate(tool.config_dirs):
-                target = self._store.profile_dir(profile_name) / dm.profile_subdir
-                live = self._resolver.tool_dir(tool, i)
-                swap_link(target, live)
+            source = active.get(tid)
+            if not source:
+                continue
+            # No ConfigFile on this tool → nothing to capture. Skip the
+            # drift dispatch below: its sole purpose is to choose which
+            # profile's CF snapshot to write into, and a tool with no
+            # ``config_files`` would just no-op through
+            # ``_capture_config_files``. Pre-fix, dir-only tools (e.g.
+            # the bundled ``copilot``) tripped the case-4 "match
+            # neither source nor destination" gate whenever their
+            # live symlink was simply missing (deleted by the user,
+            # broken by an external rename, etc.), regressing the
+            # pre-v0.1.6 ``use()`` flow where ``swap_link`` would
+            # restore the link. The dispatch's contract is about
+            # ConfigFile state and shouldn't be load-bearing on
+            # dir-only flows (Hermes pass-PR-8.5 #1).
+            if not tool.config_files:
+                continue
+            # Four-way dispatch on where the live config_dirs symlinks
+            # actually point (CR pass-PR-3 major + dangling-symlink
+            # carve-out for failed-rename recovery):
+            #
+            # (1) Links match the active-map source → normal pre-switch
+            #     capture into source's snapshot. Preserves in-flight
+            #     edits the user made while ``source`` was the active
+            #     profile.
+            #
+            # (2) Links match the DESTINATION profile we're switching to.
+            #     This is the stale-active drift case from abby r11 —
+            #     a prior use() flipped symlinks to ``profile_name`` but
+            #     never committed ``set_active_state``. Pre-fix the
+            #     branch silently skipped capture; that drops any
+            #     in-flight edits the user made while ``profile_name``
+            #     was effectively active on disk, because the apply
+            #     phase below would overwrite live with profile_name's
+            #     pre-edit snapshot. Capture into ``profile_name`` so
+            #     the apply is a no-op write of the bytes we just
+            #     captured and the user's edits survive.
+            #
+            # (3) ALL of the tool's config_dir live paths are dangling
+            #     links — typical post-failed-rename recovery shape
+            #     (``store.rename`` moved the target dir but
+            #     ``swap_link`` failed to retarget). No live data
+            #     behind any dangling link to either capture or
+            #     overwrite, so skip capture and let the apply +
+            #     swap_link below complete the recovery cleanly. The
+            #     "ALL" requirement matters for multi-dir tools: a
+            #     mixed state where one dir dangles and another
+            #     resolves to a third profile would still be
+            #     ambiguous (CR pass-PR-4) — case 4 catches it.
+            #
+            # (4) Links resolve to neither source nor destination AND
+            #     aren't uniformly dangling — they point at a third
+            #     profile, an external directory, or a mix of dangling
+            #     plus elsewhere. Genuinely ambiguous drift; refuse
+            #     loudly rather than silently overwrite that other
+            #     state with destination bytes.
+            if self._symlink_matches_active_source(tool, source):
+                self._capture_config_files(source, tool)
+                continue
+            if self._symlink_matches_active_source(tool, profile_name):
+                self._capture_config_files(profile_name, tool)
+                continue
+            if self._all_live_dirs_dangling(tool):
+                continue
+            raise StorageError(
+                f"live config_dirs for {tid!r} match neither active source "
+                f"{source!r} nor destination {profile_name!r}; refusing to "
+                f"overwrite ConfigFile state blindly. Manual recovery required."
+            )
+        # Pre-flight 3: plan every tool's ConfigFile applies. Read-only — no
+        # filesystem mutation. Any malformed-JSON / non-object / walker-
+        # rejection error raises StorageError here, before swap_link has
+        # flipped any symlinks. Closes the "half-applied switch on parse
+        # failure" gap abby r4 flagged.
+        #
+        # Per-tool plans are kept in a dict so the commit phase below can
+        # consume each tool's plan immediately after its swap_link loop —
+        # preserves the "links first, file overlay second" ordering inside
+        # a single tool while keeping all parses upfront across tools.
+        config_file_plans: dict[str, list[tuple[Path, bytes]]] = {
+            tid: self._plan_config_file_applies(profile_name, tool) for tid, tool in resolved
+        }
+        for tid, tool in resolved:
+            # Within-tool rollback: if any post-swap step (atomic_write_file)
+            # raises a runtime failure that pre-flight couldn't catch (disk
+            # full, EACCES, EROFS, an unexpected target shape), swap_link
+            # back to the source profile so the tool isn't left with
+            # config_dirs pointing at the destination but ConfigFile state
+            # still at the source. Best-effort: rollback exceptions are
+            # swallowed so the user sees the *original* failure that the
+            # commit was trying to recover from.
+            #
+            # Cross-tool rollback (undoing prior tools whose swap+write
+            # already succeeded) is intentionally out of scope — symmetric
+            # to the existing config_dirs swap_link loop, which has always
+            # accepted partial-multi-tool mutation as op-log territory
+            # (spec §2.7; the next `switcher init --continue` is the
+            # architectural cleanup path). Adding per-loop unwinding here
+            # would duplicate op-log work without the journaling that
+            # makes it crash-safe.
+            # ``active[tid]`` is guaranteed populated for every ``tid`` in
+            # resolved by the target_ids filter at the top of use() (both
+            # the default path's ``profile.tools.keys() & managed`` and the
+            # --only path's explicit ``tid not in managed`` check). Use
+            # ``.get()`` defensively so a future refactor that loosens that
+            # filter doesn't silently turn an invariant violation into a
+            # raw KeyError on the rollback path (abby r8). ``None`` means
+            # "no prior profile known for this tool" — skip rollback, since
+            # there's no source profile to swap_link back to.
+            source_profile = active.get(tid)
+            swapped: list[tuple[Path, Path]] = []
+            try:
+                for i, dm in enumerate(tool.config_dirs):
+                    target = self._store.profile_dir(profile_name) / dm.profile_subdir
+                    live = self._resolver.tool_dir(tool, i)
+                    if source_profile is not None:
+                        source_target = self._store.profile_dir(source_profile) / dm.profile_subdir
+                        swap_link(target, live)
+                        swapped.append((live, source_target))
+                    else:
+                        swap_link(target, live)
+                # Symlink swap first, then file overlay — the dir-mapping
+                # flip is visible to the tool before ConfigFile state is
+                # reconciled. Tool validator caps config_files at 1, so
+                # this is at most one write per tool.
+                for live_path, content in config_file_plans[tid]:
+                    atomic_write_file(live_path, content)
+            except Exception:
+                for live, source_target in reversed(swapped):
+                    with contextlib.suppress(Exception):
+                        swap_link(source_target, live)
+                raise
             active[tid] = profile_name
         # Combined write that also flushes any derived migration entries.
         self._store.set_active_state(active, self._derive_cache_for_active(active))
@@ -2567,6 +3793,7 @@ class ProfileService:
                     # under the active profile, not the link itself.
                     src = live.resolve() if live.is_symlink() else live
                     shutil.copytree(src, target, dirs_exist_ok=True)
+                self._capture_config_files(name, tool)
         except Exception:
             # No-debris discipline: copytree can fail mid-snapshot for
             # runtime reasons that pre-flight can't catch (transient I/O,
@@ -2613,6 +3840,7 @@ class ProfileService:
                     # / credentials list unknown).
                     continue
                 self._seed_credentials(src_profile, name, tool)
+                self._seed_config_files(src_profile, name, tool)
         except Exception:
             shutil.rmtree(self._store.profile_dir(name), ignore_errors=True)
             raise
@@ -3049,6 +4277,13 @@ class ProfileService:
 
         See spec §3 for full semantics. Dry-run bypasses non-TTY and skipped-tool
         guards (§3.1: "shows both phases without mutating or prompting").
+
+        ConfigFile invariant (spec §3.6): non-purge mode does NOT touch the
+        live config file (no symlink to break, unlike DirMapping) and
+        preserves per-profile ConfigFile snapshots alongside dir snapshots
+        — the asymmetric alternative is silent data loss. Purge mode's
+        ``shutil.rmtree(state_dir)`` carries snapshots away with the rest
+        of state.
         """
         self._require_initialized()
 
@@ -3173,6 +4408,13 @@ class ProfileService:
         _execute_uninstall_mapping). CORRUPT mappings always refuse
         regardless of --force; --force handles only the orphan-no-cache
         case (matches uninstall --force at service.py's pre-flight).
+
+        ConfigFile invariant: live config files are intentionally
+        untouched. There is no symlink to break (unlike
+        DirMapping/restore_real_dir), and writing the snapshot back
+        would destroy any drift the tool produced since the last
+        switch. Per-profile snapshots also stay on disk — same
+        preservation discipline as dir snapshots.
         """
         self._require_initialized()
         self._require_managed()
@@ -3220,18 +4462,92 @@ class ProfileService:
             # and the user is responsible — same as pre-fix.
             profile_name = active[tool_id]
             profile_dir = self._store.profile_dir(profile_name)
-            expected_subdirs = self._expected_subdirs_for(tool_id)
+            config_file_root = profile_dir / ".switcher" / "config_files"
+            # Same protection applied to ConfigFile snapshots under
+            # ``.switcher/config_files/<subdir>/``. Pre-fix, the orphan-
+            # force path only checked owned config_dir subtrees; an
+            # orphan tool with a stranded snapshot (e.g., post-init
+            # vanilla snapshot whose registry entry was later removed)
+            # would still be silently purgeable by a later
+            # ``uninstall --purge``. Treat snapshot subdirs as owned
+            # state too (Hermes + CR pass-PR-4 blocker). Subdirs share
+            # the same identifier between config_dirs and config_files
+            # (Tool validator enforces ``cf.profile_subdir in
+            # config_dirs subdirs``), so the historical-subdir union
+            # already bounds both sides.
+            expected_subdirs: set[str] = set(self._expected_subdirs_for(tool_id))
+            if not expected_subdirs:
+                # Truly unknown orphan: no registry entry AND no
+                # historical anchor. _expected_subdirs_for returns an
+                # empty set, which would otherwise let on-disk state
+                # slip past the check entirely — both lists empty,
+                # ``skipped_orphan = True``, and ``uninstall --purge``
+                # later rmtree's whatever's there. Fall back to listing
+                # the actual subdirs under the profile dir and snapshot
+                # root so unknown orphans with on-disk presence are
+                # still flagged (CR pass-PR-5 major).
+                #
+                # CRITICAL: exclude subdirs that any OTHER tool in the
+                # registry or historical table claims. In a multi-tool
+                # profile, the dated-current dir contains subdirs for
+                # claude, copilot, etc. — those belong to THOSE tools,
+                # not to the orphan being force-unmanaged. Without the
+                # exclusion, the fallback would over-attribute and
+                # refuse force-unmanage even when the orphan itself
+                # has no on-disk presence. The orphan owns at most
+                # whatever is NOT claimed by a known sibling.
+                claimed_by_others: set[str] = set()
+                for other_tool in self._registry:
+                    if other_tool.id == tool_id:
+                        continue
+                    claimed_by_others.update(self._expected_subdirs_for(other_tool.id))
+                for hist_tool_id, hist_subdirs in _HISTORICAL_PROFILE_SUBDIRS.items():
+                    if hist_tool_id == tool_id:
+                        continue
+                    claimed_by_others.update(hist_subdirs)
+                # ``.switcher`` is the reserved snapshot subtree, never a
+                # config_dir subdir — exclude it from the top-level
+                # enumeration too.
+                with contextlib.suppress(OSError):
+                    expected_subdirs.update(
+                        child.name
+                        for child in profile_dir.iterdir()
+                        if child.is_dir()
+                        and child.name != ".switcher"
+                        and child.name not in claimed_by_others
+                    )
+                if config_file_root.is_dir():
+                    with contextlib.suppress(OSError):
+                        expected_subdirs.update(
+                            child.name
+                            for child in config_file_root.iterdir()
+                            if child.is_dir() and child.name not in claimed_by_others
+                        )
             existing_subdirs = sorted(
                 sub for sub in expected_subdirs if (profile_dir / sub).is_dir()
             )
-            if existing_subdirs:
+            existing_config_file_subdirs = sorted(
+                sub for sub in expected_subdirs if (config_file_root / sub).is_dir()
+            )
+            if existing_subdirs or existing_config_file_subdirs:
+                owned_locations: list[str] = []
+                if existing_subdirs:
+                    owned_locations.append(
+                        f"config_dir subdir(s) {existing_subdirs} under {profile_name!r}"
+                    )
+                if existing_config_file_subdirs:
+                    owned_locations.append(
+                        f"ConfigFile snapshot subdir(s) "
+                        f"{existing_config_file_subdirs} under "
+                        f"{profile_name!r}/.switcher/config_files"
+                    )
                 raise UninstallPreflightError(
                     f"orphan tool {tool_id!r} still has profile data on disk "
-                    f"(subdir(s) {existing_subdirs} under {profile_name!r}). "
-                    f"Refusing to drop from active map — that data would be "
-                    f"silently lost on a later `switcher uninstall --purge`. "
-                    f"Restore the registry TOML and re-run, or delete the "
-                    f"subdir(s) manually first."
+                    f"({'; '.join(owned_locations)}). Refusing to drop from "
+                    f"active map — that data would be silently lost on a "
+                    f"later `switcher uninstall --purge`. Restore the "
+                    f"registry TOML and re-run, or delete the owned data "
+                    f"manually first."
                 )
             skipped_orphan = True
 
@@ -3399,17 +4715,17 @@ class ProfileService:
         self._require_initialized()
         active = self._store.get_active()
 
-        # Detection: tool in registry, not in active, first config dir exists at live.
-        candidates: list[Tool] = []
-        for tool in self._registry:
-            if tool.id in active:
-                continue
-            if not tool.config_dirs:
-                continue
-            first_live = self._resolver.tool_dir(tool, 0)
-            if not self._resolver.exists(first_live):
-                continue
-            candidates.append(tool)
+        # Detection: tool in registry, not in active, AND installed by
+        # the shared predicate (first config_dir on disk OR any
+        # config_files live path on disk — see _is_tool_installed).
+        # Reusing the predicate keeps rescan and detect_installed in
+        # lockstep; the v0.1.6 dir-only check missed Claude installs
+        # that only carry ``~/.claude.json`` (Hermes pass-PR-8 #1).
+        candidates: list[Tool] = [
+            tool
+            for tool in self._registry
+            if tool.id not in active and self._is_tool_installed(tool)
+        ]
 
         if only is not None:
             if not only:
@@ -3439,6 +4755,19 @@ class ProfileService:
                     raise AlreadyLinkedError(f"{live} is already a link")
                 if live.exists() and not live.is_dir():
                     raise PathNotADirectoryError(f"{live} exists but is not a directory")
+        # ConfigFile live-path preflight — pure read. Symmetric to the
+        # init() preflight added in Hermes pass-PR-7 13:04Z: detection
+        # treats a ConfigFile-only install as "installed", so a
+        # deterministic CF validation failure (symlink, non-regular
+        # file, non-UTF-8, malformed JSON, non-object JSON, owned-path
+        # shape mismatch) must surface BEFORE ``oplog.append_record``.
+        # Pre-fix, the intent was journaled first and only canceled
+        # for ``ProfileExistsError``; a CF capture failure on the
+        # first tool fully rolled the filesystem back but left the
+        # in-flight rescan record behind, forcing the next command
+        # down ``--continue`` / ``--abort`` recovery even though
+        # nothing was left to recover (Hermes pass-PR-9).
+        self._validate_config_files_live(candidates)
 
         # Resolve target profile name(s).
         if into is not None:
@@ -3449,6 +4778,29 @@ class ProfileService:
                     if (self._store.profile_dir(into) / dm.profile_subdir).exists():
                         raise RescanCaptureError(
                             f"profile {into!r} already has {dm.profile_subdir!r} (would overwrite)"
+                        )
+                # Same defensive rule for ConfigFile snapshots: a target
+                # profile that already has a snapshot at the canonical
+                # path is mid-state from a different switcher operation
+                # (an older save / a partial uninstall) — overwriting it
+                # would silently destroy the previously-captured MCP /
+                # oauth subtree (spec §3.8).
+                #
+                # ``exists() or is_symlink()`` so a broken (dangling)
+                # symlink at the snapshot path doesn't slip past the
+                # check — Path.exists() returns False for a broken
+                # symlink, but the classifier already treats any link
+                # shape at the snapshot path as AMBIGUOUS corruption.
+                # Refusing here keeps preflight consistent with the
+                # compensation rules (abby r-batch4 nit).
+                for cf in tool.config_files:
+                    snap = self._store.config_file_snapshot_path(
+                        into, cf.profile_subdir, cf.profile_filename
+                    )
+                    if snap.exists() or snap.is_symlink():
+                        raise RescanCaptureError(
+                            f"profile {into!r} already has a config_file "
+                            f"snapshot at {snap} (would overwrite)"
                         )
             targets = {tool.id: into for tool in candidates}
         else:
@@ -3503,6 +4855,25 @@ class ProfileService:
         previous_tools_snapshot: dict[str, dict[str, bool]] | None = None
         if into is not None:
             previous_tools_snapshot = {into: dict(self._store.get(into).tools)}
+        # ConfigFile intents for rescan, parallel to the init branch.
+        # Canonicalize live_path via expand() + normpath so the
+        # AbsolutePath validator accepts the string and recovery sees
+        # the same canonical form a fresh rescan would compute.
+        rescan_config_file_mappings: list[_ConfigFileMappingIntent] = []
+        for tool in candidates:
+            for cf in tool.config_files:
+                live_cf = self._resolver.expand(cf.windows_path if IS_WINDOWS else cf.posix_path)
+                rescan_config_file_mappings.append(
+                    _ConfigFileMappingIntent.model_validate(
+                        {
+                            "tool_id": tool.id,
+                            "profile_subdir": cf.profile_subdir,
+                            "profile_filename": cf.profile_filename,
+                            "live_path": os.path.normpath(str(live_cf)),
+                            "owned_json_paths": tuple(cf.owned_json_paths),
+                        }
+                    )
+                )
         intent = _RescanOp.model_validate(
             {
                 "op": "rescan",
@@ -3512,6 +4883,7 @@ class ProfileService:
                 "into_mode": into is not None,
                 "previous_tools": previous_tools_snapshot,
                 "mappings": rescan_mappings,
+                "config_file_mappings": rescan_config_file_mappings,
             }
         )
         oplog.append_record(intent)
@@ -3671,6 +5043,36 @@ class ProfileService:
                             move_or_seed_dir(tgt, live)
             raise
 
+        # Mirror init's capture sequence: the rescan profile must own the
+        # same data shape every later capture will produce, or the first
+        # `switcher use <rescan-profile>` would hit snapshot-missing on
+        # every ConfigFile-equipped tool — warn-and-skip at best, silent
+        # apply of `{}` over user MCPs at worst (the snapshot-missing
+        # branch in _plan_config_file_applies). No-op for tools without
+        # config_files.
+        #
+        # Placement is post-dir-loop and post-metadata-update so a
+        # snapshot-capture failure (StorageError on malformed live JSON,
+        # symlink at live_path, etc.) doesn't strand a half-built
+        # snapshot in the partial profile dir. The inner except cleans
+        # the snapshot debris explicitly; the outer rescan() rollback
+        # (_rollback_partial_rescan) handles the dir + metadata side.
+        try:
+            self._capture_config_files(target, tool)
+        except Exception:
+            # Unlink any partial snapshot debris. For fresh-mode the
+            # outer rmtree of target_dir would catch this too, but
+            # --into mode leaves target_dir alone — the dir-rollback
+            # only touches per-tool subdirs, so an orphan snapshot
+            # under .switcher/config_files/ would survive without
+            # this explicit cleanup. Belt-and-suspenders for fresh
+            # mode; load-bearing for --into.
+            for cf in tool.config_files:
+                self._store.config_file_snapshot_path(
+                    target, cf.profile_subdir, cf.profile_filename
+                ).unlink(missing_ok=True)
+            raise
+
         # Capture succeeded — commit the metadata update for --into. If this
         # write fails after a successful capture, the live links exist but
         # metadata doesn't reflect them; that's a narrower window than the
@@ -3772,6 +5174,31 @@ class ProfileService:
                     f"profile {target!r} metadata.json revert failed "
                     f"(still lists tool {tool.id!r}): {meta_err}"
                 )
+
+        # Remove any ConfigFile snapshot debris written into the
+        # --into target for this tool. The inner cleanup in
+        # ``_capture_tool_for_rescan`` only fires when
+        # ``_capture_config_files`` itself raises; if that succeeds and
+        # the LATER ``update_profile_tools`` (or ``set_active_state`` in
+        # the outer rescan loop) fails, the snapshot survives. For
+        # --into mode, target_dir is NOT rmtree'd by this rollback —
+        # the snapshot would leak under
+        # ``<target>/.switcher/config_files/...`` and trip the
+        # ``rescan --into`` collision pre-flight on the next retry
+        # (Hermes pass-PR-2 / pass-PR-9.5). ``force_remove`` handles
+        # every shape (file / symlink / junction / directory) the path
+        # could have taken between capture and rollback — a previous
+        # ``unlink(missing_ok=True)`` would have silently failed on a
+        # directory-shaped snapshot path and wedged the next retry
+        # because ``snap.exists()`` would still be True at the
+        # collision check.
+        for cf in tool.config_files:
+            snap_path = self._store.config_file_snapshot_path(
+                target, cf.profile_subdir, cf.profile_filename
+            )
+            if snap_path.is_symlink() or snap_path.exists():
+                with contextlib.suppress(Exception):
+                    force_remove(snap_path)
         for i, dm in enumerate(tool.config_dirs):
             live = self._resolver.tool_dir(tool, i)
             if self._resolver.is_link(live):

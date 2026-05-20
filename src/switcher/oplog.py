@@ -21,6 +21,7 @@ import json
 import os
 import tempfile
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -41,6 +42,13 @@ from pydantic import (
 )
 
 from switcher.errors import OpLogCorruptError, StorageError
+from switcher.json_paths import (
+    InvalidOwnedPathError,
+    UnsupportedWalkTargetError,
+    parse_owned_path,
+    validate_snapshot_against_owned_paths,
+)
+from switcher.links import snapshot_ancestor_link
 from switcher.models import validate_absolute_path, validate_safe_name
 
 # StrictStr blocks str/int/bool coercion; Field(min_length=1) rejects
@@ -97,6 +105,29 @@ SafeName = Annotated[NonEmptyStr, AfterValidator(validate_safe_name)]
 AbsolutePath = Annotated[NonEmptyStr, AfterValidator(validate_absolute_path)]
 
 
+def _validate_owned_json_paths(paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Reject any entry that doesn't parse against the owned-path grammar.
+
+    Same fail-fast discipline as the surrounding ``Annotated`` types: a
+    hand-edited journal carrying garbage like ``"mcpServers"`` (missing
+    the leading ``.``) or ``".projects[]"`` (leaf ``[]`` is not v1
+    grammar) would otherwise satisfy ``tuple[str, ...]`` and only fail
+    later at compensation time, deep inside the walker. Surface the
+    corruption at the journal-parse boundary instead, where it routes
+    through the existing ``OpLogCorruptError`` mapping the IO layer
+    already does for ValidationError (CR pass-PR-2 major).
+    """
+    for path in paths:
+        try:
+            parse_owned_path(path)
+        except InvalidOwnedPathError as e:
+            raise ValueError(f"invalid owned_json_paths entry {path!r}: {e}") from e
+    return paths
+
+
+OwnedJsonPaths = Annotated[tuple[NonEmptyStr, ...], AfterValidator(_validate_owned_json_paths)]
+
+
 class _MappingIntent(BaseModel):
     """Per-DirMapping original state — seed metadata for abort.
 
@@ -149,6 +180,117 @@ class _MappingIntent(BaseModel):
     live_path: AbsolutePath
     profile_subdir: SafeName
     original_kind: Literal["missing", "real-dir"]
+
+
+class _ConfigFileMappingIntent(BaseModel):
+    """Per-ConfigFile original state for an init/rescan op — seed metadata
+    for the snapshot side of compensation. Parallel to ``_MappingIntent``
+    for DirMappings; used by ``_InitOp`` and ``_RescanOp``. ``use`` and
+    ``save`` are NOT journaled per spec §3.7.
+
+    Unlike ``_MappingIntent``, there is no ``original_kind`` /
+    ``pre_op_snapshot_existed`` field. init/rescan always start with a
+    fresh profile dir (rescan ``--into`` is required by §3.8 to refuse a
+    target with a pre-existing snapshot at the same path), so the
+    snapshot file can never pre-exist when the intent is written. The
+    only state the journal needs is "did we write it yet?", a single bit
+    the classifier reads directly from the filesystem.
+
+    Snapshot path is structurally guaranteed to live under
+    ``<profile_dir>/.switcher/config_files/<profile_subdir>/<profile_filename>``;
+    there is no stored snapshot path to corrupt because every consumer
+    derives the path from these fields via
+    ``FileProfileStore.config_file_snapshot_path``. SafeName on
+    profile_subdir and profile_filename rejects journal-path-traversal
+    attempts before the classifier ever touches the disk.
+
+    ``live_path`` is a canonical absolute path — the writer expands
+    raw ConfigFile paths through ``PathResolver.expand()`` AND runs
+    ``os.path.normpath`` (or ``Path.resolve``) before persisting, so
+    anything that isn't a normalized absolute string here is corruption.
+    AbsolutePath rejects ``..`` segments, so a non-canonicalized
+    expansion would fail validation at intent-write time rather than
+    silently slipping into the journal.
+
+    ``owned_json_paths`` snapshots the EXACT walker contract that
+    capture was supposed to use, copied from the registry's
+    ``ConfigFile.owned_json_paths`` at intent-write time. Recovery
+    replays from this journaled list rather than re-reading the
+    current registry, so a registry edit between intent-write and
+    recovery (e.g., switcher upgrade that changes which subtrees are
+    owned for the same ``(profile_subdir, profile_filename)`` pair)
+    cannot silently change the shape of the snapshot the original op
+    intended. abby r-batch4 blocker: the runtime registry check
+    confirms the tuple still exists, but without this field the
+    extracted shape would drift across version changes — non-
+    idempotent recovery.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    tool_id: SafeName
+    profile_subdir: SafeName
+    profile_filename: SafeName
+    live_path: AbsolutePath
+    # Tuple — frozen alongside the BaseModel's ``frozen=True`` config.
+    # Strings stay un-aliased; the walker's parse step is the boundary
+    # that validates each path expression.
+    owned_json_paths: OwnedJsonPaths
+
+
+def _check_config_file_mappings_against_target_ids(
+    op_name: str,
+    target_ids: list[str],
+    mappings: list[_ConfigFileMappingIntent],
+    target_profile_for_tool: Callable[[str], str],
+) -> None:
+    """Shared cross-field validator for config_file_mappings.
+
+    Two invariants — parallel to the dir-mapping validator above:
+
+    1. Every ``mapping.tool_id`` must appear in ``target_ids``. A
+       mapping for a tool that isn't in the targeted set is a corrupt
+       journal entry; recovery would not know whether to treat it as
+       part of this op or as drift.
+
+    2. The STORAGE-PATH identity
+       ``(target_profile, profile_subdir, profile_filename)`` is
+       unique across mappings. The triple identifies exactly the
+       on-disk snapshot file (spec §3.3 layout:
+       ``<profile_dir>/.switcher/config_files/<subdir>/<filename>``)
+       — duplicate storage paths in the journal let recovery double-
+       extract and silently clobber one tool's snapshot with another's
+       on a different live read (abby r-batch4 blocker). The
+       ``tool_id`` field is NOT part of the uniqueness key because
+       two different tool_ids pointing at the same storage path is
+       precisely the corruption shape this guard exists to refuse.
+
+       ``target_profile`` is resolved per tool via the caller-supplied
+       ``target_profile_for_tool`` function so the same validator
+       handles both init (single profile across all targets) and
+       rescan (potentially different profile per tool in fresh-mode).
+
+    NOT enforced: that every tool in ``target_ids`` has at least one
+    entry. Tools without config_files legitimately contribute zero
+    entries — symmetric to ``_check_mappings_against_target_ids``'s
+    treatment of registry-only tools.
+    """
+    target_set = set(target_ids)
+    seen: set[tuple[str, str, str]] = set()
+    for m in mappings:
+        if m.tool_id not in target_set:
+            raise ValueError(
+                f"{op_name}: config_file_mappings entry references "
+                f"tool_id={m.tool_id!r} not in target_ids={sorted(target_set)!r}"
+            )
+        storage_profile = target_profile_for_tool(m.tool_id)
+        key = (storage_profile, m.profile_subdir, m.profile_filename)
+        if key in seen:
+            raise ValueError(
+                f"{op_name}: duplicate config_file_mappings storage path "
+                f"{key!r} (two entries would write to the same snapshot file "
+                f"under profile {storage_profile!r})"
+            )
+        seen.add(key)
 
 
 class _BaseOp(BaseModel):
@@ -274,6 +416,10 @@ class _InitOp(_BaseOp):
     target_ids: list[SafeName]
     profile_name: SafeName
     mappings: list[_MappingIntent]
+    # Default-empty preserves wire-format compatibility: journals
+    # written before this feature shipped will continue to parse and
+    # round-trip exactly, with no config_file_mappings work to do.
+    config_file_mappings: list[_ConfigFileMappingIntent] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_target_ids_unique(self) -> Self:
@@ -283,6 +429,20 @@ class _InitOp(_BaseOp):
     @model_validator(mode="after")
     def _check_mappings_consistency(self) -> Self:
         _check_mappings_against_target_ids("_InitOp", self.target_ids, self.mappings)
+        return self
+
+    @model_validator(mode="after")
+    def _check_config_file_mappings_consistency(self) -> Self:
+        # All init mappings land in the same profile_name; the resolver
+        # is a constant function. Captured-by-default at class scope so
+        # Python's late-binding doesn't make ``self`` lookups surprising.
+        profile_name = self.profile_name
+        _check_config_file_mappings_against_target_ids(
+            "_InitOp",
+            self.target_ids,
+            self.config_file_mappings,
+            lambda _tool_id: profile_name,
+        )
         return self
 
 
@@ -330,6 +490,9 @@ class _RescanOp(_BaseOp):
     into_mode: StrictBool
     previous_tools: dict[SafeName, dict[SafeName, StrictBool]] | None = None
     mappings: list[_MappingIntent]
+    # Default-empty preserves wire-format compatibility with journals
+    # written before this feature shipped — see ``_InitOp``.
+    config_file_mappings: list[_ConfigFileMappingIntent] = Field(default_factory=list)
     rescan_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
 
     @model_validator(mode="after")
@@ -392,6 +555,23 @@ class _RescanOp(_BaseOp):
     @model_validator(mode="after")
     def _check_mappings_consistency(self) -> Self:
         _check_mappings_against_target_ids("_RescanOp", self.target_ids, self.mappings)
+        return self
+
+    @model_validator(mode="after")
+    def _check_config_file_mappings_consistency(self) -> Self:
+        # In rescan, target_profile depends on tool_id (fresh-mode can
+        # have different per-tool profiles; --into has a single one).
+        # The resolver consults ``target_profiles`` so the uniqueness
+        # check measures the actual storage path, not a per-tool key
+        # that wouldn't catch two tools writing the same snapshot file
+        # under a shared profile (abby r-batch4).
+        target_profiles = self.target_profiles
+        _check_config_file_mappings_against_target_ids(
+            "_RescanOp",
+            self.target_ids,
+            self.config_file_mappings,
+            lambda tool_id: target_profiles[tool_id],
+        )
         return self
 
 
@@ -596,6 +776,116 @@ def classify_mapping(intent: _MappingIntent, profile_dir: Path) -> MappingDiskSt
     # of any kind, broken symlink). All are corruption from the
     # journal's perspective.
     return MappingDiskState.AMBIGUOUS
+
+
+class ConfigFileDiskState(Enum):
+    """Per-ConfigFile on-disk state for op-log compensation (spec §3.7).
+
+    Three states partition the snapshot-path shape space:
+
+    - COMPLETE: snapshot is a regular file containing valid JSON —
+      ``_capture_config_files`` ran to completion for this entry.
+    - UNTOUCHED: snapshot file absent — the SIGKILL window between
+      intent-write and the atomic snapshot rename. ``--continue``
+      re-extracts from the (journaled) live_path; ``--abort`` is a
+      no-op.
+    - AMBIGUOUS: any non-regular-file shape (directory, symlink,
+      junction, special file) OR a regular file that fails to parse as
+      JSON. Refuse to compensate; surface to the user.
+
+    The dir-mapping classifier has four states because move +
+    swap_link is a two-step commit. ``_capture_config_files`` uses
+    ``atomic_write_file`` (write-temp + rename), a single commit point
+    — so the MOVE_DONE_LINK_MISSING shape that the dir classifier
+    needs has no analogue here. Two states "did we write it?" and
+    "is the write parseable?" are observable from one ``stat`` + one
+    ``json.loads`` call, which is what this function does.
+    """
+
+    COMPLETE = "complete"
+    UNTOUCHED = "untouched"
+    AMBIGUOUS = "ambiguous"
+
+
+def classify_config_file_mapping(
+    entry: _ConfigFileMappingIntent, profile_dir: Path
+) -> ConfigFileDiskState:
+    """Classify the on-disk state of a ConfigFile snapshot.
+
+    The snapshot path is derived structurally from the entry; the
+    classifier never trusts a stored snapshot path — the entry carries
+    only ``profile_subdir`` + ``profile_filename``, and the snapshot
+    layout (``<profile_dir>/.switcher/config_files/<subdir>/<filename>``)
+    is the single source of truth that every writer
+    (``FileProfileStore.config_file_snapshot_path``) routes through.
+
+    Pure read; no mutations. Mirrors ``classify_mapping`` in shape and
+    in being a pure observation of the live filesystem at compensation
+    time.
+
+    Args:
+        entry: the per-ConfigFile intent record.
+        profile_dir: the resolved ``<state_dir>/profiles/<profile_name>``
+            directory the op was targeting. Passed in explicitly so the
+            classifier doesn't take a Store reference.
+    """
+    snap_path = (
+        profile_dir / ".switcher" / "config_files" / entry.profile_subdir / entry.profile_filename
+    )
+    # Surface ancestor-link redirection BEFORE the leaf checks below. A
+    # symlink/junction at ``.switcher`` / ``config_files`` / ``<subdir>``
+    # transparently redirects ``snap_path.is_symlink``/``is_file``/
+    # ``read_text`` to whatever the link points at — without this guard
+    # an external file would be classified COMPLETE and recovery would
+    # read or unlink attacker-controlled paths under the assumption the
+    # subtree is reserved (Hermes pass-PR-6 blocker). AMBIGUOUS keeps
+    # the classifier's pure-read contract (no raise) and slots into the
+    # existing "preflight refuses, surface to user" disposition every
+    # compensation path already encodes.
+    if snapshot_ancestor_link(profile_dir, entry.profile_subdir) is not None:
+        return ConfigFileDiskState.AMBIGUOUS
+    # `Path.exists()` returns False for a broken symlink; `Path.is_symlink()`
+    # returns True. Combine both to distinguish "absent" from "present in
+    # a corrupt shape". Without the is_symlink check, a broken-symlink
+    # snapshot would misclassify as UNTOUCHED and the --continue path
+    # would re-extract over it, silently destroying the link target.
+    if not snap_path.exists() and not snap_path.is_symlink():
+        return ConfigFileDiskState.UNTOUCHED
+    # is_file() follows symlinks, so an unbroken symlink to a real file
+    # would pass it; the explicit is_symlink() check rejects link
+    # shapes regardless of what they point at. ``_is_link`` covers
+    # Windows junctions too, mirroring the dir-mapping classifier.
+    if _is_link(snap_path) or not snap_path.is_file():
+        return ConfigFileDiskState.AMBIGUOUS
+    try:
+        parsed = json.loads(snap_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return ConfigFileDiskState.AMBIGUOUS
+    # ``_capture_config_files`` / ``_extract_and_write_config_file_snapshot``
+    # always emit a JSON object — the snapshot is an extract of owned
+    # subtrees keyed by name. A parseable-but-wrong shape (``[]``, ``"x"``,
+    # ``null``, ``42``, ...) is corruption from our perspective: the apply
+    # side rejects non-object snapshots with StorageError, so classifying
+    # such a file as COMPLETE would defer a detectable corruption to a
+    # later ``use`` and silently preserve / unlink the wrong-shape state
+    # at compensation time (abby r-batch4: detectable corruption must
+    # surface at the boundary, not at a later use).
+    if not isinstance(parsed, dict):
+        return ConfigFileDiskState.AMBIGUOUS
+    # Validate the snapshot's shape against the journaled owned-paths.
+    # A regular file that parses as a JSON object can still be
+    # structurally incompatible: a snapshot like ``{"projects": []}``
+    # with owned-path ``.projects[].mcpServers`` parses fine but the
+    # iter segment lands on a list, so a later ``use`` would either
+    # silently delete owned leaves from live or raise mid-apply.
+    # Surfacing that AT the classifier boundary keeps compensation
+    # from short-circuiting (marking the journal completed) while
+    # corruption persists in the on-disk snapshot (Hermes pass-PR-5).
+    try:
+        validate_snapshot_against_owned_paths(parsed, entry.owned_json_paths)
+    except (UnsupportedWalkTargetError, InvalidOwnedPathError):
+        return ConfigFileDiskState.AMBIGUOUS
+    return ConfigFileDiskState.COMPLETE
 
 
 class OpLogIO:

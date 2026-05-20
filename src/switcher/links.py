@@ -26,10 +26,12 @@ hosted Windows runner.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from switcher.errors import (
@@ -79,7 +81,7 @@ def _create_junction(target: Path, link_path: Path) -> None:
     )
 
 
-def _force_remove(path: Path) -> None:
+def force_remove(path: Path) -> None:
     """Remove a path regardless of what kind of entry it is.
 
     Junctions are reparse-pointed *directory* entries on Windows: the
@@ -111,7 +113,7 @@ def remove_link(link_path: Path) -> None:
     invokes `RemoveDirectory`, which accepts them. POSIX symlinks always
     go through `unlink`. Anything that's not a link (real dir, regular
     file, missing) raises `PathNotADirectoryError` — callers that need
-    "remove anything" should use `_force_remove` instead.
+    "remove anything" should use `force_remove` instead.
     """
     if IS_WINDOWS and os.path.isjunction(link_path):
         link_path.rmdir()
@@ -178,7 +180,7 @@ def swap_link(target: Path, link_path: Path) -> None:
         # the old symlink or the new one, never a missing entry.
         tmp = link_path.with_name(link_path.name + ".tmp")
         if tmp.exists() or tmp.is_symlink():
-            _force_remove(tmp)
+            force_remove(tmp)
         link_dir(target, tmp)
         tmp.replace(link_path)
 
@@ -282,3 +284,163 @@ def restore_real_dir(temp_dir: Path, live_path: Path) -> None:
         )
     remove_link(live_path)
     temp_dir.rename(live_path)
+
+
+def atomic_write_file(target: Path, content: bytes) -> None:
+    """Atomically write ``content`` to ``target`` via tmp-file + rename.
+
+    Mirrors the discipline in ``oplog._write_records``:
+
+    - ``mkdir(parents=True, exist_ok=True)`` on the parent first, so callers
+      don't need to remember the contract. The ``.switcher/config_files/<subdir>/``
+      reserved path used by ConfigFile snapshots won't exist on the first
+      snapshot write per profile.
+    - ``tempfile.mkstemp`` for the staging file — ``O_EXCL`` defeats the
+      pre-placed-symlink class flagged on the journal write, the random
+      suffix prevents collisions across overlapping callers, and
+      same-directory placement keeps the rename within one filesystem so
+      it's atomic on POSIX and Windows alike.
+    - ``Path.replace`` for the rename (cross-platform since Python 3.3).
+    - On any failure after ``mkstemp`` but before ``replace`` succeeds,
+      ``unlink(missing_ok=True)`` the tmp file so retries don't accumulate
+      orphans.
+
+    **Scope:** torn-write prevention, not power-loss durability. No fsync
+    on the tmp file or parent directory — matches the explicit trade-off
+    documented in ``oplog._write_records``.
+
+    **Mode preservation (POSIX):** ``tempfile.mkstemp`` creates files at
+    mode 0o600 by default, so a naive tmp+rename would silently change
+    the permissions of any pre-existing target file (typically tightening
+    them, since 0o600 is more restrictive than typical umask defaults).
+    To keep this primitive transparent to callers, when the target exists
+    as a regular file we capture its mode pre-rename and apply it to the
+    tmp file via ``os.chmod`` before the swap. Best-effort: if the
+    capture or apply fails (rare, e.g. filesystems that reject chmod),
+    the rename still proceeds with mkstemp's default mode.
+
+    **Other metadata** (ACLs, xattrs, ownership) is not preserved — the
+    rename swaps in a fresh inode and only mode bits are restored. Callers
+    that need richer metadata preservation must layer it on top.
+
+    **Symlink targets — best-effort rejection:** if ``target`` is a
+    symlink at call time, raise ``OSError`` so the user sees the
+    incompatibility instead of having their redirection silently
+    replaced by a regular file. (Previously raised ``IsADirectoryError``;
+    that subclass is semantically misleading — a symlink isn't a
+    directory — and shadowed other path-shape ``IsADirectoryError``s
+    from ``Path.replace``.) This is **best-effort**, not a hard
+    guarantee: there's a TOCTOU window between the up-front check and
+    the eventual ``Path.replace`` during which another process could
+    swap the target to a symlink. No POSIX primitive cleanly expresses
+    "atomic replace iff target is a regular file", and the realistic
+    threat for v1 consumers (``~/.claude.json``, switcher-private
+    snapshots) is the user statically configuring a symlink — not a
+    concurrent race. Closing the race tightly would require platform-
+    specific tricks (renameat2's flags on Linux, no Windows analogue)
+    that don't match the cross-platform contract this helper provides.
+    """
+    if target.is_symlink():
+        raise OSError(
+            f"refusing to atomic-write through symlink at {target!r}; "
+            "atomic rename would replace the link with a regular file, "
+            "breaking the redirection. Resolve the symlink and write to "
+            "the underlying path directly, or remove the symlink."
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Capture pre-existing mode so the rename doesn't silently tighten
+    # permissions when mkstemp's 0o600 default differs from the live file.
+    prior_mode: int | None = None
+    if target.is_file() and not target.is_symlink():
+        try:
+            prior_mode = target.stat().st_mode & 0o777
+        except OSError:
+            prior_mode = None
+
+    fd, tmpname = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=target.name + ".",
+        suffix=".tmp",
+    )
+    tmppath = Path(tmpname)
+    try:
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+        except Exception:
+            # Best-effort close — fdopen may or may not have taken
+            # ownership of fd before raising. Closing-after-close
+            # raises EBADF on some platforms; suppress so the original
+            # write failure surfaces.
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        if prior_mode is not None:
+            # Best-effort; the rename still proceeds with mkstemp's
+            # default mode. Filesystems that reject chmod (e.g. some
+            # Windows shares) shouldn't block the write.
+            with contextlib.suppress(OSError):
+                tmppath.chmod(prior_mode)
+        tmppath.replace(target)
+    except Exception:
+        tmppath.unlink(missing_ok=True)
+        raise
+
+
+def snapshot_ancestor_link(profile_dir: Path, profile_subdir: str) -> Path | None:
+    """Return the first link/junction ancestor of the reserved snapshot
+    subtree, or None if every existing reserved ancestor is a real
+    directory.
+
+    ConfigFile snapshots live at
+    ``profile_dir/.switcher/config_files/<profile_subdir>/<filename>``.
+    Every read/write/classify site already rejects a leaf symlink, but
+    a symlink/junction at ``<state>/profiles``, ``profile_dir``,
+    ``.switcher``, ``.switcher/config_files``, or
+    ``.switcher/config_files/<profile_subdir>`` silently redirects
+    snapshot I/O outside the state store — the leaf's
+    ``is_symlink()``/``is_file()`` check follows the redirection and
+    reports a healthy regular file even though the underlying inode
+    lives elsewhere (Hermes pass-PR-6 / pass-PR-7 #1 / pass-PR-8 #2
+    blockers).
+
+    The scan includes ``<state>/profiles`` and ``profile_dir`` itself
+    because a symlinked ancestor compromises the *entire* reserved
+    subtree, not just the snapshot path: every ConfigFile call site
+    routes through ``FileProfileStore.config_file_snapshot_path``
+    (which routes through this helper), so anchoring the check at the
+    state-store profiles root closes the escape regardless of which
+    profile or subdirectory the caller is targeting. ``state_dir``
+    itself is NOT scanned — users may legitimately point
+    ``SWITCHER_STATE_DIR`` at a symlink to relocate the state store,
+    whereas the internal ``profiles/`` directory layout is switcher-
+    owned and a link there is always tampering.
+
+    Pure observation; never mutates the filesystem. Missing ancestors
+    are fine (``atomic_write_file`` materializes them via
+    ``mkdir(parents=True, exist_ok=True)`` on the next write) — once
+    the chain hits an absent ancestor, nothing below it can be link-
+    shaped yet either, so the scan terminates without surfacing
+    anything. Only the link/junction shape is rejected; a real
+    directory passes silently.
+    """
+    chain = (
+        profile_dir.parent,
+        profile_dir,
+        profile_dir / ".switcher",
+        profile_dir / ".switcher" / "config_files",
+        profile_dir / ".switcher" / "config_files" / profile_subdir,
+    )
+    for ancestor in chain:
+        # ``is_symlink`` returns True for both healthy and broken
+        # symlinks on POSIX and Windows; ``os.path.isjunction`` adds
+        # Windows directory junctions, which ``is_symlink`` reports
+        # False for. Both shapes redirect I/O regardless of whether
+        # the link target exists, so both must surface here.
+        if ancestor.is_symlink():
+            return ancestor
+        if os.name == "nt" and os.path.isjunction(str(ancestor)):
+            return ancestor
+        if not ancestor.exists():
+            return None
+    return None

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from switcher.errors import ProfileExistsError, StorageError, UnknownProfileError
+from switcher.links import snapshot_ancestor_link
 from switcher.models import Profile, validate_safe_name
 
 
@@ -67,6 +68,13 @@ class ProfileStore(Protocol):
 
     def profile_dir(self, name: str) -> Path: ...
     def state_dir(self) -> Path: ...
+    # ConfigFile snapshot path layout is the store's responsibility —
+    # callers (service, oplog compensation, tests) MUST route through
+    # this helper rather than reconstruct the .switcher/config_files/...
+    # path manually, so the layout doesn't drift.
+    def config_file_snapshot_path(
+        self, profile_name: str, profile_subdir: str, profile_filename: str
+    ) -> Path: ...
 
 
 class FileProfileStore:
@@ -83,6 +91,41 @@ class FileProfileStore:
         # so any caller (incl. the Protocol's external implementers) is forced
         # through validate_safe_name before a name can become a real path.
         return self._state_dir / "profiles" / validate_safe_name(name)
+
+    def config_file_snapshot_path(
+        self, profile_name: str, profile_subdir: str, profile_filename: str
+    ) -> Path:
+        # Single source of truth for the .switcher/config_files/<subdir>/<filename>
+        # layout. Every caller — save, use, init, create, rescan, op-log
+        # compensation — routes through here so the layout doesn't drift the
+        # first time someone adds a seventh call site. validate_safe_name
+        # rejects leading dots, so no tool's profile_subdir can collide with
+        # the reserved .switcher subtree.
+        pdir = self.profile_dir(profile_name)
+        subdir = validate_safe_name(profile_subdir)
+        filename = validate_safe_name(profile_filename)
+        # Reject any link/junction in the reserved snapshot subtree before
+        # handing the path back. Without this guard every read/write site
+        # only checks the leaf for ``is_symlink``, which follows a
+        # link-shaped ancestor and reports a healthy regular file even
+        # though the underlying inode lives outside the state store.
+        # ``classify_config_file_mapping`` would then return COMPLETE
+        # and recovery / use / save / init --continue / rescan --continue
+        # would read or write attacker-controlled paths while the
+        # journal believes the subtree is clean (Hermes pass-PR-6 blocker).
+        # Path construction is the single chokepoint every IO call site
+        # routes through, so anchoring the guard here keeps the leaf-only
+        # ``is_symlink`` checks from being load-bearing on their own.
+        bad = snapshot_ancestor_link(pdir, subdir)
+        if bad is not None:
+            raise StorageError(
+                f"refusing snapshot path for {profile_name!r}: reserved "
+                f"ancestor {bad} is a link or junction; this would "
+                f"redirect snapshot I/O outside the state store. Resolve "
+                f"the link (or remove it so the reserved subtree is a "
+                f"real directory) and re-run."
+            )
+        return pdir / ".switcher" / "config_files" / subdir / filename
 
     def _profiles_dir(self) -> Path:
         return self._state_dir / "profiles"
@@ -152,8 +195,20 @@ class FileProfileStore:
         # (metadata rewritten, dir move failed). Reconcile here so list() and
         # other observers see a consistent view: caller-visible name matches
         # the on-disk path. The cached name is repaired on the next rewrite.
+        #
+        # ``journal_id`` MUST be carried across this rebuild — fresh-mode
+        # rescan compensation proves ownership via
+        # ``profile.journal_id == record.rescan_id`` (service.py recovery
+        # paths). Dropping the field during drift-repair would let a
+        # post-rename ``get()`` silently return ``journal_id=None`` and
+        # cause recovery to misclassify a legitimate profile as foreign.
         if profile.name != name:
-            profile = Profile(name=name, created_at=profile.created_at, tools=profile.tools)
+            profile = Profile(
+                name=name,
+                created_at=profile.created_at,
+                tools=profile.tools,
+                journal_id=profile.journal_id,
+            )
         return profile
 
     def list(self) -> list[Profile]:
@@ -185,7 +240,15 @@ class FileProfileStore:
         # re-running rename(old, new) is idempotent. Reverse order leaves the
         # caller stuck (dir at new with stale metadata, old_dir gone).
         existing = self.get(old)
-        renamed = Profile(name=new, created_at=existing.created_at, tools=existing.tools)
+        # journal_id MUST be carried so fresh-mode rescan ownership
+        # proofs survive a rename of the reserved profile name. Same
+        # rationale as the drift-repair branch in ``get`` above.
+        renamed = Profile(
+            name=new,
+            created_at=existing.created_at,
+            tools=existing.tools,
+            journal_id=existing.journal_id,
+        )
         self._atomic_write(
             self._metadata_path(old),
             renamed.model_dump_json(by_alias=True),
@@ -393,6 +456,13 @@ class FileProfileStore:
             name=name,
             created_at=existing.created_at,
             tools=dict(tools),
+            # journal_id is load-bearing for fresh-mode rescan
+            # ownership — same rationale as the rename / drift-repair
+            # branches above. update_profile_tools is invoked by rescan
+            # --into's deferred metadata write; dropping the marker
+            # here would make a subsequent recovery falsely classify
+            # the profile as foreign.
+            journal_id=existing.journal_id,
         )
         typed = json.loads(new_prof.model_dump_json(by_alias=True))
         # Drop both alias variants so a manually-edited file with the

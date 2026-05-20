@@ -1251,8 +1251,8 @@ packages:
   requires_python: '>=2.7,!=3.0.*,!=3.1.*,!=3.2.*'
 - pypi: ./
   name: switcher
-  version: 0.1.6.dev2+g1cc1acca1.d20260519
-  sha256: 46e0ebc9eb0d2262879e211cfe04bfc00a3207504cb2280de1ee02c917fea392
+  version: 0.1.6.dev47+g15c6693a4.d20260519
+  sha256: 9210b0599c810cdf116bed8f04f2f3bc3c1d36e627ce46ae6cb2afd7ed32e95f
   requires_dist:
   - platformdirs>=4.0
   - pydantic>=2.7

@@ -64,12 +64,17 @@ def test_load_user_tools_raises_on_malformed(tmp_path: Path) -> None:
 
 
 def test_build_registry_merges_builtins_and_user(tmp_path: Path) -> None:
+    """Subset assertion so future builtins don't trip this on
+    legitimate growth — we only care that the user tool merged in
+    alongside the day-one builtins (matches the policy
+    ``test_load_builtins_includes_claude_and_copilot`` documents).
+    """
     rd = tmp_path / "registry.d"
     rd.mkdir()
     (rd / "gemini.toml").write_text(USER_TOOL, encoding="utf-8")
     tools = build_registry(rd)
-    ids = sorted(t.id for t in tools)
-    assert ids == ["claude", "codex", "copilot", "gemini"]
+    ids = {t.id for t in tools}
+    assert {"claude", "copilot", "gemini"} <= ids
 
 
 def test_build_registry_user_overrides_builtin(
@@ -126,6 +131,283 @@ def test_build_registry_two_user_files_overriding_builtin_attribute_correctly(
     assert len(lines) == 2
     assert "overrides builtin" in lines[0]
     assert "duplicate user tool" in lines[1]
+
+
+_TOOL_WITH_CF_TEMPLATE = """\
+id = "{id}"
+name = "{name}"
+
+[[config_dirs]]
+posix_path = "~/.{dir}"
+windows_path = "%USERPROFILE%\\\\.{dir}"
+profile_subdir = "{dir}"
+
+[[config_files]]
+posix_path = "{posix}"
+windows_path = "{windows}"
+profile_subdir = "{dir}"
+profile_filename = "{filename}"
+merge_strategy = "json_subtree_merge"
+owned_json_paths = [".mcpServers"]
+"""
+
+
+def _write_cf_tool(
+    rd: Path,
+    filename_in_rd: str,
+    *,
+    tool_id: str,
+    subdir: str,
+    posix: str,
+    windows: str,
+    filename: str,
+) -> None:
+    (rd / filename_in_rd).write_text(
+        _TOOL_WITH_CF_TEMPLATE.format(
+            id=tool_id,
+            name=tool_id,
+            dir=subdir,
+            posix=posix,
+            windows=windows,
+            filename=filename,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_build_registry_rejects_cross_tool_snapshot_slot_collision(
+    tmp_path: Path,
+) -> None:
+    """abby r13: per-tool ConfigFile uniqueness doesn't catch two distinct
+    tools claiming the same snapshot slot (profile_subdir + profile_filename)
+    under ``.switcher/config_files/...``. The registry-level check must.
+    """
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="~/.atool.json",
+        windows="%USERPROFILE%\\\\.atool.json",
+        filename="conf.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="atool",  # same subdir → snapshot slot collision
+        posix="~/.btool.json",
+        windows="%USERPROFILE%\\\\.btool.json",
+        filename="conf.json",
+    )
+    with pytest.raises(ValueError, match="snapshot slot"):
+        build_registry(rd)
+
+
+def test_build_registry_rejects_cross_tool_posix_path_collision(
+    tmp_path: Path,
+) -> None:
+    """Two distinct tools claiming the same posix_path → live-file race on
+    save/use. Registry-level check must catch."""
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="~/.shared.json",
+        windows="%USERPROFILE%\\\\.a.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="~/.shared.json",  # same posix → live-file collision
+        windows="%USERPROFILE%\\\\.b.json",
+        filename="b.json",
+    )
+    with pytest.raises(ValueError, match="posix_path"):
+        build_registry(rd)
+
+
+def test_build_registry_rejects_cross_tool_windows_path_collision(
+    tmp_path: Path,
+) -> None:
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="~/.a.json",
+        windows="%USERPROFILE%\\\\.shared.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="~/.b.json",
+        windows="%USERPROFILE%\\\\.shared.json",  # same windows → collision
+        filename="b.json",
+    )
+    with pytest.raises(ValueError, match="windows_path"):
+        build_registry(rd)
+
+
+def test_build_registry_cross_tool_collision_is_case_insensitive(
+    tmp_path: Path,
+) -> None:
+    """Default NTFS / APFS are case-insensitive; ``~/.foo.json`` and
+    ``~/.Foo.json`` resolve to the same file. Raw string compare would
+    let them through and re-introduce the silent-clobber class on
+    case-insensitive filesystems.
+    """
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="~/.foo.json",
+        windows="%USERPROFILE%\\\\.a.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="~/.Foo.json",  # case-variant of ~/.foo.json
+        windows="%USERPROFILE%\\\\.b.json",
+        filename="b.json",
+    )
+    with pytest.raises(ValueError, match="case-insensitive"):
+        build_registry(rd)
+
+
+def test_build_registry_rejects_home_dollar_spelling_collision(tmp_path: Path) -> None:
+    """Hermes pass-PR-4 blocker: two tools spelling the same home-relative
+    path as ``~/.shared.json`` and ``$HOME/.shared.json`` must be flagged
+    as duplicates. Runtime ``PathResolver.expand`` collapses both to the
+    same live file; the validator has to mirror that or the cross-tool
+    clobber class slips back in through a different spelling.
+    """
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="~/.shared.json",
+        windows="%USERPROFILE%\\\\.a.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="$HOME/.shared.json",  # equivalent spelling of ~/.shared.json
+        windows="%USERPROFILE%\\\\.b.json",
+        filename="b.json",
+    )
+    with pytest.raises(ValueError, match="posix_path"):
+        build_registry(rd)
+
+
+def test_build_registry_rejects_userprofile_tilde_spelling_collision_windows(
+    tmp_path: Path,
+) -> None:
+    """Mirror of the POSIX case for Windows: ``%USERPROFILE%\\.shared.json``
+    and ``~\\.shared.json`` resolve to the same live file at runtime.
+    """
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="~/.a.json",
+        windows="%USERPROFILE%\\\\.shared.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="~/.b.json",
+        windows="~\\\\.shared.json",  # equivalent spelling of %USERPROFILE%\.shared.json
+        filename="b.json",
+    )
+    with pytest.raises(ValueError, match="windows_path"):
+        build_registry(rd)
+
+
+def test_build_registry_rejects_curly_brace_home_spelling_collision(
+    tmp_path: Path,
+) -> None:
+    """``$HOME/.x.json`` and ``${HOME}/.x.json`` are POSIX-equivalent."""
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="$HOME/.shared.json",
+        windows="%USERPROFILE%\\\\.a.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="${HOME}/.shared.json",
+        windows="%USERPROFILE%\\\\.b.json",
+        filename="b.json",
+    )
+    with pytest.raises(ValueError, match="posix_path"):
+        build_registry(rd)
+
+
+def test_build_registry_accepts_disjoint_config_files(tmp_path: Path) -> None:
+    """Sanity-check the cross-tool uniqueness validator doesn't false-
+    positive on tools whose ConfigFiles touch disjoint paths."""
+    rd = tmp_path / "registry.d"
+    rd.mkdir()
+    _write_cf_tool(
+        rd,
+        "a.toml",
+        tool_id="atool",
+        subdir="atool",
+        posix="~/.atool.json",
+        windows="%USERPROFILE%\\\\.atool.json",
+        filename="a.json",
+    )
+    _write_cf_tool(
+        rd,
+        "b.toml",
+        tool_id="btool",
+        subdir="btool",
+        posix="~/.btool.json",
+        windows="%USERPROFILE%\\\\.btool.json",
+        filename="b.json",
+    )
+    tools = build_registry(rd)
+    assert {t.id for t in tools} >= {"atool", "btool"}
 
 
 def test_find_tool_returns_none_when_missing() -> None:

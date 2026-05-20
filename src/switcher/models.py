@@ -6,10 +6,12 @@ and serialized back the same way. Field aliases keep on-disk shapes clean.
 
 from __future__ import annotations
 
+import ntpath
+import posixpath
 import re
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from pydantic import (
     AliasChoices,
@@ -131,6 +133,70 @@ def validate_absolute_path(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cross-tool path uniqueness canonicalization
+# ---------------------------------------------------------------------------
+#
+# Validator-side mirror of ``PathResolver.expand`` for collision detection.
+# Runtime expansion (paths.py) consults ``os.environ`` and the configured
+# home; the validator runs at registry-build time, has no PathResolver,
+# and MUST be deterministic across hosts. Substitute the common "user
+# home" spellings against a sentinel so any spelling that resolves to the
+# user's home at runtime maps to a single key here. Then ``normpath``
+# folds ``..`` segments and ``casefold`` matches default NTFS/APFS
+# case-insensitive-but-preserving semantics (Hermes pass-PR-4 blocker).
+_HOME_SENTINEL = "\x00switcher-home\x00"
+# Windows ``%VAR%`` lookup is case-insensitive at runtime, mirror that here.
+_WIN_USERPROFILE_RE = re.compile(r"%USERPROFILE%", re.IGNORECASE)
+# POSIX env-var match: ``$HOME`` followed by a non-word char (or end of
+# string) OR the explicit ``${HOME}`` brace form. Without the boundary,
+# the pattern would match the ``$HOME`` prefix of unrelated variables
+# like ``$HOME_BACKUP`` / ``${HOME_DIR}`` and collapse semantically
+# distinct paths to the same canonical key — a false-positive collision
+# that would reject valid configs (Hermes pass-PR-4 blocker 3).
+_POSIX_HOME_RE = re.compile(r"\$(?:HOME(?!\w)|\{HOME\})")
+
+
+def canonicalize_path_for_uniqueness(path: str, *, windows: bool) -> str:
+    """Produce a canonical key for cross-tool path uniqueness compare.
+
+    Catches every spelling of a home-relative path that runtime
+    ``PathResolver.expand`` collapses to the same file:
+
+    - ``~`` / ``~/...`` / ``~\\...`` (runtime accepts both separators)
+    - POSIX: ``$HOME/...`` and ``${HOME}/...``
+    - Windows: ``%USERPROFILE%\\...`` (any case)
+
+    Does NOT consult ``os.environ`` — the registry validator must be
+    deterministic and produce the same key regardless of which host runs
+    the build. Other env-var references (e.g., ``$XDG_CONFIG_HOME``) are
+    left as-is; two tools spelling the same path through a non-home env
+    var would still slip past, but that's a much narrower class than the
+    home-relative case Hermes flagged.
+    """
+    # Tilde at the start. Match ``PathResolver.expand``'s shape exactly:
+    # ``~`` alone, ``~/...``, and ``~\\...`` (the latter so a
+    # Windows-shaped tilde path canonicalizes against the same sentinel).
+    # The runtime only treats the LEADING separator after ``~`` as
+    # equivalent across spellings — it strips the ``~\\`` or ``~/``
+    # prefix and passes the remainder to ``Path()`` unchanged, so
+    # ``~/foo\\bar`` and ``~/foo/bar`` resolve to DIFFERENT files on
+    # POSIX. Only normalize that single leading separator; a global
+    # backslash-to-slash fold would collide unrelated POSIX paths
+    # whose names legitimately contain ``\\`` (Hermes pass-PR-5 blocker).
+    if path == "~":
+        path = _HOME_SENTINEL
+    elif path.startswith("~/"):
+        path = _HOME_SENTINEL + path[1:]
+    elif path.startswith("~\\"):
+        path = _HOME_SENTINEL + "/" + path[2:]
+    if windows:
+        path = _WIN_USERPROFILE_RE.sub(_HOME_SENTINEL, path)
+        return ntpath.normpath(path).casefold()
+    path = _POSIX_HOME_RE.sub(_HOME_SENTINEL, path)
+    return posixpath.normpath(path).casefold()
+
+
+# ---------------------------------------------------------------------------
 # DirMapping
 # ---------------------------------------------------------------------------
 
@@ -180,6 +246,125 @@ class CredentialFile(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# ConfigFile
+# ---------------------------------------------------------------------------
+
+
+class ConfigFile(BaseModel):
+    """One on-disk JSON config file managed via owned-path read-merge-write.
+
+    Unlike DirMapping (which the tool reaches via a symlink to a per-profile
+    directory), ConfigFile names a single file the tool writes to via atomic
+    rename(2). Switcher owns specific JSON subtrees inside it and reconciles
+    them on every switch by reading live, overlaying the profile's snapshot,
+    and atomically rewriting.
+
+    ``profile_subdir`` is a *grouping key* that ties this config file to the
+    same logical owner as a sibling DirMapping. The snapshot lives under
+    ``<profile>/.switcher/config_files/<profile_subdir>/<profile_filename>`` —
+    ``.switcher`` is a reserved subtree no DirMapping can collide with
+    (``validate_safe_name`` rejects leading dots), so the reservation is
+    structurally unforgeable.
+
+    ``owned_json_paths`` uses a narrow jq-ish grammar; see ``json_paths.py``
+    for the supported tokens (``.key``, ``[]`` over JSON objects, composition).
+    """
+
+    posix_path: str
+    windows_path: str
+    profile_subdir: str
+    profile_filename: str
+    merge_strategy: Literal["json_subtree_merge"]
+    owned_json_paths: tuple[str, ...]
+
+    @field_validator("profile_subdir")
+    @classmethod
+    def _validate_subdir(cls, v: str) -> str:
+        return validate_safe_name(v)
+
+    @field_validator("profile_filename")
+    @classmethod
+    def _validate_filename(cls, v: str) -> str:
+        return validate_safe_name(v)
+
+    @model_validator(mode="after")
+    def _validate_owned_paths_non_empty(self) -> ConfigFile:
+        if self.merge_strategy == "json_subtree_merge" and not self.owned_json_paths:
+            raise ValueError(
+                "owned_json_paths must be non-empty when merge_strategy is 'json_subtree_merge'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_owned_paths_parse(self) -> ConfigFile:
+        # Local import: ``json_paths`` is pure logic with no model deps, but
+        # importing at module scope would tighten the import graph for no
+        # benefit. Parse-fail-loud at config-load time so a typo'd path
+        # surfaces at registry load, not on the first ``use`` that touches it.
+        from switcher.json_paths import InvalidOwnedPathError, parse_owned_path
+
+        parsed: list[tuple[tuple[str, ...], ...]] = []
+        for raw in self.owned_json_paths:
+            try:
+                segments = parse_owned_path(raw)
+            except InvalidOwnedPathError as e:
+                raise ValueError(f"invalid owned_json_paths entry {raw!r}: {e}") from e
+            parsed.append(segments)
+
+        # Reject duplicates and overlaps. A "prefix overlap" means the
+        # longer path writes into a subtree the shorter path already
+        # captured whole, producing order-sensitive extraction and silent
+        # clobbering at apply time.
+        #
+        # The overlap check treats ``iter`` as a wildcard that matches any
+        # key. ``.a[].b`` and ``.a.c`` both touch ``a["c"]["b"]`` whenever
+        # ``"c"`` is one of the iterated keys (abby r7) — the earlier
+        # strict-tuple-prefix check missed this because the segment tuples
+        # ``(key 'a', iter, key 'b')`` and ``(key 'a', key 'c')`` aren't
+        # literal prefixes of each other. Two paths overlap iff their
+        # first ``min(len, len)`` positions are pairwise compatible (same
+        # key, or at least one ``iter``).
+        for i, a in enumerate(parsed):
+            for j, b in enumerate(parsed):
+                if i == j:
+                    continue
+                if a == b and i < j:
+                    raise ValueError(
+                        f"duplicate owned_json_paths entry {self.owned_json_paths[j]!r}"
+                    )
+                if len(a) > len(b):
+                    # The pair will surface on the (j, i) iteration with
+                    # a shorter-or-equal; only check the longer side once.
+                    continue
+                if a == b:
+                    # Already reported above when i < j; the j < i half is
+                    # otherwise a no-op for equal tuples.
+                    continue
+                # len(a) <= len(b) and a != b: a is a candidate prefix.
+                # Check pairwise compatibility under iter-as-wildcard.
+                compatible = True
+                for k in range(len(a)):
+                    sa, sb = a[k], b[k]
+                    if sa[0] == "iter" or sb[0] == "iter":
+                        continue
+                    # Both segments are ("key", name).
+                    if sa[1] != sb[1]:
+                        compatible = False
+                        break
+                if compatible:
+                    raise ValueError(
+                        f"owned_json_paths entries overlap: "
+                        f"{self.owned_json_paths[i]!r} is a "
+                        f"(wildcard-compatible) prefix of "
+                        f"{self.owned_json_paths[j]!r}; one captures a "
+                        f"subtree the other writes into. '[]' iter "
+                        f"matches any object key, so e.g. '.a[].b' "
+                        f"overlaps with '.a.c.b' (when 'c' is iterated)."
+                    )
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Tool
 # ---------------------------------------------------------------------------
 
@@ -196,6 +381,7 @@ class Tool(BaseModel):
     name: str
     config_dirs: tuple[DirMapping, ...]
     credentials: tuple[CredentialFile, ...] = ()
+    config_files: tuple[ConfigFile, ...] = ()
 
     @field_validator("id")
     @classmethod
@@ -253,6 +439,26 @@ class Tool(BaseModel):
 
     @model_validator(mode="after")
     def _validate_credential_dirs(self) -> Tool:
+        # Two config_dirs entries sharing a profile_subdir both resolve
+        # to ``<profile>/<subdir>`` at init/use time, so the first
+        # ``move_or_seed_dir`` succeeds and the second deterministically
+        # trips ``ProfileTargetExistsError`` AFTER the first live dir has
+        # already been swapped to a link. Catch at registry-load time so
+        # the malformed entry surfaces immediately instead of at
+        # init/use (Hermes pass-PR-6 blocker). Comparison is case-
+        # insensitive to match the storage backend's case-folding on
+        # macOS / Windows; ``foo`` and ``Foo`` would still collide.
+        seen_subdirs: set[str] = set()
+        for d in self.config_dirs:
+            key = d.profile_subdir.casefold()
+            if key in seen_subdirs:
+                raise ValueError(
+                    f"duplicate config_dirs profile_subdir "
+                    f"{d.profile_subdir!r}; each on-disk dir must map "
+                    "to a distinct profile subdir (comparison is "
+                    "case-insensitive)."
+                )
+            seen_subdirs.add(key)
         valid = {d.profile_subdir for d in self.config_dirs}
         for c in self.credentials:
             if c.config_dir not in valid:
@@ -260,6 +466,91 @@ class Tool(BaseModel):
                     f"credential references unknown config_dir {c.config_dir!r}; "
                     f"expected one of {sorted(valid)}"
                 )
+        for cf in self.config_files:
+            if cf.profile_subdir not in valid:
+                raise ValueError(
+                    f"config_file references unknown config_dir {cf.profile_subdir!r}; "
+                    f"expected one of {sorted(valid)}"
+                )
+        # Uniqueness across config_files. Two entries that share a snapshot
+        # slot (same profile_subdir + profile_filename) would race on write
+        # and produce order-dependent results. Two entries that share a
+        # live path on either OS would extract from / apply to the same
+        # file twice — silent clobbering. Reject both at load time.
+        #
+        # Comparison runs each path through
+        # ``canonicalize_path_for_uniqueness`` (case-insensitive,
+        # path-normalized, AND home-spelling-folded) so all four runtime-
+        # equivalent spellings produce the same key: ``~/.claude.json``,
+        # ``$HOME/.claude.json``, ``${HOME}/.claude.json``, and
+        # ``%USERPROFILE%\\.claude.json`` all collapse to one sentinel-
+        # prefixed normpath. The runtime path goes through
+        # ``PathResolver.expand`` + ``os.path.normpath`` and resolves
+        # those four spellings to the same live file; the validator
+        # must catch that equivalence too, or two
+        # semantically-identical-but-syntactically-different entries
+        # silently re-introduce the clobber class (Hermes pass-PR-3 +
+        # pass-PR-4).
+        seen_slots: set[tuple[str, str]] = set()
+        seen_posix: set[str] = set()
+        seen_windows: set[str] = set()
+        for cf in self.config_files:
+            slot = (cf.profile_subdir.casefold(), cf.profile_filename.casefold())
+            if slot in seen_slots:
+                raise ValueError(
+                    f"duplicate config_file snapshot slot "
+                    f"(profile_subdir={cf.profile_subdir!r}, "
+                    f"profile_filename={cf.profile_filename!r}); "
+                    "comparison is case-insensitive"
+                )
+            seen_slots.add(slot)
+            posix_key = canonicalize_path_for_uniqueness(cf.posix_path, windows=False)
+            if posix_key in seen_posix:
+                raise ValueError(
+                    f"duplicate config_file posix_path {cf.posix_path!r}; "
+                    "comparison is case-insensitive, path-normalized, "
+                    "and home-spelling-folded"
+                )
+            seen_posix.add(posix_key)
+            windows_key = canonicalize_path_for_uniqueness(cf.windows_path, windows=True)
+            if windows_key in seen_windows:
+                raise ValueError(
+                    f"duplicate config_file windows_path {cf.windows_path!r}; "
+                    "comparison is case-insensitive, path-normalized, "
+                    "and home-spelling-folded"
+                )
+            seen_windows.add(windows_key)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_at_most_one_config_file(self) -> Tool:
+        # v0.1.5 ships one ConfigFile per tool max. The use() commit phase
+        # writes the N planned applies in an unrolled loop with no rollback
+        # if write #k fails after write #1 has been swapped into place. With
+        # N <= 1 the loop is degenerate and safe; allowing N > 1 reaches a
+        # commit-time partial-mutation window that the op-log compensation
+        # (plan Task 11, spec §2.7) is the architectural answer to.
+        #
+        # When op-log compensation lands and use() gains rollback for the
+        # commit phase, this validator should be removed. Until then,
+        # multi-file support belongs behind that integration, not ahead of
+        # it. Users with multiple owned subtrees in a single file express
+        # that via multiple ``owned_json_paths`` on one ConfigFile, which
+        # the v0.1.5 walker already handles end-to-end.
+        #
+        # Runs *after* _validate_credential_dirs so a 2-CF input that's
+        # also internally inconsistent (e.g. duplicate snapshot slot)
+        # surfaces the more-specific "duplicate" error first — the dead-code
+        # duplicate-detection path is preserved for the post-op-log world
+        # where multi-file becomes legal.
+        if len(self.config_files) > 1:
+            raise ValueError(
+                f"tool {self.id!r}: multiple config_files entries are not "
+                "supported in v0.1.5 — multi-file commit atomicity awaits "
+                "op-log compensation (plan Task 11). Combine the owned "
+                "subtrees into a single config_files entry with multiple "
+                "owned_json_paths instead."
+            )
         return self
 
 

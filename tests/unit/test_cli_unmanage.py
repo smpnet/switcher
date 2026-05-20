@@ -188,6 +188,51 @@ def test_unmanage_force_refuses_when_orphan_has_owned_subdir_in_profile(
     assert "copilot" in orphan._store.get_active()
 
 
+def test_unmanage_force_refuses_when_orphan_has_config_file_snapshot(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """Hermes + CR pass-PR-4 blocker: ``unmanage --force`` on orphan-no-
+    cache pre-fix only inspected owned ``<profile>/<subdir>`` dirs. If
+    those were already gone but a ConfigFile snapshot survived under
+    ``<profile>/.switcher/config_files/<subdir>/``, the force-skip
+    silently dropped the tool from ``active`` and a later
+    ``uninstall --purge`` would ``rmtree()`` the state dir without the
+    skipped-tool guard ever firing — exactly the same silent-data-loss
+    class the existing owned-subdir refusal closes for config_dirs.
+
+    The fix extends the orphan refusal to snapshot subdirs too. This
+    test exercises the snapshot-only branch (owned dir removed) so a
+    regression on either side surfaces independently.
+    """
+    import pytest as _pytest
+
+    from switcher.errors import UninstallPreflightError
+
+    _full, orphan, profile_name = _orphan_copilot_service(tmp_state, tmp_home)
+    profile_dir = orphan._store.profile_dir(profile_name)
+    # Remove the owned config_dir subdir so the dir-side refusal doesn't
+    # fire — we want the snapshot-side check to be the gate under test.
+    shutil.rmtree(profile_dir / "copilot-config")
+    # Drop the live symlink so derive-on-read doesn't repopulate cache
+    # (orphan-no-cache precondition).
+    copilot_link = tmp_home / ".copilot"
+    if copilot_link.is_symlink():
+        copilot_link.unlink()
+    elif copilot_link.is_dir():
+        shutil.rmtree(copilot_link)
+    # Plant a ConfigFile snapshot at the canonical reserved path.
+    # The historical subdir union (_expected_subdirs_for) includes
+    # copilot-config, so the new check will see this subdir as owned.
+    snap_dir = profile_dir / ".switcher" / "config_files" / "copilot-config"
+    snap_dir.mkdir(parents=True)
+    (snap_dir / "settings.json").write_text('{"mcpServers": {}}')
+
+    with _pytest.raises(UninstallPreflightError, match="ConfigFile snapshot"):
+        orphan.unmanage("copilot", force=True)
+    # active map unchanged — the refusal preserves the purge guard.
+    assert "copilot" in orphan._store.get_active()
+
+
 def test_unmanage_force_succeeds_when_orphan_has_no_on_disk_presence(
     tmp_home: Path, tmp_state: Path
 ) -> None:
@@ -242,6 +287,55 @@ def test_unmanage_force_succeeds_for_truly_unknown_orphan_tool(
     report = service.unmanage("fake_orphan_tool", force=True)
     assert report.skipped_orphan is True
     assert "fake_orphan_tool" not in service._store.get_active()
+
+
+def test_unmanage_force_refuses_unknown_orphan_with_on_disk_presence(
+    tmp_home: Path, tmp_state: Path
+) -> None:
+    """CR pass-PR-5 major: a tool id with NO registry entry AND NO
+    historical fallback (``_expected_subdirs_for`` returns ``set()``)
+    used to slip past the orphan-force safety check entirely — both
+    subdir lists were empty and ``skipped_orphan`` went True. If the
+    profile actually had on-disk data (config_dir subdir OR ConfigFile
+    snapshot) for that unknown tool, a later ``uninstall --purge``
+    would rmtree it silently.
+
+    The fix falls back to enumerating actual subdirs under the active
+    profile dir + ``.switcher/config_files/`` when the registry/
+    historical anchor is empty.
+    """
+    import pytest as _pytest
+
+    from switcher.errors import UninstallPreflightError
+    from switcher.paths import PathResolver
+    from switcher.registry import build_registry
+    from switcher.service import ProfileService
+    from switcher.store import FileProfileStore
+
+    full_registry = build_registry(tmp_state / "registry.d")
+    service = ProfileService(
+        FileProfileStore(tmp_state),
+        PathResolver(home=tmp_home),
+        full_registry,
+    )
+    service.init()
+    active = service._store.get_active()
+    profile_name = next(iter(active.values()))
+    profile_dir = service._store.profile_dir(profile_name)
+    new_active = dict(active)
+    new_active["fake_orphan_tool"] = profile_name
+    cache = service._store.get_active_live_paths()
+    service._store.set_active_state(new_active, dict(cache))
+
+    # Plant on-disk state for the unknown orphan: a config_dir subdir
+    # name the registry has never heard of.
+    (profile_dir / "fake-orphan-subdir").mkdir()
+    (profile_dir / "fake-orphan-subdir" / "data.json").write_text("{}")
+
+    with _pytest.raises(UninstallPreflightError, match="still has profile data"):
+        service.unmanage("fake_orphan_tool", force=True)
+    # active map unchanged — refusal preserves the purge guard.
+    assert "fake_orphan_tool" in service._store.get_active()
 
 
 def test_unmanage_force_dry_run_orphan_does_not_say_already_restored(

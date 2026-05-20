@@ -6,10 +6,12 @@ import pytest
 from pydantic import ValidationError
 
 from switcher.models import (
+    ConfigFile,
     CredentialFile,
     DirMapping,
     Profile,
     Tool,
+    canonicalize_path_for_uniqueness,
     validate_credential_path,
     validate_safe_name,
 )
@@ -91,6 +93,113 @@ def test_credential_path_accepts_relative(p: str) -> None:
 def test_credential_path_rejects_unsafe(p: str) -> None:
     with pytest.raises(ValueError):
         validate_credential_path(p)
+
+
+# ---------------- canonicalize_path_for_uniqueness ----------------
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "~/.claude.json",
+        "$HOME/.claude.json",
+        "${HOME}/.claude.json",
+        "~/.config/../.claude.json",
+        "~/foo/../.claude.json",
+    ],
+)
+def test_canonicalize_posix_home_spellings_collide(spelling: str) -> None:
+    """Every spelling that runtime ``PathResolver.expand`` collapses to
+    ``<home>/.claude.json`` must produce the same canonical key.
+    Hermes pass-PR-4: validator-side uniqueness has to mirror runtime
+    home-equivalence or two tools can silently co-manage the same file.
+    """
+    canonical = canonicalize_path_for_uniqueness("~/.claude.json", windows=False)
+    assert canonicalize_path_for_uniqueness(spelling, windows=False) == canonical
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "~\\.claude.json",
+        "%USERPROFILE%\\.claude.json",
+        "%userprofile%\\.claude.json",
+        "%UserProfile%\\.claude.json",
+        "%USERPROFILE%\\foo\\..\\.claude.json",
+    ],
+)
+def test_canonicalize_windows_home_spellings_collide(spelling: str) -> None:
+    """Mirror of the POSIX case for Windows. ``%VAR%`` env-var lookup is
+    case-insensitive at runtime so the regex match is too."""
+    canonical = canonicalize_path_for_uniqueness("~\\.claude.json", windows=True)
+    assert canonicalize_path_for_uniqueness(spelling, windows=True) == canonical
+
+
+def test_canonicalize_distinct_paths_produce_distinct_keys() -> None:
+    """Sanity check: two genuinely different paths under home produce
+    different canonical keys."""
+    a = canonicalize_path_for_uniqueness("~/.foo.json", windows=False)
+    b = canonicalize_path_for_uniqueness("~/.bar.json", windows=False)
+    assert a != b
+
+
+def test_canonicalize_posix_tilde_backslash_folds_to_forward_slash() -> None:
+    """Hermes pass-PR-4 blocker 2: POSIX runtime expansion accepts both
+    ``~/`` AND ``~\\`` prefixes (paths.py:48 — ``expanded.startswith(("~/",
+    "~\\\\"))``), so the two spellings resolve to the same live file.
+    ``posixpath.normpath`` doesn't fold backslashes though, so without
+    an explicit normalization step the validator key for ``~\\.claude.json``
+    would differ from ``~/.claude.json`` — two tools using different
+    separator spellings would slip past as distinct.
+    """
+    canonical = canonicalize_path_for_uniqueness("~/.claude.json", windows=False)
+    assert canonicalize_path_for_uniqueness("~\\.claude.json", windows=False) == canonical
+
+
+def test_canonicalize_posix_backslash_in_path_body_is_not_a_separator() -> None:
+    """Hermes pass-PR-5 blocker: only the leading ``~\\`` is equivalent
+    to ``~/``. ``PathResolver.expand`` strips that prefix and passes the
+    remainder to ``Path()`` unchanged, so on POSIX a literal backslash
+    inside the path body is a regular filename character — two such
+    paths must NOT collide in the validator. Pre-fix, a global
+    ``path.replace("\\\\", "/")`` collapsed them and could falsely
+    reject valid registry entries as duplicate ``config_file`` paths.
+    """
+    with_backslash = canonicalize_path_for_uniqueness("/tmp/foo\\bar.json", windows=False)
+    with_slash = canonicalize_path_for_uniqueness("/tmp/foo/bar.json", windows=False)
+    assert with_backslash != with_slash
+
+
+@pytest.mark.parametrize(
+    "unrelated",
+    [
+        "$HOME_BACKUP/.cfg",
+        "${HOME_DIR}/.cfg",
+        "$HOMEBREW_PREFIX/.cfg",
+    ],
+)
+def test_canonicalize_posix_home_regex_does_not_overmatch(unrelated: str) -> None:
+    """Hermes pass-PR-4 blocker 3: ``$HOME_BACKUP`` and ``${HOME_DIR}``
+    are NOT the user's home — they're unrelated env vars whose names
+    happen to start with ``HOME``. Pre-fix, the regex matched the
+    ``$HOME`` prefix and collapsed semantically distinct paths to the
+    same canonical key, causing false-positive collision rejections.
+    """
+    home = canonicalize_path_for_uniqueness("$HOME/.cfg", windows=False)
+    unrelated_key = canonicalize_path_for_uniqueness(unrelated, windows=False)
+    assert unrelated_key != home
+
+
+def test_canonicalize_does_not_consult_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Validator-side canonicalization must be deterministic across hosts.
+    Setting ``$HOME`` to something exotic at test time must NOT change
+    the canonical key — the helper substitutes against a sentinel, not
+    the host's actual home."""
+    monkeypatch.setenv("HOME", "/some/strange/home")
+    before = canonicalize_path_for_uniqueness("$HOME/.x.json", windows=False)
+    monkeypatch.setenv("HOME", "/different/home")
+    after = canonicalize_path_for_uniqueness("$HOME/.x.json", windows=False)
+    assert before == after
 
 
 # ---------------- DirMapping ----------------
@@ -183,6 +292,125 @@ def test_tool_id_is_validated() -> None:
                     profile_subdir="x",
                 ),
             ),
+        )
+
+
+def test_tool_rejects_multiple_config_files() -> None:
+    """v0.1.5 caps config_files at 1 per tool until op-log compensation
+    handles multi-file commit atomicity (plan Task 11). The two-file shape
+    must be rejected at load time, with a message that points users at the
+    single-CF / multiple-owned-paths workaround.
+    """
+    cf1 = {
+        "posix_path": "~/.claude.json",
+        "windows_path": "%USERPROFILE%\\.claude.json",
+        "profile_subdir": "claude",
+        "profile_filename": "claude.json",
+        "merge_strategy": "json_subtree_merge",
+        "owned_json_paths": [".mcpServers"],
+    }
+    cf2 = {
+        "posix_path": "~/.claude-extra.json",
+        "windows_path": "%USERPROFILE%\\.claude-extra.json",
+        "profile_subdir": "claude",
+        "profile_filename": "claude-extra.json",
+        "merge_strategy": "json_subtree_merge",
+        "owned_json_paths": [".extra"],
+    }
+    with pytest.raises(ValidationError, match="multiple config_files"):
+        Tool.model_validate(
+            {
+                "id": "claude",
+                "name": "Claude Code",
+                "config_dirs": [
+                    {
+                        "posix_path": "~/.claude",
+                        "windows_path": "%USERPROFILE%\\.claude",
+                        "profile_subdir": "claude",
+                    }
+                ],
+                "config_files": [cf1, cf2],
+            }
+        )
+
+
+def test_tool_accepts_single_config_file() -> None:
+    """Sanity-check the at-most-one validator: one entry must still pass."""
+    tool = Tool(
+        id="claude",
+        name="Claude Code",
+        config_dirs=(
+            DirMapping(
+                posix_path="~/.claude",
+                windows_path="%USERPROFILE%\\.claude",
+                profile_subdir="claude",
+            ),
+        ),
+        config_files=(
+            ConfigFile(
+                posix_path="~/.claude.json",
+                windows_path="%USERPROFILE%\\.claude.json",
+                profile_subdir="claude",
+                profile_filename="claude.json",
+                merge_strategy="json_subtree_merge",
+                owned_json_paths=(".mcpServers",),
+            ),
+        ),
+    )
+    assert len(tool.config_files) == 1
+
+
+def test_tool_rejects_duplicate_config_dir_profile_subdir() -> None:
+    """Hermes pass-PR-6: two ``config_dirs`` entries that share a
+    ``profile_subdir`` both resolve to ``<profile>/<subdir>`` at
+    init/use time. The first ``move_or_seed_dir`` succeeds and
+    swaps the first live dir to a link; the second
+    deterministically trips ``ProfileTargetExistsError`` AFTER live
+    has already been mutated. Catch at registry-load time so the
+    malformed entry surfaces immediately instead of mid-init.
+    """
+    with pytest.raises(ValidationError, match="duplicate config_dirs profile_subdir"):
+        Tool.model_validate(
+            {
+                "id": "dupdirs",
+                "name": "Dup Dirs",
+                "config_dirs": [
+                    {
+                        "posix_path": "~/.a",
+                        "windows_path": "%USERPROFILE%\\a",
+                        "profile_subdir": "same",
+                    },
+                    {
+                        "posix_path": "~/.b",
+                        "windows_path": "%USERPROFILE%\\b",
+                        "profile_subdir": "same",
+                    },
+                ],
+            }
+        )
+
+
+def test_tool_rejects_duplicate_config_dir_profile_subdir_case_insensitive() -> None:
+    """Matches the case-insensitive storage semantics on macOS / Windows:
+    ``Same`` and ``SAME`` would land at the same on-disk dir."""
+    with pytest.raises(ValidationError, match="duplicate config_dirs profile_subdir"):
+        Tool.model_validate(
+            {
+                "id": "dupdirs",
+                "name": "Dup Dirs",
+                "config_dirs": [
+                    {
+                        "posix_path": "~/.a",
+                        "windows_path": "%USERPROFILE%\\a",
+                        "profile_subdir": "Same",
+                    },
+                    {
+                        "posix_path": "~/.b",
+                        "windows_path": "%USERPROFILE%\\b",
+                        "profile_subdir": "SAME",
+                    },
+                ],
+            }
         )
 
 

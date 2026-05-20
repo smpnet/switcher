@@ -7,3 +7,20 @@ posix_path = "~/.claude"
 windows_path = "%USERPROFILE%\\.claude"
 profile_subdir = "claude"
 env_override = "CLAUDE_CONFIG_DIR"
+
+# ~/.claude.json holds per-project state Claude treats as a single file.
+# Only three subtrees are profile-scoped (spec §3.2); everything else
+# (lastSessionId, hasCompletedOnboarding, telemetry counters, etc.) is
+# machine-global and must NOT be profile-isolated — copy-on-switch
+# preserves the live values for those keys.
+[[config_files]]
+posix_path = "~/.claude.json"
+windows_path = "%USERPROFILE%\\.claude.json"
+profile_subdir = "claude"
+profile_filename = "claude.json"
+merge_strategy = "json_subtree_merge"
+owned_json_paths = [
+    ".mcpServers",
+    ".projects[].mcpServers",
+    ".oauthAccount",
+]
