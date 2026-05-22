@@ -517,8 +517,8 @@ path = "apps.json"
 
 `pipx` remembers the URL the package came from. To pull a newer commit on
 the same ref, run `pipx upgrade switcher` — but note that pinned tags
-(`@v0.1.7`) won't move past the tag. To switch to a different tag, reinstall
-with the new ref:
+won't move past the tag. To switch to a different tag, reinstall with the
+new ref:
 
 ```bash
 pipx install --force git+https://github.com/smpnet/switcher.git@<tag-or-commit>
