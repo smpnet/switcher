@@ -1,0 +1,42 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "dependencyDashboard": true,
+  "timezone": "America/New_York",
+  "schedule": ["before 10am on monday"],
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 5,
+  "semanticCommits": "enabled",
+  "semanticCommitType": "chore",
+  "semanticCommitScope": "deps",
+  "vulnerabilityAlerts": {
+    "enabled": true
+  },
+  "osvVulnerabilityAlerts": true,
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "pre-commit": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions updates into a single PR.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "addLabels": ["github-actions"]
+    },
+    {
+      "description": "Group all pixi and PEP 621 Python dep updates into a single PR.",
+      "matchManagers": ["pep621", "pixi"],
+      "groupName": "python deps",
+      "addLabels": ["python"]
+    },
+    {
+      "description": "Python lower bound set to 3.13 in pyproject.toml requires-python. Disable auto-bump to prevent unintended lower-bound shifts.",
+      "matchPackageNames": ["python"],
+      "matchManagers": ["pep621", "pixi"],
+      "enabled": false
+    }
+  ]
+}
