@@ -31,7 +31,12 @@ as built-in registry entries. Tools are user-extensible via TOML in
 
 ## Install
 
-> **Note:** switcher is currently a private repo. The command below works once the repo is public; until then, you need read access on `smpnet/switcher` and authenticated git credentials (e.g. `gh auth login && gh auth setup-git`).
+> **Note:** switcher is currently a private repo. The command below works once the repo is public. While the repo is private, you'll need read access on `smpnet/switcher` and an authenticated git credential helper. Run once first:
+>
+> ```bash
+> gh auth login          # one-time
+> gh auth setup-git      # one-time: registers gh as git's credential helper
+> ```
 
 ```bash
 pipx install git+https://github.com/smpnet/switcher.git@v0.1.5
