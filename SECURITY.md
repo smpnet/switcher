@@ -6,7 +6,7 @@ Email security reports to **smpnet74@gmail.com**. Please do not open public issu
 
 ## Supported versions
 
-Security fixes target the latest released version on `main`. Older tags are not patched — upgrade to the latest release if you're affected.
+Security fixes target the latest tagged release. The `main` branch may contain unreleased changes. Older tags are not patched — upgrade to the latest release if you're affected.
 
 ## Scope
 
