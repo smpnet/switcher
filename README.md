@@ -28,21 +28,12 @@ as built-in registry entries. Tools are user-extensible via TOML in
   - Windows: `py -m pip install --user pipx`
   - Then run `pipx ensurepath` once to add pipx's bin dir to your PATH.
 - **git.** Anything recent.
-- **GitHub auth.** This repo is private. You need either an SSH key registered
-  with GitHub OR the [`gh` CLI](https://cli.github.com/) authenticated and
-  configured as git's credential helper.
 
 ## Install
 
-Pick the path that matches how you already auth with GitHub:
+> **Note:** switcher is currently a private repo. The command below works once the repo is public; until then, you need read access on `smpnet/switcher` and authenticated git credentials (e.g. `gh auth login && gh auth setup-git`).
 
 ```bash
-# SSH (if you have a GitHub-registered key in your agent)
-pipx install git+ssh://git@github.com/smpnet/switcher.git@v0.1.5
-
-# OR via the gh credential helper
-gh auth login          # one-time
-gh auth setup-git      # one-time: registers gh as git's credential helper
 pipx install git+https://github.com/smpnet/switcher.git@v0.1.5
 ```
 
