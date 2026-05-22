@@ -42,13 +42,13 @@ as built-in registry entries. Tools are user-extensible via TOML in
 > Once the repo is public, the `pipx install` command below works directly without the auth setup.
 
 ```bash
-pipx install git+https://github.com/smpnet/switcher.git@v0.1.5
+pipx install git+https://github.com/smpnet/switcher.git@v0.1.7
 ```
 
 Verify:
 
 ```bash
-switcher version       # → switcher v0.1.5
+switcher version       # → switcher v0.1.7
 ```
 
 ---
