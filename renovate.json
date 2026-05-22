@@ -29,7 +29,7 @@
     {
       "description": "Group all pixi and PEP 621 Python dep updates into a single PR.",
       "matchManagers": ["pep621", "pixi"],
-      "groupName": "pixi deps",
+      "groupName": "python deps",
       "addLabels": ["python"]
     },
     {
