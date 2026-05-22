@@ -8,7 +8,7 @@ conventions, and a walkthrough for adding a built-in tool.
 
 ```bash
 # 1. Clone (or fork + clone).
-git clone https://github.com/<owner>/switcher.git
+git clone https://github.com/smpnet/switcher.git
 cd switcher
 
 # 2. Install the toolchain via pixi. One-time setup.
@@ -72,25 +72,12 @@ behavior typically touches all three tiers.
 
 ## How features get designed and built
 
-Non-trivial changes — anything touching 3+ files or changing
-user-visible behavior — should include a short design rationale.
-The maintainer's workflow uses:
-
-- **Specs** at `docs/superpowers/specs/<date>-<topic>-design.md`
-  (note: `docs/superpowers/` is gitignored — these are local
-  working notes; the maintainer references them in PR descriptions
-  rather than committing them).
-- **Briefs** at `docs/<version>.md` for milestone-scoped roadmaps
-  (these ARE committed; see `docs/v0.1.4.md`, `docs/v0.1.5.md`).
-- **Optional tooling:** if you use Claude Code, the
-  `superpowers:brainstorming` / `superpowers:writing-plans` /
-  `superpowers:executing-plans` skills automate the workflow.
-  External contributors are not required to use them — a
-  well-written PR description with motivation, design notes,
-  and a test plan covers the same ground.
-
-For a worked example, see the v0.1.4 brief (`docs/v0.1.4.md`)
-and the resulting PR (`#5`).
+For non-trivial changes — anything touching 3+ files or
+changing user-visible behavior — please include a short design
+rationale in the PR description: motivation, alternatives
+considered, and a test plan. There's no required template; a
+few paragraphs covering those three points is enough for review
+to start.
 
 ## Pre-PR (local) review loops
 
@@ -107,31 +94,31 @@ unused imports, weak types, missing docstrings, edge-case gaps.
 You don't need to install it: the CodeRabbit bot on the PR side
 runs the same review automatically after `gh pr create`.
 
-### Maintainer-only local loops
-
-The project maintainer additionally runs `abby-review` — a private
-Hermes-based intent-review container against the local diff. It is
-**not required for external contributors** and not installable
-without the maintainer's local Hermes setup. The PR-side bots
-(below) cover intent review for outside contributions.
-
 ## Open-PR review cycle
 
-After `gh pr create`, two bots review every PR automatically:
+After `gh pr create`, two layers of review apply to every PR:
 
 - **CodeRabbit bot:** mechanical and structural review comments
   per push. Configured at the repo level; runs on forks too.
-- **Hermes webhook:** intent-level review comments per push.
-  Also runs on every PR including fork-PRs.
+- **Maintainer review:** the project maintainer (@smpnet74)
+  reviews every PR for intent, design fit, and codebase
+  coherence, posting comments directly on the PR thread.
 
-To merge, you'll need to resolve actionable findings from both.
+To merge, both layers must be addressed:
+
+1. **CodeRabbit:** all actionable findings resolved or pushed
+   back on with reasoning; the latest CodeRabbit review on the
+   PR surfaces only nitpicks or preferences.
+2. **Maintainer:** an explicit LGTM (or equivalent approval)
+   from @smpnet74.
+
 **Push back on findings you disagree with** — reply on the
-GitHub thread with technical reasoning. Don't blindly apply every
-suggestion; "right for this codebase" is the bar.
+GitHub thread with technical reasoning. Don't blindly apply
+every suggestion; "right for this codebase" is the bar.
 
-Bundle local fixes into one push per review cycle. Multiple rapid
-pushes retrigger both bots and produce noisy comment history
-("review flapping").
+Bundle local fixes into one push per review cycle. Multiple
+rapid pushes retrigger CodeRabbit and produce noisy comment
+history ("review flapping").
 
 No installation required to receive these reviews. They run on
 GitHub.
@@ -274,5 +261,7 @@ stable, or delete the rc1 tag before tagging stable.
 
 ## Code of conduct / contact
 
-Open an issue for design discussion or bug reports. Send a PR for
-code contributions.
+This project follows the [Contributor Covenant Code of
+Conduct](CODE_OF_CONDUCT.md). Open an issue for design
+discussion or bug reports. Send a PR for code contributions.
+Security reports go via [SECURITY.md](SECURITY.md).
