@@ -517,33 +517,19 @@ path = "apps.json"
 
 `pipx` remembers the URL the package came from. To pull a newer commit on
 the same ref, run `pipx upgrade switcher` — but note that pinned tags
-(`@v0.1.5`) won't move past the tag. To switch to a different tag, reinstall
-with the new ref:
+won't move past the tag. To switch to a different tag, reinstall with the
+new ref:
 
 ```bash
-pipx install --force git+ssh://git@github.com/smpnet/switcher.git@<tag-or-commit>
+pipx install --force git+https://github.com/smpnet/switcher.git@<tag-or-commit>
 ```
-
-While the repo is private, both upgrade and reinstall still need the same
-GitHub auth that worked at install time (SSH key in your agent, or
-`gh auth status` showing a valid login). If `pipx upgrade switcher` fails
-with a `git clone`-style auth error, that's a GitHub auth problem, not a
-`switcher` bug — refresh the SSH agent or re-run `gh auth login`.
 
 ### Windows-specific install notes
 
-The two install options work on Windows, but you need a working git auth
-setup first. Pick the one matching your existing setup:
+Install works the same on Windows as macOS/Linux once the README's
+Requirements (Python, pipx, git) are satisfied — run the README's
+install line from PowerShell or Git Bash.
 
-- **SSH:** install [Git for Windows](https://git-scm.com/download/win)
-  (ships OpenSSH), generate a key, add it to your GitHub account, and ensure
-  `ssh-agent` is running. Then use the SSH `pipx install` line from the
-  README from PowerShell or Git Bash.
-- **HTTPS via gh:** install [GitHub CLI](https://cli.github.com/), run
-  `gh auth login` then `gh auth setup-git`, then use the HTTPS `pipx
-  install` line from the README.
-
-`pipx` itself works the same across macOS, Linux, and Windows (it ships
-per-OS bin dirs). The Windows code paths (junctions, `%LOCALAPPDATA%`,
-`%USERPROFILE%` env-var expansion) are covered by the test suite, which
-runs on a Windows runner in CI (see `.github/workflows/ci.yml`).
+The Windows code paths (junctions, `%LOCALAPPDATA%`, `%USERPROFILE%`
+env-var expansion) are covered by the test suite, which runs on a
+Windows runner in CI (see `.github/workflows/ci.yml`).
