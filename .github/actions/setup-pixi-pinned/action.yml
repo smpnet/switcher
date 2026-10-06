@@ -13,7 +13,7 @@ runs:
     # hardening. Bump along with any other action audits during the
     # next security review. Upstream has cut a v0.9 line; stay on v0.8.x
     # until v0.9's setup contract changes have been audited.
-    - uses: prefix-dev/setup-pixi@8ca4608ef7f4daeb54f5205b20d0b7cb42f11143  # v0.8.14
+    - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514  # v0.11.0
       with:
         pixi-version: v0.66.0
         cache: true

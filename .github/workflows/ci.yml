@@ -56,7 +56,7 @@ jobs:
       # Pinned to immutable commit SHA (= tag v4) for the same supply-chain
       # hardening reason setup-pixi is pinned in run-pixi-ci/action.yml;
       # bump on the v0.1.5 security review.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           # hatch-vcs reads `git describe --tags` whenever the package is
           # installed or built. Without full tag history it produces a
@@ -78,7 +78,7 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           # diff-cover compares against origin/<base_ref> to compute the
           # patch coverage delta; a shallow checkout would miss the base
@@ -133,7 +133,7 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           # hatch-vcs reads `git describe --tags` at build time to derive the
           # package version. A shallow checkout would produce a 0.0.0+local-style
@@ -193,7 +193,7 @@ jobs:
       # checkout pinned to immutable commit SHA (= tag v4) for the same
       # supply-chain hardening reason setup-pixi is pinned; bump on the
       # v0.1.5 security review.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           # See the matrix-job comment above — hatch-vcs needs full tag
           # history. verify-windows-strict doesn't itself build, but
